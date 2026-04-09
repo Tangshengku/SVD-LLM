@@ -77,6 +77,101 @@ def profle_svdllm(name, model, calib_loader, dev):
     return profiling_mat
         
 
+def profile_bi_svdllm(model_name, model, calib_loader, dev, eps_a=1e-6, eps_b=1e-6):
+    if "llama" in model_name or "mistral" in model_name or "vicuna" in model_name:
+        layers = model.model.layers
+    elif "opt" in model_name:
+        layers = model.model.decoder.layers
+    else:
+        raise NotImplementedError(f"Unsupported model type for {model_name}")
+
+    model = model.to(dev)
+    model.eval()
+    print("Start obtaining the bi-whitening matrices...")
+
+    def _flatten_feature(tensor):
+        tensor = tensor.detach().float()
+        if tensor.dim() == 2:
+            return tensor
+        return tensor.reshape(-1, tensor.shape[-1])
+
+    def forward_hook(module, input, output):
+        inp = _flatten_feature(input[0])
+        module.raw_input_cov += inp.transpose(0, 1).matmul(inp)
+        module.nsamples += inp.shape[0]
+
+    def backward_hook(module, grad_input, grad_output):
+        gout = _flatten_feature(grad_output[0])
+        module.raw_output_cov += gout.transpose(0, 1).matmul(gout)
+
+    handles = []
+    for _, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            module.raw_input_cov = 0
+            module.raw_output_cov = 0
+            module.nsamples = 0
+            handles.append(module.register_forward_hook(forward_hook))
+            handles.append(module.register_full_backward_hook(backward_hook))
+
+    for batch in tqdm(calib_loader):
+        batch = {k: v.to(dev) for k, v in batch.items()}
+        model.zero_grad(set_to_none=True)
+        loss = model(**batch, labels=batch["input_ids"]).loss
+        loss.backward()
+
+    for handle in handles:
+        handle.remove()
+    model.zero_grad(set_to_none=True)
+    torch.cuda.empty_cache()
+    model = model.cpu()
+
+    for i in range(len(layers)):
+        subset = find_layers(layers[i])
+        for name in subset:
+            subset[name].raw_input_cov = subset[name].raw_input_cov.cpu()
+            subset[name].raw_output_cov = subset[name].raw_output_cov.cpu()
+
+    profiling_mat = {}
+    print("Start bi-whitening factorization...")
+    for i in tqdm(range(len(layers))):
+        layer_profile = {}
+        subset = find_layers(layers[i])
+        for name in subset:
+            module = subset[name]
+            sample_count = max(module.nsamples, 1)
+            input_cov = module.raw_input_cov.double() / sample_count
+            output_cov = module.raw_output_cov.double() / sample_count
+            input_cov += eps_a * torch.eye(input_cov.shape[0], dtype=input_cov.dtype)
+            output_cov += eps_b * torch.eye(output_cov.shape[0], dtype=output_cov.dtype)
+
+            try:
+                input_factor = torch.linalg.cholesky(input_cov)
+            except Exception:
+                print(f"Warning: input covariance is not positive definite at layer {i}:{name}, adding damping.")
+                eigenvalues = torch.linalg.eigvalsh(input_cov)
+                input_cov += (-eigenvalues[0] + eps_a) * torch.eye(input_cov.shape[0], dtype=input_cov.dtype)
+                input_factor = torch.linalg.cholesky(input_cov)
+
+            try:
+                output_factor = torch.linalg.cholesky(output_cov)
+            except Exception:
+                print(f"Warning: output covariance is not positive definite at layer {i}:{name}, adding damping.")
+                eigenvalues = torch.linalg.eigvalsh(output_cov)
+                output_cov += (-eigenvalues[0] + eps_b) * torch.eye(output_cov.shape[0], dtype=output_cov.dtype)
+                output_factor = torch.linalg.cholesky(output_cov)
+
+            layer_profile[name] = {
+                "input_factor": input_factor.cpu(),
+                "output_factor": output_factor.cpu(),
+            }
+            module.raw_input_cov = None
+            module.raw_output_cov = None
+            del module.raw_input_cov, module.raw_output_cov
+            torch.cuda.empty_cache()
+        profiling_mat[i] = layer_profile
+    return profiling_mat
+
+
 @torch.no_grad()
 def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
     if "opt" in model_name:
@@ -183,6 +278,109 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
     return profiling_mat
      
  
+@torch.no_grad()
+def bi_whitening(model_name, model, profiling_mat, ratio, dev):
+    model.eval()
+    if 'opt' in model_name:
+        layers = model.model.decoder.layers
+    else:
+        layers = model.model.layers
+    print("Start SVD decomposition after bi-whitening...")
+    for i in tqdm(range(len(layers))):
+        layer = layers[i]
+        subset = find_layers(layer)
+        if "llama" in model_name or "vicuna" in model_name:
+            svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio)
+            svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio)
+        elif "mistral" in model_name:
+            svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio)
+            svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio)
+        elif 'opt' in model_name:
+            svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio)
+        for name in subset:
+            W = subset[name].weight.data.float().to(dev)
+            dtype = W.dtype
+            input_factor = profiling_mat[i][name]["input_factor"].to(dev).float()
+            output_factor = profiling_mat[i][name]["output_factor"].to(dev).float()
+            W_scale = torch.matmul(output_factor.transpose(0, 1), torch.matmul(W, input_factor))
+            U, S, VT = torch.linalg.svd(W_scale, full_matrices=False)
+            num_s_after_trunc = int(W.shape[0] * W.shape[1] * ratio / (W.shape[0] + W.shape[1]))
+            truc_s = S[:num_s_after_trunc]
+            truc_u = U[:, :num_s_after_trunc]
+            truc_v = VT[:num_s_after_trunc, :]
+            sqrtSigma = torch.diag(torch.sqrt(truc_s))
+            left_factor = torch.linalg.solve_triangular(
+                output_factor.transpose(0, 1),
+                torch.matmul(truc_u, sqrtSigma),
+                upper=True,
+                left=True,
+            )
+            right_factor = torch.linalg.solve_triangular(
+                input_factor.transpose(0, 1),
+                torch.matmul(sqrtSigma, truc_v).transpose(0, 1),
+                upper=True,
+                left=True,
+            ).transpose(0, 1)
+            svd_u = left_factor.cpu().to(dtype)
+            svd_v = right_factor.cpu().to(dtype)
+            if 'opt' in model_name:
+                if "q_proj" in name:
+                    svd_decoder.self_attn.q_u_proj.weight.data = svd_u
+                    svd_decoder.self_attn.q_v_proj.weight.data = svd_v
+                    svd_decoder.self_attn.q_u_proj.bias.data = layer.self_attn.q_proj.bias.data
+                elif "k_proj" in name:
+                    svd_decoder.self_attn.k_u_proj.weight.data = svd_u
+                    svd_decoder.self_attn.k_v_proj.weight.data = svd_v
+                    svd_decoder.self_attn.k_u_proj.bias.data = layer.self_attn.k_proj.bias.data
+                elif "v_proj" in name:
+                    svd_decoder.self_attn.v_u_proj.weight.data = svd_u
+                    svd_decoder.self_attn.v_v_proj.weight.data = svd_v
+                    svd_decoder.self_attn.v_u_proj.bias.data = layer.self_attn.v_proj.bias.data
+                elif "out_proj" in name:
+                    svd_decoder.self_attn.out_u_proj.weight.data = svd_u
+                    svd_decoder.self_attn.out_v_proj.weight.data = svd_v
+                    svd_decoder.self_attn.out_u_proj.bias.data = layer.self_attn.out_proj.bias.data
+                elif "fc1" in name:
+                    svd_decoder.fc1_u_proj.weight.data = svd_u
+                    svd_decoder.fc1_v_proj.weight.data = svd_v
+                    svd_decoder.fc1_u_proj.bias.data = layer.fc1.bias.data
+                elif "fc2" in name:
+                    svd_decoder.fc2_u_proj.weight.data = svd_u
+                    svd_decoder.fc2_v_proj.weight.data = svd_v
+                    svd_decoder.fc2_u_proj.bias.data = layer.fc2.bias.data
+                    svd_decoder.self_attn_layer_norm = layer.self_attn_layer_norm
+                    svd_decoder.final_layer_norm = layer.final_layer_norm
+                    layers[i] = svd_decoder
+            else:
+                if "q_proj" in name:
+                    svd_attn.q_u_proj.weight.data = svd_u
+                    svd_attn.q_v_proj.weight.data = svd_v
+                elif "k_proj" in name:
+                    svd_attn.k_u_proj.weight.data = svd_u
+                    svd_attn.k_v_proj.weight.data = svd_v
+                elif "v_proj" in name:
+                    svd_attn.v_u_proj.weight.data = svd_u
+                    svd_attn.v_v_proj.weight.data = svd_v
+                elif "o_proj" in name:
+                    svd_attn.o_u_proj.weight.data = svd_u
+                    svd_attn.o_v_proj.weight.data = svd_v
+                    layer.self_attn =  svd_attn
+                elif "gate_proj" in name:
+                    svd_mlp.gate_u_proj.weight.data = svd_u
+                    svd_mlp.gate_v_proj.weight.data = svd_v
+                elif "down_proj" in name:
+                    svd_mlp.down_u_proj.weight.data = svd_u
+                    svd_mlp.down_v_proj.weight.data = svd_v
+                elif "up_proj" in name:
+                    svd_mlp.up_u_proj.weight.data = svd_u
+                    svd_mlp.up_v_proj.weight.data = svd_v
+                    layer.mlp = svd_mlp
+            W = W_scale = input_factor = output_factor = U = S = VT = truc_s = truc_u = truc_v = sqrtSigma = left_factor = right_factor = None
+            del W, W_scale, input_factor, output_factor, U, S, VT, truc_s, truc_u, truc_v, sqrtSigma, left_factor, right_factor
+        del layer
+        torch.cuda.empty_cache()
+
+
 @torch.no_grad()
 def whitening(model_name, model, profiling_mat, ratio, dev):
     model.eval()
@@ -518,6 +716,9 @@ if __name__ == '__main__':
     parser.add_argument('--gen_seq_len', type=int, default=1024, help='generated sequence len for efficiency evaluation')
     parser.add_argument('--step', type=int, default=4, help='the step to run the compression')
     parser.add_argument('--lora', type=str, default=None, help='the lora updated weight path to run the accuracy evaluation')
+    parser.add_argument('--bi_whitening', action='store_true', help='use bi-whitened SVD with both input and output-gradient curvature statistics')
+    parser.add_argument('--curvature_eps_a', type=float, default=1e-6, help='input covariance damping for bi-whitened SVD')
+    parser.add_argument('--curvature_eps_b', type=float, default=1e-6, help='output-gradient covariance damping for bi-whitened SVD')
     
     args = parser.parse_args()
     args.ratio = 1- args.ratio
@@ -526,14 +727,30 @@ if __name__ == '__main__':
         model = model.eval()
         if args.profiling_mat_path is None:
             cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
-            profiling_mat = profle_svdllm_low_resource(args.model, model, cali_white_data, args.DEV)
+            if args.bi_whitening:
+                if args.run_low_resource:
+                    raise NotImplementedError("Bi-whitened SVD is not implemented in low-resource mode.")
+                profiling_mat = profile_bi_svdllm(
+                    args.model,
+                    model,
+                    cali_white_data,
+                    args.DEV,
+                    eps_a=args.curvature_eps_a,
+                    eps_b=args.curvature_eps_b,
+                )
+            else:
+                profiling_mat = profle_svdllm_low_resource(args.model, model, cali_white_data, args.DEV)
             if args.save_path is not None:
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
-        whitening(args.model, model, profiling_mat, args.ratio, args.DEV)
+        if args.bi_whitening:
+            bi_whitening(args.model, model, profiling_mat, args.ratio, args.DEV)
+        else:
+            whitening(args.model, model, profiling_mat, args.ratio, args.DEV)
         if args.save_path is not None:
-            torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_' + str(args.ratio) + '.pt')   # fp32
+            suffix = '_bi_whitening_only_' if args.bi_whitening else '_whitening_only_'
+            torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + suffix + str(args.ratio) + '.pt')   # fp32
     elif args.step == 2:
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
         dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)

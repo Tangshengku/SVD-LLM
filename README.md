@@ -88,6 +88,8 @@ python SVDLLM.py \
 --save_path WHITENING_INFO_SAVING_PATH
 ```
 
+To run the bi-whitened SVD base method from the updated writeup, add `--bi_whitening`. This collects both activation covariances and output-gradient covariances on the calibration set, so it is slower and currently does not support `--run_low_resource`.
+
 <!-- To compress LLM with larger size, or to run the compression under the resource-constraint platform, we can add `--run_low_resource` to the command. -->
 
 
