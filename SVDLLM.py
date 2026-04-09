@@ -85,7 +85,7 @@ def profile_bi_svdllm(model_name, model, calib_loader, dev, eps_a=1e-6, eps_b=1e
     else:
         raise NotImplementedError(f"Unsupported model type for {model_name}")
 
-    model = model.to(dev)
+    # model = model.to(dev)
     model.eval()
     use_cache = model.config.use_cache
     model.config.use_cache = False
