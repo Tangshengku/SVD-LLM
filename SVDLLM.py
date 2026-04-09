@@ -631,8 +631,8 @@ def sequential_bi_whitening(model_name, model, calib_loader, ratio, dev, eps_a=1
             svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio).to(dev)
 
         for name in subset:
+            orig_weight_dtype = subset[name].weight.data.dtype
             W = subset[name].weight.data.float().to(dev)
-            weight_dtype = W.dtype
             input_factor = layer_profile[name]["input_factor"].to(dev).float()
             output_factor = layer_profile[name]["output_factor"].to(dev).float()
             W_scale = torch.matmul(output_factor.transpose(0, 1), torch.matmul(W, input_factor))
@@ -658,8 +658,8 @@ def sequential_bi_whitening(model_name, model, calib_loader, ratio, dev, eps_a=1
                 upper=True,
                 left=True,
             ).transpose(0, 1)
-            svd_u = left_factor.to(weight_dtype)
-            svd_v = right_factor.to(weight_dtype)
+            svd_u = left_factor.to(orig_weight_dtype)
+            svd_v = right_factor.to(orig_weight_dtype)
 
             if 'opt' in model_name:
                 if "q_proj" in name:
