@@ -1121,6 +1121,7 @@ if __name__ == '__main__':
                         stat_device=args.curvature_stat_device,
                         stat_dtype=torch.float32 if args.curvature_stat_dtype == 'float32' else torch.float64,
                     )
+                    bi_whitening(args.model, model, profiling_mat, args.ratio, args.DEV)
             else:
                 profiling_mat = profle_svdllm_low_resource(args.model, model, cali_white_data, args.DEV)
             if args.save_path is not None:
