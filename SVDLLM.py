@@ -87,7 +87,25 @@ def profile_bi_svdllm(model_name, model, calib_loader, dev, eps_a=1e-6, eps_b=1e
 
     model = model.to(dev)
     model.eval()
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
     print("Start obtaining the bi-whitening matrices...")
+
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+
+    original_requires_grad = {}
+    for name, param in model.named_parameters():
+        original_requires_grad[name] = param.requires_grad
+        param.requires_grad_(False)
+
+    input_embedding_hook = None
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+    else:
+        def make_inputs_require_grad(module, input, output):
+            output.requires_grad_(True)
+        input_embedding_hook = model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
     def _flatten_feature(tensor):
         tensor = tensor.detach().float()
@@ -96,12 +114,22 @@ def profile_bi_svdllm(model_name, model, calib_loader, dev, eps_a=1e-6, eps_b=1e
         return tensor.reshape(-1, tensor.shape[-1])
 
     def forward_hook(module, input, output):
-        inp = _flatten_feature(input[0])
+        inp = _flatten_feature(input[0]).cpu()
+        if isinstance(module.raw_input_cov, int):
+            module.raw_input_cov = torch.zeros(
+                (inp.shape[1], inp.shape[1]),
+                dtype=torch.float64,
+            )
         module.raw_input_cov += inp.transpose(0, 1).matmul(inp)
         module.nsamples += inp.shape[0]
 
     def backward_hook(module, grad_input, grad_output):
-        gout = _flatten_feature(grad_output[0])
+        gout = _flatten_feature(grad_output[0]).cpu()
+        if isinstance(module.raw_output_cov, int):
+            module.raw_output_cov = torch.zeros(
+                (gout.shape[1], gout.shape[1]),
+                dtype=torch.float64,
+            )
         module.raw_output_cov += gout.transpose(0, 1).matmul(gout)
 
     handles = []
@@ -122,14 +150,23 @@ def profile_bi_svdllm(model_name, model, calib_loader, dev, eps_a=1e-6, eps_b=1e
     for handle in handles:
         handle.remove()
     model.zero_grad(set_to_none=True)
+    if input_embedding_hook is not None:
+        input_embedding_hook.remove()
+    if hasattr(model, "gradient_checkpointing_disable"):
+        model.gradient_checkpointing_disable()
+    model.config.use_cache = use_cache
+    for name, param in model.named_parameters():
+        param.requires_grad_(original_requires_grad[name])
     torch.cuda.empty_cache()
     model = model.cpu()
 
     for i in range(len(layers)):
         subset = find_layers(layers[i])
         for name in subset:
-            subset[name].raw_input_cov = subset[name].raw_input_cov.cpu()
-            subset[name].raw_output_cov = subset[name].raw_output_cov.cpu()
+            if not isinstance(subset[name].raw_input_cov, int):
+                subset[name].raw_input_cov = subset[name].raw_input_cov.cpu()
+            if not isinstance(subset[name].raw_output_cov, int):
+                subset[name].raw_output_cov = subset[name].raw_output_cov.cpu()
 
     profiling_mat = {}
     print("Start bi-whitening factorization...")
@@ -139,8 +176,14 @@ def profile_bi_svdllm(model_name, model, calib_loader, dev, eps_a=1e-6, eps_b=1e
         for name in subset:
             module = subset[name]
             sample_count = max(module.nsamples, 1)
-            input_cov = module.raw_input_cov.double() / sample_count
-            output_cov = module.raw_output_cov.double() / sample_count
+            if isinstance(module.raw_input_cov, int):
+                input_cov = eps_a * torch.eye(module.in_features, dtype=torch.float64)
+            else:
+                input_cov = module.raw_input_cov.double() / sample_count
+            if isinstance(module.raw_output_cov, int):
+                output_cov = eps_b * torch.eye(module.out_features, dtype=torch.float64)
+            else:
+                output_cov = module.raw_output_cov.double() / sample_count
             input_cov += eps_a * torch.eye(input_cov.shape[0], dtype=input_cov.dtype)
             output_cov += eps_b * torch.eye(output_cov.shape[0], dtype=output_cov.dtype)
 
