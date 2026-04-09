@@ -427,6 +427,7 @@ def bi_whitening(model_name, model, profiling_mat, ratio, dev):
 def sequential_bi_whitening(model_name, model, calib_loader, ratio, dev, eps_a=1e-6, eps_b=1e-6, stat_device=None, stat_dtype=torch.float32):
     if stat_device is None:
         stat_device = dev
+    model = make_model_pickleable(model)
     model.eval()
     use_cache = model.config.use_cache
     model.config.use_cache = False
@@ -534,6 +535,7 @@ def sequential_bi_whitening(model_name, model, calib_loader, ratio, dev, eps_a=1
             model.zero_grad(set_to_none=True)
             hidden_states = inps[j].unsqueeze(0).to(dev).detach().requires_grad_(True)
             attention_mask = attention_masks[j].unsqueeze(0).to(dev)
+            moved_suffix_layers = []
             if "opt" not in model_name:
                 position_id = position_ids[j].unsqueeze(0).to(dev)
                 hidden_states = layer(hidden_states, attention_mask=attention_mask, position_ids=position_id)[0]
@@ -542,12 +544,11 @@ def sequential_bi_whitening(model_name, model, calib_loader, ratio, dev, eps_a=1
 
             for k in range(i + 1, len(layers)):
                 suffix_layer = layers[k].to(dev)
+                moved_suffix_layers.append((k, suffix_layer))
                 if "opt" not in model_name:
                     hidden_states = suffix_layer(hidden_states, attention_mask=attention_mask, position_ids=position_id)[0]
                 else:
                     hidden_states = suffix_layer(hidden_states, attention_mask=attention_mask)[0]
-                layers[k] = suffix_layer.cpu()
-                torch.cuda.empty_cache()
 
             if 'opt' in model_name:
                 if model.model.decoder.final_layer_norm is not None:
@@ -563,6 +564,9 @@ def sequential_bi_whitening(model_name, model, calib_loader, ratio, dev, eps_a=1
             loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
             loss.backward()
             model.zero_grad(set_to_none=True)
+            for k, suffix_layer in moved_suffix_layers:
+                layers[k] = suffix_layer.cpu()
+            torch.cuda.empty_cache()
 
             hidden_states = logits = shift_logits = shift_labels = loss = None
             del hidden_states, logits, shift_logits, shift_labels, loss
