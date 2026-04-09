@@ -75,7 +75,7 @@ This script would compress the LLaMA-7B model under 20\% compression ratio and a
 ## Step-by-Step Instructions of SVD-LLM
     
 ### 1. Truncation-Aware Data Whitening + SVD Compression
-Under the low compression ratio (recommended ratio <= 0.3), we first run the data whitening of the LLM and saved the weight along with the whitening information.
+Under the low compression ratio (recommended ratio <= 0.3), step `1` now runs the exact OBSVD Case B calibration-data special case, which reduces to the original whitening formulation when the empirical input covariance is full rank.
 ```
 python SVDLLM.py \
 --step 1  \

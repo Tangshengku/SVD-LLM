@@ -184,13 +184,60 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
      
  
 @torch.no_grad()
+def _recover_calibration_covariance(profile_matrix, dev):
+    profile_matrix = profile_matrix.to(dev).double()
+    lower = torch.tril(profile_matrix)
+    lower_residual = torch.linalg.norm(profile_matrix - lower)
+    sym_residual = torch.linalg.norm(profile_matrix - profile_matrix.transpose(0, 1))
+    baseline = torch.linalg.norm(profile_matrix).clamp_min(1.0)
+    if lower_residual <= 1e-6 * baseline and sym_residual > 1e-6 * baseline:
+        return lower.matmul(lower.transpose(0, 1))
+    return 0.5 * (profile_matrix + profile_matrix.transpose(0, 1))
+
+
+@torch.no_grad()
+def _case_b_calibration_special_factors(W, profile_matrix, ratio, dev):
+    # Exact Case B solution for H = Sigma_x \otimes I on the support of Sigma_x.
+    # When Sigma_x is full rank, this reduces to TSVD_k(W Sigma_x^{1/2}) Sigma_x^{-1/2}.
+    W = W.float().to(dev)
+    dtype = W.dtype
+    sigma_x = _recover_calibration_covariance(profile_matrix, dev)
+    eigvals, eigvecs = torch.linalg.eigh(sigma_x)
+    eigvals = eigvals.clamp_min(0)
+    tol = torch.finfo(eigvals.dtype).eps * sigma_x.shape[0] * eigvals.max().clamp_min(1.0)
+    keep = eigvals > tol
+
+    num_s_after_trunc = int(W.shape[0] * W.shape[1] * ratio / (W.shape[0] + W.shape[1]))
+    if not torch.any(keep):
+        return (
+            torch.zeros((W.shape[0], num_s_after_trunc), device=dev, dtype=dtype),
+            torch.zeros((num_s_after_trunc, W.shape[1]), device=dev, dtype=dtype),
+        )
+
+    support_basis = eigvecs[:, keep].float()
+    support_scales = torch.sqrt(eigvals[keep]).float()
+    whitened_input = support_basis * support_scales.unsqueeze(0)
+    W_scale = torch.matmul(W, whitened_input)
+    U, S, VT = torch.linalg.svd(W_scale, full_matrices=False)
+    num_s_after_trunc = min(num_s_after_trunc, S.shape[0])
+    truc_s = S[:num_s_after_trunc]
+    truc_u = U[:, :num_s_after_trunc]
+    inv_support_scales = torch.reciprocal(support_scales)
+    truc_v = torch.matmul(VT[:num_s_after_trunc, :] * inv_support_scales.unsqueeze(0), support_basis.transpose(0, 1))
+    sqrtSigma = torch.diag(torch.sqrt(truc_s))
+    svd_u = torch.matmul(truc_u, sqrtSigma)
+    svd_v = torch.matmul(sqrtSigma, truc_v)
+    return svd_u.to(dtype), svd_v.to(dtype)
+
+
+@torch.no_grad()
 def whitening(model_name, model, profiling_mat, ratio, dev):
     model.eval()
     if 'opt' in model_name:
         layers = model.model.decoder.layers
     else:
         layers = model.model.layers
-    print("Start SVD decomposition after whitening...")
+    print("Start OBSVD Case B decomposition with calibration Hessian...")
     for i in tqdm(range(len(layers))):
         layer = layers[i]
         subset = find_layers(layer)
@@ -207,26 +254,14 @@ def whitening(model_name, model, profiling_mat, ratio, dev):
         for name in subset:
             W = subset[name].weight.data.float().to(dev)
             dtype = W.dtype
-            scaling_diag_matrix = profiling_mat[i][name].to(dev)
-            try:
-                scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix)
-            except Exception as e:
-                print("Warning: scaling_diag_matrix is not full rank!")
-                scaling_diag_matrix += 1e-6 * torch.eye(scaling_diag_matrix.shape[0]).to(dev)
-                scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix)
-            scaling_diag_matrix = scaling_diag_matrix.float()
-            scaling_matrix_inv = scaling_matrix_inv.float()
-            W_scale = torch.matmul(W, scaling_diag_matrix)
-            U, S, VT = torch.linalg.svd(W_scale, full_matrices=False)
-            num_s_after_trunc = int(W.shape[0] * W.shape[1] * ratio / (W.shape[0] + W.shape[1]))
-            truc_s = S[:num_s_after_trunc]
-            truc_u = U[:, :num_s_after_trunc]
-            truc_v = torch.matmul(VT[:num_s_after_trunc, :], scaling_matrix_inv)
-            truc_sigma = torch.diag(truc_s)
-            #### Replace Attn, MLP ####
-            sqrtSigma = torch.sqrt(truc_sigma)
-            svd_u = torch.matmul(truc_u, sqrtSigma).cpu().to(dtype)
-            svd_v = torch.matmul(sqrtSigma, truc_v).cpu().to(dtype)
+            svd_u, svd_v = _case_b_calibration_special_factors(
+                W=W,
+                profile_matrix=profiling_mat[i][name],
+                ratio=ratio,
+                dev=dev,
+            )
+            svd_u = svd_u.cpu().to(dtype)
+            svd_v = svd_v.cpu().to(dtype)
             if 'opt' in model_name:
                 if "q_proj" in name:
                     svd_decoder.self_attn.q_u_proj.weight.data = svd_u
@@ -279,8 +314,8 @@ def whitening(model_name, model, profiling_mat, ratio, dev):
                     svd_mlp.up_u_proj.weight.data = svd_u
                     svd_mlp.up_v_proj.weight.data = svd_v
                     layer.mlp = svd_mlp
-            W = W_scale = scaling_matrix_inv = scaling_diag_matrix = U = S = VT  = truc_s = truc_u = truc_v = sqrtSigma = None
-            del  W, W_scale, scaling_matrix_inv, scaling_diag_matrix, U, S, VT, truc_s, truc_u, truc_v, sqrtSigma
+            W = svd_u = svd_v = None
+            del W, svd_u, svd_v
         del layer
         torch.cuda.empty_cache()
 
@@ -516,7 +551,7 @@ if __name__ == '__main__':
     parser.add_argument('--model_seq_len', type=int, default=2048, help='the default sequence length of the LLM')
     parser.add_argument('--eval_batch_size', type=int, default=4, help='inference bactch size')
     parser.add_argument('--gen_seq_len', type=int, default=1024, help='generated sequence len for efficiency evaluation')
-    parser.add_argument('--step', type=int, default=4, help='the step to run the compression')
+    parser.add_argument('--step', type=int, default=4, help='1: OBSVD Case-B compression, 2: whitening+update, 3: update only, 4/5: evaluation')
     parser.add_argument('--lora', type=str, default=None, help='the lora updated weight path to run the accuracy evaluation')
     
     args = parser.parse_args()
