@@ -505,10 +505,15 @@ def sequential_bi_whitening(model_name, model, calib_loader, ratio, dev, eps_a=1
             return tensor
         return tensor.reshape(-1, tensor.shape[-1])
 
-    print("Start sequential bi-whitened SVD...")
+    print(
+        "Start sequential bi-whitened SVD... "
+        f"num_layers={len(layers)}, nsamples={inps.shape[0]}, "
+        f"stat_device={stat_device}, stat_dtype={stat_dtype}, dev={dev}"
+    )
     for i in tqdm(range(len(layers))):
         layer = layers[i].to(dev)
         subset = find_layers(layer)
+        print(f"[Sequential Bi-Whitening] Layer {i + 1}/{len(layers)}: start profiling {len(subset)} linear modules")
 
         def forward_hook(module, input, output):
             inp = _flatten_feature(input[0]).to(stat_device)
@@ -532,6 +537,7 @@ def sequential_bi_whitening(model_name, model, calib_loader, ratio, dev, eps_a=1
             handles.append(subset[name].register_full_backward_hook(backward_hook))
 
         for j in range(inps.shape[0]):
+            print(f"[Sequential Bi-Whitening] Layer {i + 1}/{len(layers)} Sample {j + 1}/{inps.shape[0]}: forward/backward start")
             model.zero_grad(set_to_none=True)
             hidden_states = inps[j].unsqueeze(0).to(dev).detach().requires_grad_(True)
             attention_mask = attention_masks[j].unsqueeze(0).to(dev)
@@ -567,6 +573,10 @@ def sequential_bi_whitening(model_name, model, calib_loader, ratio, dev, eps_a=1
             for k, suffix_layer in moved_suffix_layers:
                 layers[k] = suffix_layer.cpu()
             torch.cuda.empty_cache()
+            print(
+                f"[Sequential Bi-Whitening] Layer {i + 1}/{len(layers)} Sample {j + 1}/{inps.shape[0]}: "
+                f"backward done, suffix_layers={len(moved_suffix_layers)}"
+            )
 
             hidden_states = logits = shift_logits = shift_labels = loss = None
             del hidden_states, logits, shift_logits, shift_labels, loss
@@ -574,6 +584,7 @@ def sequential_bi_whitening(model_name, model, calib_loader, ratio, dev, eps_a=1
 
         for h in handles:
             h.remove()
+        print(f"[Sequential Bi-Whitening] Layer {i + 1}/{len(layers)}: collected curvature statistics")
 
         layer_profile = {}
         for name in subset:
@@ -582,6 +593,10 @@ def sequential_bi_whitening(model_name, model, calib_loader, ratio, dev, eps_a=1
             output_cov = subset[name].raw_output_cov / sample_count
             input_cov = input_cov.cpu()
             output_cov = output_cov.cpu()
+            print(
+                f"[Sequential Bi-Whitening] Layer {i + 1}/{len(layers)} Module {name}: "
+                f"sample_count={sample_count}, input_shape={tuple(input_cov.shape)}, output_shape={tuple(output_cov.shape)}"
+            )
             input_cov += eps_a * torch.eye(input_cov.shape[0], dtype=input_cov.dtype)
             output_cov += eps_b * torch.eye(output_cov.shape[0], dtype=output_cov.dtype)
             try:
@@ -604,6 +619,7 @@ def sequential_bi_whitening(model_name, model, calib_loader, ratio, dev, eps_a=1
             subset[name].raw_output_cov = None
             del subset[name].raw_input_cov, subset[name].raw_output_cov
         profiling_mat[i] = layer_profile
+        print(f"[Sequential Bi-Whitening] Layer {i + 1}/{len(layers)}: factorization done, start compression")
 
         if "llama" in model_name or "vicuna" in model_name:
             svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio).to(dev)
@@ -622,6 +638,10 @@ def sequential_bi_whitening(model_name, model, calib_loader, ratio, dev, eps_a=1
             W_scale = torch.matmul(output_factor.transpose(0, 1), torch.matmul(W, input_factor))
             U, S, VT = torch.linalg.svd(W_scale, full_matrices=False)
             num_s_after_trunc = int(W.shape[0] * W.shape[1] * ratio / (W.shape[0] + W.shape[1]))
+            print(
+                f"[Sequential Bi-Whitening] Layer {i + 1}/{len(layers)} Module {name}: "
+                f"weight_shape={tuple(W.shape)}, trunc_rank={num_s_after_trunc}"
+            )
             truc_s = S[:num_s_after_trunc]
             truc_u = U[:, :num_s_after_trunc]
             truc_v = VT[:num_s_after_trunc, :]
@@ -696,6 +716,7 @@ def sequential_bi_whitening(model_name, model, calib_loader, ratio, dev, eps_a=1
                     layer.mlp = svd_mlp
 
         outs = torch.zeros_like(inps)
+        print(f"[Sequential Bi-Whitening] Layer {i + 1}/{len(layers)}: recomputing compressed outputs for next layer")
         for j in range(inps.shape[0]):
             hidden_states = inps[j].unsqueeze(0).to(dev)
             attention_mask = attention_masks[j].unsqueeze(0).to(dev)
@@ -708,6 +729,7 @@ def sequential_bi_whitening(model_name, model, calib_loader, ratio, dev, eps_a=1
         layers[i] = layer.cpu()
         inps = outs
         torch.cuda.empty_cache()
+        print(f"[Sequential Bi-Whitening] Layer {i + 1}/{len(layers)}: finished")
 
     if 'opt' in model_name:
         if model.model.decoder.final_layer_norm is not None:
@@ -720,6 +742,7 @@ def sequential_bi_whitening(model_name, model, calib_loader, ratio, dev, eps_a=1
     model.config.use_cache = use_cache
     for name, param in model.named_parameters():
         param.requires_grad_(original_requires_grad[name])
+    print("[Sequential Bi-Whitening] Completed all layers")
     return profiling_mat
 
 
