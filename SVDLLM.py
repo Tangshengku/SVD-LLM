@@ -77,7 +77,7 @@ def profle_svdllm(name, model, calib_loader, dev):
     return profiling_mat
         
 
-def profile_bi_svdllm(model_name, model, calib_loader, dev, eps_a=1e-6, eps_b=1e-6):
+def profile_bi_svdllm(model_name, model, calib_loader, dev, eps_a=1e-6, eps_b=1e-6, stat_device=None, stat_dtype=torch.float32):
     if "llama" in model_name or "mistral" in model_name or "vicuna" in model_name:
         layers = model.model.layers
     elif "opt" in model_name:
@@ -89,6 +89,8 @@ def profile_bi_svdllm(model_name, model, calib_loader, dev, eps_a=1e-6, eps_b=1e
     model.eval()
     use_cache = model.config.use_cache
     model.config.use_cache = False
+    if stat_device is None:
+        stat_device = dev
     print("Start obtaining the bi-whitening matrices...")
 
     if hasattr(model, "gradient_checkpointing_enable"):
@@ -108,27 +110,29 @@ def profile_bi_svdllm(model_name, model, calib_loader, dev, eps_a=1e-6, eps_b=1e
         input_embedding_hook = model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
     def _flatten_feature(tensor):
-        tensor = tensor.detach().float()
+        tensor = tensor.detach().to(dtype=stat_dtype)
         if tensor.dim() == 2:
             return tensor
         return tensor.reshape(-1, tensor.shape[-1])
 
     def forward_hook(module, input, output):
-        inp = _flatten_feature(input[0]).cpu()
+        inp = _flatten_feature(input[0]).to(stat_device)
         if isinstance(module.raw_input_cov, int):
             module.raw_input_cov = torch.zeros(
                 (inp.shape[1], inp.shape[1]),
-                dtype=torch.float64,
+                dtype=stat_dtype,
+                device=stat_device,
             )
         module.raw_input_cov += inp.transpose(0, 1).matmul(inp)
         module.nsamples += inp.shape[0]
 
     def backward_hook(module, grad_input, grad_output):
-        gout = _flatten_feature(grad_output[0]).cpu()
+        gout = _flatten_feature(grad_output[0]).to(stat_device)
         if isinstance(module.raw_output_cov, int):
             module.raw_output_cov = torch.zeros(
                 (gout.shape[1], gout.shape[1]),
-                dtype=torch.float64,
+                dtype=stat_dtype,
+                device=stat_device,
             )
         module.raw_output_cov += gout.transpose(0, 1).matmul(gout)
 
@@ -177,13 +181,13 @@ def profile_bi_svdllm(model_name, model, calib_loader, dev, eps_a=1e-6, eps_b=1e
             module = subset[name]
             sample_count = max(module.nsamples, 1)
             if isinstance(module.raw_input_cov, int):
-                input_cov = eps_a * torch.eye(module.in_features, dtype=torch.float64)
+                input_cov = eps_a * torch.eye(module.in_features, dtype=stat_dtype)
             else:
-                input_cov = module.raw_input_cov.double() / sample_count
+                input_cov = module.raw_input_cov / sample_count
             if isinstance(module.raw_output_cov, int):
-                output_cov = eps_b * torch.eye(module.out_features, dtype=torch.float64)
+                output_cov = eps_b * torch.eye(module.out_features, dtype=stat_dtype)
             else:
-                output_cov = module.raw_output_cov.double() / sample_count
+                output_cov = module.raw_output_cov / sample_count
             input_cov += eps_a * torch.eye(input_cov.shape[0], dtype=input_cov.dtype)
             output_cov += eps_b * torch.eye(output_cov.shape[0], dtype=output_cov.dtype)
 
@@ -762,6 +766,8 @@ if __name__ == '__main__':
     parser.add_argument('--bi_whitening', action='store_true', help='use bi-whitened SVD with both input and output-gradient curvature statistics')
     parser.add_argument('--curvature_eps_a', type=float, default=1e-6, help='input covariance damping for bi-whitened SVD')
     parser.add_argument('--curvature_eps_b', type=float, default=1e-6, help='output-gradient covariance damping for bi-whitened SVD')
+    parser.add_argument('--curvature_stat_device', type=str, default='cuda', help='device for accumulating bi-whitening statistics: cuda or cpu')
+    parser.add_argument('--curvature_stat_dtype', type=str, default='float32', choices=['float32', 'float64'], help='dtype for accumulating bi-whitening statistics')
     
     args = parser.parse_args()
     args.ratio = 1- args.ratio
@@ -780,6 +786,8 @@ if __name__ == '__main__':
                     args.DEV,
                     eps_a=args.curvature_eps_a,
                     eps_b=args.curvature_eps_b,
+                    stat_device=args.curvature_stat_device,
+                    stat_dtype=torch.float32 if args.curvature_stat_dtype == 'float32' else torch.float64,
                 )
             else:
                 profiling_mat = profle_svdllm_low_resource(args.model, model, cali_white_data, args.DEV)
