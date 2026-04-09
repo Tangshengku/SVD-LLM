@@ -1082,6 +1082,7 @@ if __name__ == '__main__':
     parser.add_argument('--step', type=int, default=4, help='the step to run the compression')
     parser.add_argument('--lora', type=str, default=None, help='the lora updated weight path to run the accuracy evaluation')
     parser.add_argument('--bi_whitening', action='store_true', help='use bi-whitened SVD with both input and output-gradient curvature statistics')
+    parser.add_argument('--bi_whitening_sequential', action='store_true', help='use sequential profiling/compression for bi-whitening; otherwise use the original non-sequential bi-whitening path')
     parser.add_argument('--curvature_eps_a', type=float, default=1e-6, help='input covariance damping for bi-whitened SVD')
     parser.add_argument('--curvature_eps_b', type=float, default=1e-6, help='output-gradient covariance damping for bi-whitened SVD')
     parser.add_argument('--curvature_stat_device', type=str, default='cuda', help='device for accumulating bi-whitening statistics: cuda or cpu')
@@ -1095,25 +1096,41 @@ if __name__ == '__main__':
         if args.profiling_mat_path is None:
             cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
             if args.bi_whitening:
-                profiling_mat = sequential_bi_whitening(
-                    args.model,
-                    model,
-                    cali_white_data,
-                    args.ratio,
-                    args.DEV,
-                    eps_a=args.curvature_eps_a,
-                    eps_b=args.curvature_eps_b,
-                    stat_device=args.curvature_stat_device,
-                    stat_dtype=torch.float32 if args.curvature_stat_dtype == 'float32' else torch.float64,
-                )
+                if args.bi_whitening_sequential:
+                    profiling_mat = sequential_bi_whitening(
+                        args.model,
+                        model,
+                        cali_white_data,
+                        args.ratio,
+                        args.DEV,
+                        eps_a=args.curvature_eps_a,
+                        eps_b=args.curvature_eps_b,
+                        stat_device=args.curvature_stat_device,
+                        stat_dtype=torch.float32 if args.curvature_stat_dtype == 'float32' else torch.float64,
+                    )
+                else:
+                    if args.run_low_resource:
+                        raise NotImplementedError("Non-sequential bi-whitening is not implemented in low-resource mode.")
+                    profiling_mat = profile_bi_svdllm(
+                        args.model,
+                        model,
+                        cali_white_data,
+                        args.DEV,
+                        eps_a=args.curvature_eps_a,
+                        eps_b=args.curvature_eps_b,
+                        stat_device=args.curvature_stat_device,
+                        stat_dtype=torch.float32 if args.curvature_stat_dtype == 'float32' else torch.float64,
+                    )
             else:
                 profiling_mat = profle_svdllm_low_resource(args.model, model, cali_white_data, args.DEV)
             if args.save_path is not None:
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
-            if args.bi_whitening:
+            if args.bi_whitening and not args.bi_whitening_sequential:
                 bi_whitening(args.model, model, profiling_mat, args.ratio, args.DEV)
+        if args.bi_whitening and (args.profiling_mat_path is not None) and args.bi_whitening_sequential:
+            raise ValueError("Sequential bi-whitening does not support --profiling_mat_path because profiling and compression are coupled.")
         if not args.bi_whitening:
             whitening(args.model, model, profiling_mat, args.ratio, args.DEV)
         if args.save_path is not None:
