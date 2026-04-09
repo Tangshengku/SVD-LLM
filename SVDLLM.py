@@ -333,13 +333,13 @@ def bi_whitening(model_name, model, profiling_mat, ratio, dev):
         layer = layers[i]
         subset = find_layers(layer)
         if "llama" in model_name or "vicuna" in model_name:
-            svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio)
-            svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio)
+            svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio).to(dev)
+            svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio).to(dev)
         elif "mistral" in model_name:
-            svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio)
-            svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio)
+            svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio).to(dev)
+            svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio).to(dev)
         elif 'opt' in model_name:
-            svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio)
+            svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio).to(dev)
         for name in subset:
             W = subset[name].weight.data.float().to(dev)
             dtype = W.dtype
@@ -422,6 +422,301 @@ def bi_whitening(model_name, model, profiling_mat, ratio, dev):
             del W, W_scale, input_factor, output_factor, U, S, VT, truc_s, truc_u, truc_v, sqrtSigma, left_factor, right_factor
         del layer
         torch.cuda.empty_cache()
+
+
+def sequential_bi_whitening(model_name, model, calib_loader, ratio, dev, eps_a=1e-6, eps_b=1e-6, stat_device=None, stat_dtype=torch.float32):
+    if stat_device is None:
+        stat_device = dev
+    model.eval()
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+
+    if 'opt' in model_name:
+        layers = model.model.decoder.layers
+        model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev)
+        model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(dev)
+        if model.model.decoder.final_layer_norm is not None:
+            model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.to(dev)
+        if hasattr(model.model.decoder, "project_out") and model.model.decoder.project_out is not None:
+            model.model.decoder.project_out = model.model.decoder.project_out.to(dev)
+    else:
+        layers = model.model.layers
+        model.model.embed_tokens = model.model.embed_tokens.to(dev)
+        model.model.norm = model.model.norm.to(dev)
+    model.lm_head = model.lm_head.to(dev)
+
+    original_requires_grad = {}
+    for name, param in model.named_parameters():
+        original_requires_grad[name] = param.requires_grad
+        param.requires_grad_(False)
+
+    dtype = next(iter(model.parameters())).dtype
+    inps = torch.zeros(
+        (len(calib_loader), model.seqlen, model.config.hidden_size), dtype=dtype, device="cpu"
+    )
+    labels = torch.zeros((len(calib_loader), model.seqlen), dtype=torch.long, device="cpu")
+    cache = {'i': 0, 'attention_mask': None, "position_ids": None}
+
+    class Catcher(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+
+        def forward(self, inp, **kwargs):
+            inps[cache['i']] = inp.detach().cpu()
+            labels[cache['i']] = cache['current_labels']
+            cache['i'] += 1
+            if cache['attention_mask'] is None:
+                cache['attention_mask'] = kwargs['attention_mask'].detach().cpu()
+                if "opt" not in model_name:
+                    cache['position_ids'] = kwargs['position_ids'].detach().cpu()
+            else:
+                cache['attention_mask'] = torch.cat((cache['attention_mask'], kwargs['attention_mask'].detach().cpu()), dim=0)
+                if "opt" not in model_name:
+                    cache['position_ids'] = torch.cat((cache['position_ids'], kwargs['position_ids'].detach().cpu()), dim=0)
+            raise ValueError
+
+    layers[0] = Catcher(layers[0])
+    for batch in calib_loader:
+        try:
+            batch = {k: v.to(dev) for k, v in batch.items()}
+            cache['current_labels'] = batch["input_ids"].detach().cpu()
+            model(**batch, labels=batch["input_ids"])
+        except ValueError:
+            pass
+    layers[0] = layers[0].module
+
+    if 'opt' in model_name:
+        model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
+        model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
+    else:
+        model.model.embed_tokens = model.model.embed_tokens.cpu()
+    torch.cuda.empty_cache()
+
+    attention_masks = cache['attention_mask']
+    position_ids = cache['position_ids'] if "opt" not in model_name else None
+    profiling_mat = {}
+    loss_fct = torch.nn.CrossEntropyLoss()
+
+    def _flatten_feature(tensor):
+        tensor = tensor.detach().to(dtype=stat_dtype)
+        if tensor.dim() == 2:
+            return tensor
+        return tensor.reshape(-1, tensor.shape[-1])
+
+    print("Start sequential bi-whitened SVD...")
+    for i in tqdm(range(len(layers))):
+        layer = layers[i].to(dev)
+        subset = find_layers(layer)
+
+        def forward_hook(module, input, output):
+            inp = _flatten_feature(input[0]).to(stat_device)
+            if isinstance(module.raw_input_cov, int):
+                module.raw_input_cov = torch.zeros((inp.shape[1], inp.shape[1]), dtype=stat_dtype, device=stat_device)
+            module.raw_input_cov += inp.transpose(0, 1).matmul(inp)
+            module.nsamples += inp.shape[0]
+
+        def backward_hook(module, grad_input, grad_output):
+            gout = _flatten_feature(grad_output[0]).to(stat_device)
+            if isinstance(module.raw_output_cov, int):
+                module.raw_output_cov = torch.zeros((gout.shape[1], gout.shape[1]), dtype=stat_dtype, device=stat_device)
+            module.raw_output_cov += gout.transpose(0, 1).matmul(gout)
+
+        handles = []
+        for name in subset:
+            subset[name].raw_input_cov = 0
+            subset[name].raw_output_cov = 0
+            subset[name].nsamples = 0
+            handles.append(subset[name].register_forward_hook(forward_hook))
+            handles.append(subset[name].register_full_backward_hook(backward_hook))
+
+        for j in range(inps.shape[0]):
+            model.zero_grad(set_to_none=True)
+            hidden_states = inps[j].unsqueeze(0).to(dev).detach().requires_grad_(True)
+            attention_mask = attention_masks[j].unsqueeze(0).to(dev)
+            if "opt" not in model_name:
+                position_id = position_ids[j].unsqueeze(0).to(dev)
+                hidden_states = layer(hidden_states, attention_mask=attention_mask, position_ids=position_id)[0]
+            else:
+                hidden_states = layer(hidden_states, attention_mask=attention_mask)[0]
+
+            for k in range(i + 1, len(layers)):
+                suffix_layer = layers[k].to(dev)
+                if "opt" not in model_name:
+                    hidden_states = suffix_layer(hidden_states, attention_mask=attention_mask, position_ids=position_id)[0]
+                else:
+                    hidden_states = suffix_layer(hidden_states, attention_mask=attention_mask)[0]
+                layers[k] = suffix_layer.cpu()
+                torch.cuda.empty_cache()
+
+            if 'opt' in model_name:
+                if model.model.decoder.final_layer_norm is not None:
+                    hidden_states = model.model.decoder.final_layer_norm(hidden_states)
+                if hasattr(model.model.decoder, "project_out") and model.model.decoder.project_out is not None:
+                    hidden_states = model.model.decoder.project_out(hidden_states)
+            else:
+                hidden_states = model.model.norm(hidden_states)
+
+            logits = model.lm_head(hidden_states)
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[j].unsqueeze(0).to(dev)[:, 1:].contiguous()
+            loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
+            loss.backward()
+            model.zero_grad(set_to_none=True)
+
+            hidden_states = logits = shift_logits = shift_labels = loss = None
+            del hidden_states, logits, shift_logits, shift_labels, loss
+            torch.cuda.empty_cache()
+
+        for h in handles:
+            h.remove()
+
+        layer_profile = {}
+        for name in subset:
+            sample_count = max(subset[name].nsamples, 1)
+            input_cov = subset[name].raw_input_cov / sample_count
+            output_cov = subset[name].raw_output_cov / sample_count
+            input_cov = input_cov.cpu()
+            output_cov = output_cov.cpu()
+            input_cov += eps_a * torch.eye(input_cov.shape[0], dtype=input_cov.dtype)
+            output_cov += eps_b * torch.eye(output_cov.shape[0], dtype=output_cov.dtype)
+            try:
+                input_factor = torch.linalg.cholesky(input_cov)
+            except Exception:
+                eigenvalues = torch.linalg.eigvalsh(input_cov)
+                input_cov += (-eigenvalues[0] + eps_a) * torch.eye(input_cov.shape[0], dtype=input_cov.dtype)
+                input_factor = torch.linalg.cholesky(input_cov)
+            try:
+                output_factor = torch.linalg.cholesky(output_cov)
+            except Exception:
+                eigenvalues = torch.linalg.eigvalsh(output_cov)
+                output_cov += (-eigenvalues[0] + eps_b) * torch.eye(output_cov.shape[0], dtype=output_cov.dtype)
+                output_factor = torch.linalg.cholesky(output_cov)
+            layer_profile[name] = {
+                "input_factor": input_factor,
+                "output_factor": output_factor,
+            }
+            subset[name].raw_input_cov = None
+            subset[name].raw_output_cov = None
+            del subset[name].raw_input_cov, subset[name].raw_output_cov
+        profiling_mat[i] = layer_profile
+
+        if "llama" in model_name or "vicuna" in model_name:
+            svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio).to(dev)
+            svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio).to(dev)
+        elif "mistral" in model_name:
+            svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio).to(dev)
+            svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio).to(dev)
+        elif 'opt' in model_name:
+            svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio).to(dev)
+
+        for name in subset:
+            W = subset[name].weight.data.float().to(dev)
+            weight_dtype = W.dtype
+            input_factor = layer_profile[name]["input_factor"].to(dev).float()
+            output_factor = layer_profile[name]["output_factor"].to(dev).float()
+            W_scale = torch.matmul(output_factor.transpose(0, 1), torch.matmul(W, input_factor))
+            U, S, VT = torch.linalg.svd(W_scale, full_matrices=False)
+            num_s_after_trunc = int(W.shape[0] * W.shape[1] * ratio / (W.shape[0] + W.shape[1]))
+            truc_s = S[:num_s_after_trunc]
+            truc_u = U[:, :num_s_after_trunc]
+            truc_v = VT[:num_s_after_trunc, :]
+            sqrtSigma = torch.diag(torch.sqrt(truc_s))
+            left_factor = torch.linalg.solve_triangular(
+                output_factor.transpose(0, 1),
+                torch.matmul(truc_u, sqrtSigma),
+                upper=True,
+                left=True,
+            )
+            right_factor = torch.linalg.solve_triangular(
+                input_factor.transpose(0, 1),
+                torch.matmul(sqrtSigma, truc_v).transpose(0, 1),
+                upper=True,
+                left=True,
+            ).transpose(0, 1)
+            svd_u = left_factor.to(weight_dtype)
+            svd_v = right_factor.to(weight_dtype)
+
+            if 'opt' in model_name:
+                if "q_proj" in name:
+                    svd_decoder.self_attn.q_u_proj.weight.data = svd_u
+                    svd_decoder.self_attn.q_v_proj.weight.data = svd_v
+                    svd_decoder.self_attn.q_u_proj.bias.data = layer.self_attn.q_proj.bias.data
+                elif "k_proj" in name:
+                    svd_decoder.self_attn.k_u_proj.weight.data = svd_u
+                    svd_decoder.self_attn.k_v_proj.weight.data = svd_v
+                    svd_decoder.self_attn.k_u_proj.bias.data = layer.self_attn.k_proj.bias.data
+                elif "v_proj" in name:
+                    svd_decoder.self_attn.v_u_proj.weight.data = svd_u
+                    svd_decoder.self_attn.v_v_proj.weight.data = svd_v
+                    svd_decoder.self_attn.v_u_proj.bias.data = layer.self_attn.v_proj.bias.data
+                elif "out_proj" in name:
+                    svd_decoder.self_attn.out_u_proj.weight.data = svd_u
+                    svd_decoder.self_attn.out_v_proj.weight.data = svd_v
+                    svd_decoder.self_attn.out_u_proj.bias.data = layer.self_attn.out_proj.bias.data
+                elif "fc1" in name:
+                    svd_decoder.fc1_u_proj.weight.data = svd_u
+                    svd_decoder.fc1_v_proj.weight.data = svd_v
+                    svd_decoder.fc1_u_proj.bias.data = layer.fc1.bias.data
+                elif "fc2" in name:
+                    svd_decoder.fc2_u_proj.weight.data = svd_u
+                    svd_decoder.fc2_v_proj.weight.data = svd_v
+                    svd_decoder.fc2_u_proj.bias.data = layer.fc2.bias.data
+                    svd_decoder.self_attn_layer_norm = layer.self_attn_layer_norm
+                    svd_decoder.final_layer_norm = layer.final_layer_norm
+                    layer = svd_decoder
+                    layers[i] = layer
+            else:
+                if "q_proj" in name:
+                    svd_attn.q_u_proj.weight.data = svd_u
+                    svd_attn.q_v_proj.weight.data = svd_v
+                elif "k_proj" in name:
+                    svd_attn.k_u_proj.weight.data = svd_u
+                    svd_attn.k_v_proj.weight.data = svd_v
+                elif "v_proj" in name:
+                    svd_attn.v_u_proj.weight.data = svd_u
+                    svd_attn.v_v_proj.weight.data = svd_v
+                elif "o_proj" in name:
+                    svd_attn.o_u_proj.weight.data = svd_u
+                    svd_attn.o_v_proj.weight.data = svd_v
+                    layer.self_attn = svd_attn
+                elif "gate_proj" in name:
+                    svd_mlp.gate_u_proj.weight.data = svd_u
+                    svd_mlp.gate_v_proj.weight.data = svd_v
+                elif "down_proj" in name:
+                    svd_mlp.down_u_proj.weight.data = svd_u
+                    svd_mlp.down_v_proj.weight.data = svd_v
+                elif "up_proj" in name:
+                    svd_mlp.up_u_proj.weight.data = svd_u
+                    svd_mlp.up_v_proj.weight.data = svd_v
+                    layer.mlp = svd_mlp
+
+        outs = torch.zeros_like(inps)
+        for j in range(inps.shape[0]):
+            hidden_states = inps[j].unsqueeze(0).to(dev)
+            attention_mask = attention_masks[j].unsqueeze(0).to(dev)
+            if "opt" not in model_name:
+                position_id = position_ids[j].unsqueeze(0).to(dev)
+                outs[j] = layer(hidden_states, attention_mask=attention_mask, position_ids=position_id)[0].detach().cpu()
+            else:
+                outs[j] = layer(hidden_states, attention_mask=attention_mask)[0].detach().cpu()
+
+        layers[i] = layer.cpu()
+        inps = outs
+        torch.cuda.empty_cache()
+
+    if 'opt' in model_name:
+        if model.model.decoder.final_layer_norm is not None:
+            model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.cpu()
+        if hasattr(model.model.decoder, "project_out") and model.model.decoder.project_out is not None:
+            model.model.decoder.project_out = model.model.decoder.project_out.cpu()
+    else:
+        model.model.norm = model.model.norm.cpu()
+    model.lm_head = model.lm_head.cpu()
+    model.config.use_cache = use_cache
+    for name, param in model.named_parameters():
+        param.requires_grad_(original_requires_grad[name])
+    return profiling_mat
 
 
 @torch.no_grad()
@@ -773,12 +1068,11 @@ if __name__ == '__main__':
         if args.profiling_mat_path is None:
             cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
             if args.bi_whitening:
-                if args.run_low_resource:
-                    raise NotImplementedError("Bi-whitened SVD is not implemented in low-resource mode.")
-                profiling_mat = profile_bi_svdllm(
+                profiling_mat = sequential_bi_whitening(
                     args.model,
                     model,
                     cali_white_data,
+                    args.ratio,
                     args.DEV,
                     eps_a=args.curvature_eps_a,
                     eps_b=args.curvature_eps_b,
@@ -791,9 +1085,9 @@ if __name__ == '__main__':
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
-        if args.bi_whitening:
-            bi_whitening(args.model, model, profiling_mat, args.ratio, args.DEV)
-        else:
+            if args.bi_whitening:
+                bi_whitening(args.model, model, profiling_mat, args.ratio, args.DEV)
+        if not args.bi_whitening:
             whitening(args.model, model, profiling_mat, args.ratio, args.DEV)
         if args.save_path is not None:
             suffix = '_bi_whitening_only_' if args.bi_whitening else '_whitening_only_'
