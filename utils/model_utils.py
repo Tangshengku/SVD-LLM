@@ -26,6 +26,29 @@ def get_model_from_local(model_id):
     tokenizer, model = pruned_dict['tokenizer'], pruned_dict['model']
     return model, tokenizer
 
+
+def make_model_pickleable(model):
+    for module in model.modules():
+        for attr in ["to", "cuda", "cpu", "half", "float"]:
+            if attr in getattr(module, "__dict__", {}):
+                delattr(module, attr)
+        if hasattr(module, "_old_forward"):
+            module.forward = module._old_forward
+            delattr(module, "_old_forward")
+        if hasattr(module, "_hf_hook"):
+            delattr(module, "_hf_hook")
+        if hasattr(module, "_forward_hooks"):
+            module._forward_hooks.clear()
+        if hasattr(module, "_forward_pre_hooks"):
+            module._forward_pre_hooks.clear()
+        if hasattr(module, "_backward_hooks"):
+            module._backward_hooks.clear()
+        if hasattr(module, "_backward_pre_hooks"):
+            module._backward_pre_hooks.clear()
+    if hasattr(model, "gradient_checkpointing_disable"):
+        model.gradient_checkpointing_disable()
+    return model
+
 def find_layers(module, layers=[nn.Conv2d, nn.Linear], name=''):
     if type(module) in layers:
         return {name: module}
