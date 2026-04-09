@@ -101,13 +101,9 @@ def profile_bi_svdllm(model_name, model, calib_loader, dev, eps_a=1e-6, eps_b=1e
         original_requires_grad[name] = param.requires_grad
         param.requires_grad_(False)
 
-    input_embedding_hook = None
-    if hasattr(model, "enable_input_require_grads"):
-        model.enable_input_require_grads()
-    else:
-        def make_inputs_require_grad(module, input, output):
-            output.requires_grad_(True)
-        input_embedding_hook = model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+    def make_inputs_require_grad(module, input, output):
+        output.requires_grad_(True)
+    input_embedding_hook = model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
     def _flatten_feature(tensor):
         tensor = tensor.detach().to(dtype=stat_dtype)
