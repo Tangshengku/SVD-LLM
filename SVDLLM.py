@@ -362,6 +362,7 @@ def _prepare_task_aware_candidates(model_name, model, profiling_mat, ratio, cand
 def _collect_task_aware_stats(model, calibration_loader, candidate_map, dev):
     use_cache = model.config.use_cache
     model.config.use_cache = False
+    model = model.to(dev)
     model.eval()
     model.zero_grad(set_to_none=True)
     handles = []
@@ -406,6 +407,8 @@ def _collect_task_aware_stats(model, calibration_loader, candidate_map, dev):
         handle.remove()
     model.zero_grad(set_to_none=True)
     model.config.use_cache = use_cache
+    model = model.cpu()
+    torch.cuda.empty_cache()
 
 
 def whitening_task_aware(model_name, model, profiling_mat, ratio, calibration_loader, candidate_extra, dev):
