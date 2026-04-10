@@ -2,6 +2,7 @@
 import os
 import sys
 import argparse
+from types import SimpleNamespace
 import torch.jit
 from tqdm import tqdm
 import torch
@@ -285,6 +286,229 @@ def whitening(model_name, model, profiling_mat, ratio, dev):
         torch.cuda.empty_cache()
 
 
+def _compute_whitened_svd(weight, scaling_diag_matrix, dev):
+    W = weight.data.float().to(dev)
+    dtype = W.dtype
+    scaling_diag_matrix = scaling_diag_matrix.to(dev)
+    try:
+        scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix)
+    except Exception as e:
+        print("Warning: scaling_diag_matrix is not full rank!")
+        scaling_diag_matrix += 1e-6 * torch.eye(scaling_diag_matrix.shape[0]).to(dev)
+        scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix)
+    scaling_diag_matrix = scaling_diag_matrix.float()
+    scaling_matrix_inv = scaling_matrix_inv.float()
+    W_scale = torch.matmul(W, scaling_diag_matrix)
+    U, S, VT = torch.linalg.svd(W_scale, full_matrices=False)
+    return SimpleNamespace(
+        W=W,
+        dtype=dtype,
+        scaling_diag_matrix=scaling_diag_matrix,
+        scaling_matrix_inv=scaling_matrix_inv,
+        W_scale=W_scale,
+        U=U,
+        S=S,
+        VT=VT,
+    )
+
+
+def _build_factorized_weight(U, S, VT, scaling_matrix_inv, selected_idx, dtype):
+    selected_idx = selected_idx.to(U.device)
+    selected_sigma = S.index_select(0, selected_idx)
+    selected_u = U.index_select(1, selected_idx)
+    selected_v = torch.matmul(VT.index_select(0, selected_idx), scaling_matrix_inv)
+    sqrt_sigma = torch.diag(torch.sqrt(selected_sigma))
+    svd_u = torch.matmul(selected_u, sqrt_sigma).cpu().to(dtype)
+    svd_v = torch.matmul(sqrt_sigma, selected_v).cpu().to(dtype)
+    return svd_u, svd_v
+
+
+def _get_target_rank(weight, ratio):
+    return int(weight.shape[0] * weight.shape[1] * ratio / (weight.shape[0] + weight.shape[1]))
+
+
+@torch.no_grad()
+def _prepare_task_aware_candidates(model_name, model, profiling_mat, ratio, candidate_extra, dev):
+    if 'opt' in model_name:
+        layers = model.model.decoder.layers
+    else:
+        layers = model.model.layers
+    candidate_map = {}
+    print("Preparing whitened SVD candidates for task-aware selection...")
+    for i in tqdm(range(len(layers))):
+        subset = find_layers(layers[i])
+        for name in subset:
+            svd_ctx = _compute_whitened_svd(subset[name].weight, profiling_mat[i][name], dev)
+            target_rank = _get_target_rank(subset[name].weight, ratio)
+            full_rank = svd_ctx.S.shape[0]
+            candidate_rank = min(full_rank, target_rank + candidate_extra)
+            candidate_map[subset[name]] = {
+                "layer_idx": i,
+                "name": name,
+                "target_rank": target_rank,
+                "candidate_rank": candidate_rank,
+                "sigma": svd_ctx.S[:candidate_rank].cpu(),
+                "u": svd_ctx.U[:, :candidate_rank].cpu(),
+                "v": torch.matmul(svd_ctx.VT[:candidate_rank, :], svd_ctx.scaling_matrix_inv).cpu(),
+                "sum_phi": torch.zeros(candidate_rank, dtype=torch.float64),
+                "sum_phi_sq": torch.zeros(candidate_rank, dtype=torch.float64),
+                "count": 0,
+            }
+            del svd_ctx
+            torch.cuda.empty_cache()
+    return candidate_map
+
+
+def _collect_task_aware_stats(model, calibration_loader, candidate_map, dev):
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+    model.eval()
+    model.zero_grad(set_to_none=True)
+    handles = []
+
+    def forward_hook(module, inputs, output):
+        inp = inputs[0].detach().float()
+        info = candidate_map[module]
+        v = info["v"].to(inp.device)
+        module._task_aware_proj = torch.matmul(inp, v.t())
+
+    def backward_hook(module, grad_input, grad_output):
+        proj = module._task_aware_proj
+        grad = grad_output[0].detach().float()
+        info = candidate_map[module]
+        u = info["u"].to(grad.device)
+        phi = torch.matmul(grad, u) * proj
+        phi = phi.reshape(-1, info["candidate_rank"])
+        info["sum_phi"] += phi.sum(dim=0).double().cpu()
+        info["sum_phi_sq"] += phi.pow(2).sum(dim=0).double().cpu()
+        info["count"] += phi.shape[0]
+        del module._task_aware_proj
+
+    for module in candidate_map:
+        handles.append(module.register_forward_hook(forward_hook))
+        handles.append(module.register_full_backward_hook(backward_hook))
+
+    print("Collecting task-aware singular saliency statistics...")
+    for batch in tqdm(calibration_loader):
+        model.zero_grad(set_to_none=True)
+        if isinstance(batch, dict):
+            inputs = {k: v.to(dev) for k, v in batch.items()}
+            labels = inputs["input_ids"]
+            outputs = model(**inputs, labels=labels, use_cache=False)
+        else:
+            input_ids = batch[0].to(dev)
+            outputs = model(input_ids=input_ids, labels=input_ids, use_cache=False)
+        outputs.loss.backward()
+        del outputs
+        torch.cuda.empty_cache()
+
+    for handle in handles:
+        handle.remove()
+    model.zero_grad(set_to_none=True)
+    model.config.use_cache = use_cache
+
+
+def whitening_task_aware(model_name, model, profiling_mat, ratio, calibration_loader, candidate_extra, dev):
+    model.eval()
+    candidate_map = _prepare_task_aware_candidates(model_name, model, profiling_mat, ratio, candidate_extra, dev)
+    _collect_task_aware_stats(model, calibration_loader, candidate_map, dev)
+    if 'opt' in model_name:
+        layers = model.model.decoder.layers
+    else:
+        layers = model.model.layers
+    print("Applying task-aware singular selection...")
+    for i in tqdm(range(len(layers))):
+        layer = layers[i]
+        subset = find_layers(layer)
+        if "llama" in model_name or "vicuna" in model_name:
+            svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio)
+            svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio)
+        elif "mistral" in model_name:
+            svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio)
+            svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio)
+        elif 'opt' in model_name:
+            svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio)
+        for name in subset:
+            info = candidate_map[subset[name]]
+            svd_ctx = _compute_whitened_svd(subset[name].weight, profiling_mat[i][name], dev)
+            if info["target_rank"] == 0:
+                selected_idx = torch.empty(0, dtype=torch.long)
+            elif info["candidate_rank"] <= info["target_rank"]:
+                selected_idx = torch.arange(info["candidate_rank"], dtype=torch.long)
+            else:
+                count = max(info["count"], 1)
+                h = (info["sum_phi"] / count).float()
+                fii = (info["sum_phi_sq"] / count).float()
+                sigma = info["sigma"].float()
+                saliency = -h * sigma + 0.5 * sigma.pow(2) * fii
+                selected_idx = torch.topk(saliency, k=info["target_rank"], largest=True).indices
+                selected_idx = selected_idx[torch.argsort(saliency.index_select(0, selected_idx), descending=True)]
+            svd_u, svd_v = _build_factorized_weight(
+                svd_ctx.U,
+                svd_ctx.S,
+                svd_ctx.VT,
+                svd_ctx.scaling_matrix_inv,
+                selected_idx,
+                svd_ctx.dtype,
+            )
+            if 'opt' in model_name:
+                if "q_proj" in name:
+                    svd_decoder.self_attn.q_u_proj.weight.data = svd_u
+                    svd_decoder.self_attn.q_v_proj.weight.data = svd_v
+                    svd_decoder.self_attn.q_u_proj.bias.data = layer.self_attn.q_proj.bias.data
+                elif "k_proj" in name:
+                    svd_decoder.self_attn.k_u_proj.weight.data = svd_u
+                    svd_decoder.self_attn.k_v_proj.weight.data = svd_v
+                    svd_decoder.self_attn.k_u_proj.bias.data = layer.self_attn.k_proj.bias.data
+                elif "v_proj" in name:
+                    svd_decoder.self_attn.v_u_proj.weight.data = svd_u
+                    svd_decoder.self_attn.v_v_proj.weight.data = svd_v
+                    svd_decoder.self_attn.v_u_proj.bias.data = layer.self_attn.v_proj.bias.data
+                elif "out_proj" in name:
+                    svd_decoder.self_attn.out_u_proj.weight.data = svd_u
+                    svd_decoder.self_attn.out_v_proj.weight.data = svd_v
+                    svd_decoder.self_attn.out_u_proj.bias.data = layer.self_attn.out_proj.bias.data
+                elif "fc1" in name:
+                    svd_decoder.fc1_u_proj.weight.data = svd_u
+                    svd_decoder.fc1_v_proj.weight.data = svd_v
+                    svd_decoder.fc1_u_proj.bias.data = layer.fc1.bias.data
+                elif "fc2" in name:
+                    svd_decoder.fc2_u_proj.weight.data = svd_u
+                    svd_decoder.fc2_v_proj.weight.data = svd_v
+                    svd_decoder.fc2_u_proj.bias.data = layer.fc2.bias.data
+                    svd_decoder.self_attn_layer_norm = layer.self_attn_layer_norm
+                    svd_decoder.final_layer_norm = layer.final_layer_norm
+                    layers[i] = svd_decoder
+            else:
+                if "q_proj" in name:
+                    svd_attn.q_u_proj.weight.data = svd_u
+                    svd_attn.q_v_proj.weight.data = svd_v
+                elif "k_proj" in name:
+                    svd_attn.k_u_proj.weight.data = svd_u
+                    svd_attn.k_v_proj.weight.data = svd_v
+                elif "v_proj" in name:
+                    svd_attn.v_u_proj.weight.data = svd_u
+                    svd_attn.v_v_proj.weight.data = svd_v
+                elif "o_proj" in name:
+                    svd_attn.o_u_proj.weight.data = svd_u
+                    svd_attn.o_v_proj.weight.data = svd_v
+                    layer.self_attn =  svd_attn
+                elif "gate_proj" in name:
+                    svd_mlp.gate_u_proj.weight.data = svd_u
+                    svd_mlp.gate_v_proj.weight.data = svd_v
+                elif "down_proj" in name:
+                    svd_mlp.down_u_proj.weight.data = svd_u
+                    svd_mlp.down_v_proj.weight.data = svd_v
+                elif "up_proj" in name:
+                    svd_mlp.up_u_proj.weight.data = svd_u
+                    svd_mlp.up_v_proj.weight.data = svd_v
+                    layer.mlp = svd_mlp
+            del svd_ctx
+            torch.cuda.empty_cache()
+        del layer
+        torch.cuda.empty_cache()
+
+
 @torch.no_grad()
 def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, dev, direct_update=False):
     print("Start SVD decomposition then update...")
@@ -518,12 +742,17 @@ if __name__ == '__main__':
     parser.add_argument('--gen_seq_len', type=int, default=1024, help='generated sequence len for efficiency evaluation')
     parser.add_argument('--step', type=int, default=4, help='the step to run the compression')
     parser.add_argument('--lora', type=str, default=None, help='the lora updated weight path to run the accuracy evaluation')
+    parser.add_argument('--selection_method', type=str, default='topk', choices=['topk', 'task_aware_diag'], help='Singular-direction selection rule for whitening compression.')
+    parser.add_argument('--selection_nsamples', type=int, default=16, help='Number of calibration samples used to estimate task-aware singular saliency.')
+    parser.add_argument('--selection_candidate_extra', type=int, default=32, help='Additional candidate singular directions considered beyond the target rank for task-aware selection.')
     
     args = parser.parse_args()
     args.ratio = 1- args.ratio
     if args.step == 1:
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
         model = model.eval()
+        if args.selection_method == "task_aware_diag":
+            model = model.float()
         if args.profiling_mat_path is None:
             cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
             profiling_mat = profle_svdllm_low_resource(args.model, model, cali_white_data, args.DEV)
@@ -531,7 +760,19 @@ if __name__ == '__main__':
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
-        whitening(args.model, model, profiling_mat, args.ratio, args.DEV)
+        if args.selection_method == "task_aware_diag":
+            selection_loader, _ = get_loaders(args.dataset, nsamples=args.selection_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
+            whitening_task_aware(
+                args.model,
+                model,
+                profiling_mat,
+                args.ratio,
+                selection_loader,
+                args.selection_candidate_extra,
+                args.DEV,
+            )
+        else:
+            whitening(args.model, model, profiling_mat, args.ratio, args.DEV)
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_' + str(args.ratio) + '.pt')   # fp32
     elif args.step == 2:
