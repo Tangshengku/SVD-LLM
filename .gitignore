@@ -4,3 +4,4 @@ cache/*
 utils/c4-*
 *.pdf
 compress_llama.sh
+*.pt
