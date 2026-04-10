@@ -1218,6 +1218,7 @@ if __name__ == '__main__':
     args.ratio = 1- args.ratio
     if args.step == 1:
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
+        model = make_model_pickleable(model)
         model = model.eval()
         rank_schedule = None
         if args.profiling_mat_path is None:
@@ -1298,6 +1299,7 @@ if __name__ == '__main__':
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + suffix + str(args.ratio) + '.pt')   # fp32
     elif args.step == 2:
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
+        model = make_model_pickleable(model)
         dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
         model = model.eval()
         model = model.float()  # need to set to float
@@ -1325,6 +1327,7 @@ if __name__ == '__main__':
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_then_update_' + str(args.ratio) + '.pt')  # fp32
     elif args.step == 3:
         model, tokenizer = get_model_from_huggingface(args.model)
+        model = make_model_pickleable(model)
         model = model.eval()
         model = model.float()
         dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
