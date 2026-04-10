@@ -90,6 +90,8 @@ python SVDLLM.py \
 
 To run the bi-whitened SVD base method from the updated writeup, add `--bi_whitening`. This collects both activation covariances and output-gradient covariances on the calibration set, so it is slower and currently does not support `--run_low_resource`. You can keep the statistics on GPU with `--curvature_stat_device cuda` and reduce memory by using `--curvature_stat_dtype float32`.
 
+To enable the writeup's global rank reallocation under the same total low-rank parameter budget, add `--global_rank_reallocation`. This works with the original whitening path, non-sequential bi-whitening, sequential bi-whitening, and the whitening-based local update paths.
+
 <!-- To compress LLM with larger size, or to run the compression under the resource-constraint platform, we can add `--run_low_resource` to the command. -->
 
 

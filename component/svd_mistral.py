@@ -162,22 +162,27 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 
 class SVD_MistralMLP(nn.Module):
     def __init__(self, config,
-                 ratio=1  # 1 means no truncate, just keep normal MLP
+                 ratio=1,  # 1 means no truncate, just keep normal MLP
+                 ranks=None,
                  ):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.ratio = ratio
-        low_rank = int(self.intermediate_size * self.hidden_size * self.ratio / (self.intermediate_size + self.hidden_size))
-        self.gate_u_proj = nn.Linear(low_rank, self.intermediate_size, bias=False)
-        self.gate_v_proj = nn.Linear(self.hidden_size, low_rank, bias=False)
+        default_low_rank = int(self.intermediate_size * self.hidden_size * self.ratio / (self.intermediate_size + self.hidden_size))
+        ranks = {} if ranks is None else ranks
+        gate_rank = ranks.get("gate_proj", default_low_rank)
+        down_rank = ranks.get("down_proj", default_low_rank)
+        up_rank = ranks.get("up_proj", default_low_rank)
+        self.gate_u_proj = nn.Linear(gate_rank, self.intermediate_size, bias=False)
+        self.gate_v_proj = nn.Linear(self.hidden_size, gate_rank, bias=False)
 
-        self.down_u_proj = nn.Linear(low_rank, self.hidden_size, bias=False)
-        self.down_v_proj = nn.Linear(self.intermediate_size, low_rank, bias=False)
+        self.down_u_proj = nn.Linear(down_rank, self.hidden_size, bias=False)
+        self.down_v_proj = nn.Linear(self.intermediate_size, down_rank, bias=False)
 
-        self.up_u_proj = nn.Linear(low_rank, self.intermediate_size, bias=False)
-        self.up_v_proj = nn.Linear(self.hidden_size, low_rank, bias=False)
+        self.up_u_proj = nn.Linear(up_rank, self.intermediate_size, bias=False)
+        self.up_v_proj = nn.Linear(self.hidden_size, up_rank, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
@@ -206,7 +211,8 @@ class SVD_MistralAttention(nn.Module):
     """
 
     def __init__(self, config: MistralConfig,
-                 ratio=1):
+                 ratio=1,
+                 ranks=None):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -224,15 +230,20 @@ class SVD_MistralAttention(nn.Module):
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
-        low_rank = int(self.hidden_size * self.ratio/2)
-        self.q_u_proj = nn.Linear(low_rank, self.num_heads * self.head_dim, bias=False)
-        self.q_v_proj = nn.Linear(self.hidden_size, low_rank, bias=False)
-        self.k_u_proj = nn.Linear(low_rank, self.num_key_value_heads * self.head_dim, bias=False)
-        self.k_v_proj = nn.Linear(self.hidden_size, low_rank, bias=False)
-        self.v_u_proj = nn.Linear(low_rank, self.num_key_value_heads * self.head_dim, bias=False)
-        self.v_v_proj = nn.Linear(self.hidden_size, low_rank, bias=False)
-        self.o_u_proj = nn.Linear(low_rank, self.hidden_size, bias=False)
-        self.o_v_proj = nn.Linear(self.num_heads * self.head_dim, low_rank, bias=False)
+        default_low_rank = int(self.hidden_size * self.ratio/2)
+        ranks = {} if ranks is None else ranks
+        q_rank = ranks.get("q_proj", default_low_rank)
+        k_rank = ranks.get("k_proj", default_low_rank)
+        v_rank = ranks.get("v_proj", default_low_rank)
+        o_rank = ranks.get("o_proj", default_low_rank)
+        self.q_u_proj = nn.Linear(q_rank, self.num_heads * self.head_dim, bias=False)
+        self.q_v_proj = nn.Linear(self.hidden_size, q_rank, bias=False)
+        self.k_u_proj = nn.Linear(k_rank, self.num_key_value_heads * self.head_dim, bias=False)
+        self.k_v_proj = nn.Linear(self.hidden_size, k_rank, bias=False)
+        self.v_u_proj = nn.Linear(v_rank, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_v_proj = nn.Linear(self.hidden_size, v_rank, bias=False)
+        self.o_u_proj = nn.Linear(o_rank, self.hidden_size, bias=False)
+        self.o_v_proj = nn.Linear(self.num_heads * self.head_dim, o_rank, bias=False)
 
         self.rotary_emb = MistralRotaryEmbedding(
             self.head_dim,

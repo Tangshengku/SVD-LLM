@@ -19,6 +19,80 @@ parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(current_path)
 
 
+def _default_rank(rows, cols, ratio):
+    return int(rows * cols * ratio / (rows + cols))
+
+
+def _build_module_rank_map(rank_schedule, layer_idx, subset):
+    if rank_schedule is None:
+        return None
+    layer_ranks = rank_schedule[layer_idx]
+    attn_keys = ["q_proj", "k_proj", "v_proj", "o_proj", "out_proj"]
+    mlp_keys = ["gate_proj", "down_proj", "up_proj", "fc1", "fc2"]
+    attn_ranks = {}
+    mlp_ranks = {}
+    for name in subset:
+        leaf_name = name.split(".")[-1]
+        if leaf_name in attn_keys and name in layer_ranks:
+            attn_ranks[leaf_name] = layer_ranks[name]
+        elif leaf_name in mlp_keys and name in layer_ranks:
+            mlp_ranks[leaf_name] = layer_ranks[name]
+    return {"attn": attn_ranks, "mlp": mlp_ranks, "all": layer_ranks}
+
+
+def _get_target_rank(rank_schedule, layer_idx, name, rows, cols, ratio):
+    if rank_schedule is not None:
+        return rank_schedule[layer_idx][name]
+    return _default_rank(rows, cols, ratio)
+
+
+def _collect_global_rank_items(rank_entries, budget):
+    items = []
+    total_params = 0
+    for entry in rank_entries:
+        rows = entry["rows"]
+        cols = entry["cols"]
+        kept_rank = entry["default_rank"]
+        total_params += (rows + cols) * kept_rank
+        singular_values = entry["singular_values"]
+        width = rows + cols
+        for rank_idx in range(min(kept_rank, singular_values.numel())):
+            score = (singular_values[rank_idx].item() ** 2) / width
+            items.append((score, entry["layer_idx"], entry["name"], rank_idx + 1, width))
+    if budget is None:
+        budget = total_params
+    return items, budget
+
+
+def _allocate_global_ranks(rank_entries, budget=None):
+    items, budget = _collect_global_rank_items(rank_entries, budget)
+    rank_schedule = {}
+    current_budget = 0
+    for entry in rank_entries:
+        layer_idx = entry["layer_idx"]
+        rank_schedule.setdefault(layer_idx, {})
+        rank_schedule[layer_idx][entry["name"]] = entry["default_rank"]
+        current_budget += (entry["rows"] + entry["cols"]) * entry["default_rank"]
+    items.sort(key=lambda x: x[0])
+    for _, layer_idx, name, threshold_rank, width in items:
+        if current_budget <= budget:
+            break
+        if rank_schedule[layer_idx][name] >= threshold_rank:
+            rank_schedule[layer_idx][name] -= 1
+            current_budget -= width
+    return rank_schedule, budget, current_budget
+
+
+def _summarize_rank_schedule(rank_schedule):
+    kept = 0
+    modules = 0
+    for layer_ranks in rank_schedule.values():
+        for rank in layer_ranks.values():
+            kept += rank
+            modules += 1
+    return kept, modules
+
+
 
 @torch.no_grad()
 def profle_svdllm(name, model, calib_loader, dev):
@@ -215,6 +289,86 @@ def profile_bi_svdllm(model_name, model, calib_loader, dev, eps_a=1e-6, eps_b=1e
     return profiling_mat
 
 
+def collect_whitened_singular_values(model_name, model, profiling_mat, ratio, dev, bi_whitening=False):
+    if 'opt' in model_name:
+        layers = model.model.decoder.layers
+    else:
+        layers = model.model.layers
+    rank_entries = []
+    for i in tqdm(range(len(layers))):
+        subset = find_layers(layers[i])
+        for name in subset:
+            W = subset[name].weight.data.float().to(dev)
+            if bi_whitening:
+                input_factor = profiling_mat[i][name]["input_factor"].to(dev).float()
+                output_factor = profiling_mat[i][name]["output_factor"].to(dev).float()
+                W_scale = torch.matmul(output_factor.transpose(0, 1), torch.matmul(W, input_factor))
+            else:
+                scaling_diag_matrix = profiling_mat[i][name].to(dev).float()
+                W_scale = torch.matmul(W, scaling_diag_matrix)
+            _, S, _ = torch.linalg.svd(W_scale, full_matrices=False)
+            rank_entries.append({
+                "layer_idx": i,
+                "name": name,
+                "rows": W.shape[0],
+                "cols": W.shape[1],
+                "default_rank": _default_rank(W.shape[0], W.shape[1], ratio),
+                "singular_values": S.detach().cpu(),
+            })
+            del W, W_scale, S
+            torch.cuda.empty_cache()
+    return rank_entries
+
+
+def collect_direct_singular_values(model_name, model, ratio, dev):
+    if 'opt' in model_name:
+        layers = model.model.decoder.layers
+    else:
+        layers = model.model.layers
+    rank_entries = []
+    for i in tqdm(range(len(layers))):
+        subset = find_layers(layers[i])
+        for name in subset:
+            W = subset[name].weight.data.float().to(dev)
+            _, S, _ = torch.linalg.svd(W, full_matrices=False)
+            rank_entries.append({
+                "layer_idx": i,
+                "name": name,
+                "rows": W.shape[0],
+                "cols": W.shape[1],
+                "default_rank": _default_rank(W.shape[0], W.shape[1], ratio),
+                "singular_values": S.detach().cpu(),
+            })
+            del W, S
+            torch.cuda.empty_cache()
+    return rank_entries
+
+
+def _build_svd_modules(model_name, model, layer, subset, ratio, rank_schedule, layer_idx, dev):
+    rank_map = _build_module_rank_map(rank_schedule, layer_idx, subset)
+    attn_ranks = None if rank_map is None else rank_map["attn"]
+    mlp_ranks = None if rank_map is None else rank_map["mlp"]
+    if "llama" in model_name or "vicuna" in model_name:
+        svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio, ranks=attn_ranks).to(dev)
+        svd_mlp = SVD_LlamaMLP(
+            hidden_size=layer.hidden_size,
+            intermediate_size=model.config.intermediate_size,
+            hidden_act=model.config.hidden_act,
+            ratio=ratio,
+            ranks=mlp_ranks,
+        ).to(dev)
+        return svd_attn, svd_mlp, None
+    if "mistral" in model_name:
+        svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio, ranks=attn_ranks).to(dev)
+        svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio, ranks=mlp_ranks).to(dev)
+        return svd_attn, svd_mlp, None
+    if 'opt' in model_name:
+        all_ranks = None if rank_map is None else rank_map["all"]
+        svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio, ranks=all_ranks).to(dev)
+        return None, None, svd_decoder
+    raise NotImplementedError
+
+
 @torch.no_grad()
 def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
     if "opt" in model_name:
@@ -322,7 +476,7 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
      
  
 @torch.no_grad()
-def bi_whitening(model_name, model, profiling_mat, ratio, dev):
+def bi_whitening(model_name, model, profiling_mat, ratio, dev, rank_schedule=None):
     model.eval()
     if 'opt' in model_name:
         layers = model.model.decoder.layers
@@ -332,14 +486,7 @@ def bi_whitening(model_name, model, profiling_mat, ratio, dev):
     for i in tqdm(range(len(layers))):
         layer = layers[i]
         subset = find_layers(layer)
-        if "llama" in model_name or "vicuna" in model_name:
-            svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio).to(dev)
-            svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio).to(dev)
-        elif "mistral" in model_name:
-            svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio).to(dev)
-            svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio).to(dev)
-        elif 'opt' in model_name:
-            svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio).to(dev)
+        svd_attn, svd_mlp, svd_decoder = _build_svd_modules(model_name, model, layer, subset, ratio, rank_schedule, i, dev)
         for name in subset:
             W = subset[name].weight.data.float().to(dev)
             dtype = W.dtype
@@ -347,7 +494,7 @@ def bi_whitening(model_name, model, profiling_mat, ratio, dev):
             output_factor = profiling_mat[i][name]["output_factor"].to(dev).float()
             W_scale = torch.matmul(output_factor.transpose(0, 1), torch.matmul(W, input_factor))
             U, S, VT = torch.linalg.svd(W_scale, full_matrices=False)
-            num_s_after_trunc = int(W.shape[0] * W.shape[1] * ratio / (W.shape[0] + W.shape[1]))
+            num_s_after_trunc = _get_target_rank(rank_schedule, i, name, W.shape[0], W.shape[1], ratio)
             truc_s = S[:num_s_after_trunc]
             truc_u = U[:, :num_s_after_trunc]
             truc_v = VT[:num_s_after_trunc, :]
@@ -424,7 +571,7 @@ def bi_whitening(model_name, model, profiling_mat, ratio, dev):
         torch.cuda.empty_cache()
 
 
-def sequential_bi_whitening(model_name, model, calib_loader, ratio, dev, eps_a=1e-6, eps_b=1e-6, stat_device=None, stat_dtype=torch.float32):
+def sequential_bi_whitening(model_name, model, calib_loader, ratio, dev, eps_a=1e-6, eps_b=1e-6, stat_device=None, stat_dtype=torch.float32, rank_schedule=None):
     if stat_device is None:
         stat_device = dev
     model = make_model_pickleable(model)
@@ -621,14 +768,7 @@ def sequential_bi_whitening(model_name, model, calib_loader, ratio, dev, eps_a=1
         profiling_mat[i] = layer_profile
         print(f"[Sequential Bi-Whitening] Layer {i + 1}/{len(layers)}: factorization done, start compression")
 
-        if "llama" in model_name or "vicuna" in model_name:
-            svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio).to(dev)
-            svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio).to(dev)
-        elif "mistral" in model_name:
-            svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio).to(dev)
-            svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio).to(dev)
-        elif 'opt' in model_name:
-            svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio).to(dev)
+        svd_attn, svd_mlp, svd_decoder = _build_svd_modules(model_name, model, layer, subset, ratio, rank_schedule, i, dev)
 
         for name in subset:
             orig_weight_dtype = subset[name].weight.data.dtype
@@ -637,7 +777,7 @@ def sequential_bi_whitening(model_name, model, calib_loader, ratio, dev, eps_a=1
             output_factor = layer_profile[name]["output_factor"].to(dev).float()
             W_scale = torch.matmul(output_factor.transpose(0, 1), torch.matmul(W, input_factor))
             U, S, VT = torch.linalg.svd(W_scale, full_matrices=False)
-            num_s_after_trunc = int(W.shape[0] * W.shape[1] * ratio / (W.shape[0] + W.shape[1]))
+            num_s_after_trunc = _get_target_rank(rank_schedule, i, name, W.shape[0], W.shape[1], ratio)
             print(
                 f"[Sequential Bi-Whitening] Layer {i + 1}/{len(layers)} Module {name}: "
                 f"weight_shape={tuple(W.shape)}, trunc_rank={num_s_after_trunc}"
@@ -747,7 +887,7 @@ def sequential_bi_whitening(model_name, model, calib_loader, ratio, dev, eps_a=1
 
 
 @torch.no_grad()
-def whitening(model_name, model, profiling_mat, ratio, dev):
+def whitening(model_name, model, profiling_mat, ratio, dev, rank_schedule=None):
     model.eval()
     if 'opt' in model_name:
         layers = model.model.decoder.layers
@@ -757,16 +897,7 @@ def whitening(model_name, model, profiling_mat, ratio, dev):
     for i in tqdm(range(len(layers))):
         layer = layers[i]
         subset = find_layers(layer)
-        #### Replace Attn, MLP ####
-        if "llama" in model_name or "vicuna" in model_name:
-            svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio)
-            svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio)
-        elif "mistral" in model_name:
-            svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio)
-            svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio)
-        elif 'opt' in model_name:
-            svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio)
-        #### Replace Attn, MLP ####
+        svd_attn, svd_mlp, svd_decoder = _build_svd_modules(model_name, model, layer, subset, ratio, rank_schedule, i, dev="cpu")
         for name in subset:
             W = subset[name].weight.data.float().to(dev)
             dtype = W.dtype
@@ -781,7 +912,7 @@ def whitening(model_name, model, profiling_mat, ratio, dev):
             scaling_matrix_inv = scaling_matrix_inv.float()
             W_scale = torch.matmul(W, scaling_diag_matrix)
             U, S, VT = torch.linalg.svd(W_scale, full_matrices=False)
-            num_s_after_trunc = int(W.shape[0] * W.shape[1] * ratio / (W.shape[0] + W.shape[1]))
+            num_s_after_trunc = _get_target_rank(rank_schedule, i, name, W.shape[0], W.shape[1], ratio)
             truc_s = S[:num_s_after_trunc]
             truc_u = U[:, :num_s_after_trunc]
             truc_v = torch.matmul(VT[:num_s_after_trunc, :], scaling_matrix_inv)
@@ -849,7 +980,7 @@ def whitening(model_name, model, profiling_mat, ratio, dev):
 
 
 @torch.no_grad()
-def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, dev, direct_update=False):
+def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, dev, direct_update=False, rank_schedule=None):
     print("Start SVD decomposition then update...")
     use_cache = model.config.use_cache
     model.config.use_cache = False
@@ -905,20 +1036,14 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
         layer = layers[i].to(dev)
         subset = find_layers(layer)
         gpts = {}
-        if "llama" in model_name or "vicuna" in model_name:
-            svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio)
-            svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio)
-        elif "mistral" in model_name:
-            svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio)
-            svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio)
-        elif 'opt' in model_name:
-            svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio)
+        svd_attn, svd_mlp, svd_decoder = _build_svd_modules(model_name, model, layer, subset, ratio, rank_schedule, i, dev="cpu")
         for name in subset:
             if profiling_mat is not None:
                 scaling_diag_matrix = profiling_mat[i][name].to(dev)
             else: 
                 scaling_diag_matrix = None
-            gpts[name] = local_update(subset[name], scaling_diag_matrix = scaling_diag_matrix, ratio=ratio, name=name, direct_update=direct_update)
+            target_rank = _get_target_rank(rank_schedule, i, name, subset[name].weight.shape[0], subset[name].weight.shape[1], ratio)
+            gpts[name] = local_update(subset[name], scaling_diag_matrix=scaling_diag_matrix, ratio=ratio, name=name, direct_update=direct_update, target_rank=target_rank)
         
         def add_batch(name):
             def tmp(_, inp, out):
@@ -1003,7 +1128,7 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
 
 
 class local_update:
-    def __init__(self, layer, scaling_diag_matrix, ratio, name, direct_update=False):
+    def __init__(self, layer, scaling_diag_matrix, ratio, name, direct_update=False, target_rank=None):
         self.layer = layer
         self.name = name
         self.dev = self.layer.weight.device
@@ -1025,7 +1150,7 @@ class local_update:
             W_scale = torch.matmul(W, scaling_diag_matrix)
             self.U, self.S, self.VT = torch.linalg.svd(W_scale, full_matrices=False)  
         # trucation SVD
-        num_s_after_trunc = int(W.shape[0] * W.shape[1] * ratio / (W.shape[0] + W.shape[1]))
+        num_s_after_trunc = target_rank if target_rank is not None else int(W.shape[0] * W.shape[1] * ratio / (W.shape[0] + W.shape[1]))
         self.truc_s = self.S[:num_s_after_trunc].cuda()
         self.truc_u = self.U[:, :num_s_after_trunc].cuda()
         if direct_update:
@@ -1083,6 +1208,7 @@ if __name__ == '__main__':
     parser.add_argument('--lora', type=str, default=None, help='the lora updated weight path to run the accuracy evaluation')
     parser.add_argument('--bi_whitening', action='store_true', help='use bi-whitened SVD with both input and output-gradient curvature statistics')
     parser.add_argument('--bi_whitening_sequential', action='store_true', help='use sequential profiling/compression for bi-whitening; otherwise use the original non-sequential bi-whitening path')
+    parser.add_argument('--global_rank_reallocation', action='store_true', help='reallocate ranks globally by singular-value saliency under the same total low-rank parameter budget')
     parser.add_argument('--curvature_eps_a', type=float, default=1e-6, help='input covariance damping for bi-whitened SVD')
     parser.add_argument('--curvature_eps_b', type=float, default=1e-6, help='output-gradient covariance damping for bi-whitened SVD')
     parser.add_argument('--curvature_stat_device', type=str, default='cuda', help='device for accumulating bi-whitening statistics: cuda or cpu')
@@ -1093,10 +1219,26 @@ if __name__ == '__main__':
     if args.step == 1:
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
         model = model.eval()
+        rank_schedule = None
         if args.profiling_mat_path is None:
             cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
             if args.bi_whitening:
                 if args.bi_whitening_sequential:
+                    if args.global_rank_reallocation:
+                        profiling_for_ranks = profile_bi_svdllm(
+                            args.model,
+                            model,
+                            cali_white_data,
+                            args.DEV,
+                            eps_a=args.curvature_eps_a,
+                            eps_b=args.curvature_eps_b,
+                            stat_device=args.curvature_stat_device,
+                            stat_dtype=torch.float32 if args.curvature_stat_dtype == 'float32' else torch.float64,
+                        )
+                        rank_entries = collect_whitened_singular_values(args.model, model, profiling_for_ranks, args.ratio, args.DEV, bi_whitening=True)
+                        rank_schedule, budget, actual_budget = _allocate_global_ranks(rank_entries)
+                        kept_ranks, rank_modules = _summarize_rank_schedule(rank_schedule)
+                        print(f"[Global Rank Reallocation] budget={budget}, actual_budget={actual_budget}, modules={rank_modules}, total_kept_rank={kept_ranks}")
                     profiling_mat = sequential_bi_whitening(
                         args.model,
                         model,
@@ -1107,6 +1249,7 @@ if __name__ == '__main__':
                         eps_b=args.curvature_eps_b,
                         stat_device=args.curvature_stat_device,
                         stat_dtype=torch.float32 if args.curvature_stat_dtype == 'float32' else torch.float64,
+                        rank_schedule=rank_schedule,
                     )
                 else:
                     if args.run_low_resource:
@@ -1121,19 +1264,34 @@ if __name__ == '__main__':
                         stat_device=args.curvature_stat_device,
                         stat_dtype=torch.float32 if args.curvature_stat_dtype == 'float32' else torch.float64,
                     )
-                    bi_whitening(args.model, model, profiling_mat, args.ratio, args.DEV)
+                    if args.global_rank_reallocation:
+                        rank_entries = collect_whitened_singular_values(args.model, model, profiling_mat, args.ratio, args.DEV, bi_whitening=True)
+                        rank_schedule, budget, actual_budget = _allocate_global_ranks(rank_entries)
+                        kept_ranks, rank_modules = _summarize_rank_schedule(rank_schedule)
+                        print(f"[Global Rank Reallocation] budget={budget}, actual_budget={actual_budget}, modules={rank_modules}, total_kept_rank={kept_ranks}")
+                    bi_whitening(args.model, model, profiling_mat, args.ratio, args.DEV, rank_schedule=rank_schedule)
             else:
                 profiling_mat = profle_svdllm_low_resource(args.model, model, cali_white_data, args.DEV)
+                if args.global_rank_reallocation:
+                    rank_entries = collect_whitened_singular_values(args.model, model, profiling_mat, args.ratio, args.DEV, bi_whitening=False)
+                    rank_schedule, budget, actual_budget = _allocate_global_ranks(rank_entries)
+                    kept_ranks, rank_modules = _summarize_rank_schedule(rank_schedule)
+                    print(f"[Global Rank Reallocation] budget={budget}, actual_budget={actual_budget}, modules={rank_modules}, total_kept_rank={kept_ranks}")
             if args.save_path is not None:
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
+            if args.global_rank_reallocation:
+                rank_entries = collect_whitened_singular_values(args.model, model, profiling_mat, args.ratio, args.DEV, bi_whitening=args.bi_whitening)
+                rank_schedule, budget, actual_budget = _allocate_global_ranks(rank_entries)
+                kept_ranks, rank_modules = _summarize_rank_schedule(rank_schedule)
+                print(f"[Global Rank Reallocation] budget={budget}, actual_budget={actual_budget}, modules={rank_modules}, total_kept_rank={kept_ranks}")
             if args.bi_whitening and not args.bi_whitening_sequential:
-                bi_whitening(args.model, model, profiling_mat, args.ratio, args.DEV)
+                bi_whitening(args.model, model, profiling_mat, args.ratio, args.DEV, rank_schedule=rank_schedule)
         if args.bi_whitening and (args.profiling_mat_path is not None) and args.bi_whitening_sequential:
             raise ValueError("Sequential bi-whitening does not support --profiling_mat_path because profiling and compression are coupled.")
         if not args.bi_whitening:
-            whitening(args.model, model, profiling_mat, args.ratio, args.DEV)
+            whitening(args.model, model, profiling_mat, args.ratio, args.DEV, rank_schedule=rank_schedule)
         if args.save_path is not None:
             suffix = '_bi_whitening_only_' if args.bi_whitening else '_whitening_only_'
             model = make_model_pickleable(model).cpu()
@@ -1143,14 +1301,25 @@ if __name__ == '__main__':
         dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
         model = model.eval()
         model = model.float()  # need to set to float
+        rank_schedule = None
         if args.profiling_mat_path is None:
             cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
             profiling_mat = profle_svdllm_low_resource(args.model, model, cali_white_data, args.DEV)
+            if args.global_rank_reallocation:
+                rank_entries = collect_whitened_singular_values(args.model, model, profiling_mat, args.ratio, args.DEV, bi_whitening=False)
+                rank_schedule, budget, actual_budget = _allocate_global_ranks(rank_entries)
+                kept_ranks, rank_modules = _summarize_rank_schedule(rank_schedule)
+                print(f"[Global Rank Reallocation] budget={budget}, actual_budget={actual_budget}, modules={rank_modules}, total_kept_rank={kept_ranks}")
             if args.save_path is not None:
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
-        whitening_local_update(args.model, model, dataloader, profiling_mat, args.ratio, args.DEV)
+            if args.global_rank_reallocation:
+                rank_entries = collect_whitened_singular_values(args.model, model, profiling_mat, args.ratio, args.DEV, bi_whitening=False)
+                rank_schedule, budget, actual_budget = _allocate_global_ranks(rank_entries)
+                kept_ranks, rank_modules = _summarize_rank_schedule(rank_schedule)
+                print(f"[Global Rank Reallocation] budget={budget}, actual_budget={actual_budget}, modules={rank_modules}, total_kept_rank={kept_ranks}")
+        whitening_local_update(args.model, model, dataloader, profiling_mat, args.ratio, args.DEV, rank_schedule=rank_schedule)
         if args.save_path is not None:
             model = make_model_pickleable(model).cpu()
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_then_update_' + str(args.ratio) + '.pt')  # fp32
@@ -1159,7 +1328,13 @@ if __name__ == '__main__':
         model = model.eval()
         model = model.float()
         dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
-        whitening_local_update(model_name=args.model, model=model, dataloader=dataloader, profiling_mat=None, ratio=args.ratio, dev=args.DEV, direct_update=True)
+        rank_schedule = None
+        if args.global_rank_reallocation:
+            rank_entries = collect_direct_singular_values(args.model, model, args.ratio, args.DEV)
+            rank_schedule, budget, actual_budget = _allocate_global_ranks(rank_entries)
+            kept_ranks, rank_modules = _summarize_rank_schedule(rank_schedule)
+            print(f"[Global Rank Reallocation] budget={budget}, actual_budget={actual_budget}, modules={rank_modules}, total_kept_rank={kept_ranks}")
+        whitening_local_update(model_name=args.model, model=model, dataloader=dataloader, profiling_mat=None, ratio=args.ratio, dev=args.DEV, direct_update=True, rank_schedule=rank_schedule)
         if args.save_path is not None:
             model = make_model_pickleable(model).cpu()
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_update_only_' + str(args.ratio) + '.pt')   # fp32

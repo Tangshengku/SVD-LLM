@@ -96,6 +96,7 @@ class SVDOPTAttention(nn.Module):
         config: OPTConfig,
         is_decoder: bool = False,
         ratio=1,
+        ranks=None,
         **kwargs,
     ):
         super().__init__()
@@ -134,28 +135,30 @@ class SVDOPTAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.is_decoder = is_decoder
 
+        default_low_rank = int(self.embed_dim * self.ratio/2)
+        ranks = {} if ranks is None else ranks
+        q_rank = ranks.get("q_proj", default_low_rank)
+        k_rank = ranks.get("k_proj", default_low_rank)
+        v_rank = ranks.get("v_proj", default_low_rank)
+        out_rank = ranks.get("out_proj", default_low_rank)
         if self.ratio != 1:
-            low_rank = int(self.embed_dim * self.ratio/2)
-            self.q_u_proj = nn.Linear(low_rank, self.embed_dim, bias=self.enable_bias)
-            self.q_v_proj = nn.Linear(self.embed_dim, low_rank, bias=False)
+            self.q_u_proj = nn.Linear(q_rank, self.embed_dim, bias=self.enable_bias)
+            self.q_v_proj = nn.Linear(self.embed_dim, q_rank, bias=False)
         else:
             self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=self.enable_bias)
         if self.ratio != 1:
-            low_rank = int(self.embed_dim * self.ratio/2)
-            self.k_u_proj = nn.Linear(low_rank, self.embed_dim, bias=self.enable_bias)
-            self.k_v_proj = nn.Linear(self.embed_dim, low_rank, bias=False)
+            self.k_u_proj = nn.Linear(k_rank, self.embed_dim, bias=self.enable_bias)
+            self.k_v_proj = nn.Linear(self.embed_dim, k_rank, bias=False)
         else:
             self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=self.enable_bias)
         if self.ratio != 1:
-            low_rank = int(self.embed_dim * self.ratio/2)
-            self.v_u_proj = nn.Linear(low_rank, self.embed_dim, bias=self.enable_bias)
-            self.v_v_proj = nn.Linear(self.embed_dim, low_rank, bias=False)
+            self.v_u_proj = nn.Linear(v_rank, self.embed_dim, bias=self.enable_bias)
+            self.v_v_proj = nn.Linear(self.embed_dim, v_rank, bias=False)
         else:
             self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=self.enable_bias)
         if self.ratio != 1:
-            low_rank = int(self.embed_dim * self.ratio/2)
-            self.out_u_proj = nn.Linear(low_rank, self.embed_dim, bias=self.enable_bias)
-            self.out_v_proj = nn.Linear(self.embed_dim, low_rank, bias=False)
+            self.out_u_proj = nn.Linear(out_rank, self.embed_dim, bias=self.enable_bias)
+            self.out_v_proj = nn.Linear(self.embed_dim, out_rank, bias=False)
         else:
             self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=self.enable_bias)
 
@@ -309,11 +312,12 @@ class SVDOPTAttention(nn.Module):
 
 
 class SVDOPTDecoderLayer(nn.Module):
-    def __init__(self, config: OPTConfig, ratio = 1):
+    def __init__(self, config: OPTConfig, ratio = 1, ranks=None):
         super().__init__()
         self.embed_dim = config.hidden_size
 
-        self.self_attn = SVDOPTAttention(config=config, ratio=ratio, is_decoder=True)
+        attn_ranks = {} if ranks is None else {k: v for k, v in ranks.items() if k in {"q_proj", "k_proj", "v_proj", "out_proj"}}
+        self.self_attn = SVDOPTAttention(config=config, ratio=ratio, ranks=attn_ranks, is_decoder=True)
 
         self.do_layer_norm_before = config.do_layer_norm_before
         self.dropout = config.dropout
@@ -323,16 +327,17 @@ class SVDOPTDecoderLayer(nn.Module):
             self.embed_dim, elementwise_affine=config.layer_norm_elementwise_affine
         )
         self.ratio = ratio
+        ranks = {} if ranks is None else ranks
+        fc1_rank = ranks.get("fc1", int(config.ffn_dim * self.embed_dim * self.ratio / (config.ffn_dim + self.embed_dim)))
+        fc2_rank = ranks.get("fc2", int(config.ffn_dim * self.embed_dim * self.ratio / (config.ffn_dim + self.embed_dim)))
         if self.ratio != 1:
-            low_rank = int(config.ffn_dim * self.embed_dim * self.ratio / (config.ffn_dim + self.embed_dim))
-            self.fc1_u_proj = nn.Linear(low_rank, config.ffn_dim, bias=config.enable_bias)
-            self.fc1_v_proj = nn.Linear(self.embed_dim, low_rank, bias=False)
+            self.fc1_u_proj = nn.Linear(fc1_rank, config.ffn_dim, bias=config.enable_bias)
+            self.fc1_v_proj = nn.Linear(self.embed_dim, fc1_rank, bias=False)
         else:
             self.fc1 = nn.Linear(self.embed_dim, config.ffn_dim, bias=config.enable_bias)
         if self.ratio != 1:
-            low_rank = int(config.ffn_dim * self.embed_dim * self.ratio / (config.ffn_dim + self.embed_dim))
-            self.fc2_u_proj = nn.Linear(low_rank, self.embed_dim, bias=config.enable_bias)
-            self.fc2_v_proj = nn.Linear(config.ffn_dim, low_rank, bias=False)
+            self.fc2_u_proj = nn.Linear(fc2_rank, self.embed_dim, bias=config.enable_bias)
+            self.fc2_v_proj = nn.Linear(config.ffn_dim, fc2_rank, bias=False)
         else:
             self.fc2 = nn.Linear(config.ffn_dim, self.embed_dim, bias=config.enable_bias)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim, elementwise_affine=config.layer_norm_elementwise_affine)
@@ -419,4 +424,3 @@ class SVDOPTDecoderLayer(nn.Module):
             outputs += (present_key_value,)
 
         return outputs
-
