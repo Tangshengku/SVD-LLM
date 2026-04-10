@@ -530,6 +530,241 @@ def whitening_task_aware(model_name, model, profiling_mat, ratio, calibration_lo
         torch.cuda.empty_cache()
 
 
+class buffered_subspace_refit:
+    def __init__(self, layer, scaling_diag_matrix, ratio, buffer_size, reg_lambda, name):
+        self.layer = layer
+        self.name = name
+        self.dev = self.layer.weight.device
+        self.dtype = self.layer.weight.data.dtype
+
+        svd_ctx = _compute_whitened_svd(self.layer.weight, scaling_diag_matrix, self.dev)
+        self.target_rank = _get_target_rank(self.layer.weight, ratio)
+        self.buffer_rank = min(svd_ctx.S.shape[0], self.target_rank + buffer_size)
+
+        self.u_bar = svd_ctx.U[:, :self.buffer_rank].float()
+        self.v_bar_t_s_inv = torch.matmul(svd_ctx.VT[:self.buffer_rank, :], svd_ctx.scaling_matrix_inv).float()
+        self.reg_lambda = float(reg_lambda)
+
+        self.c0 = torch.zeros(self.buffer_rank, self.buffer_rank, device=self.dev, dtype=torch.float32)
+        if self.target_rank > 0:
+            self.c0[:self.target_rank, :self.target_rank] = torch.diag(svd_ctx.S[:self.target_rank].float())
+
+        self.tzt = torch.zeros(self.buffer_rank, self.buffer_rank, device=self.dev, dtype=torch.float32)
+        self.zzt = torch.zeros(self.buffer_rank, self.buffer_rank, device=self.dev, dtype=torch.float32)
+
+        del svd_ctx
+        torch.cuda.empty_cache()
+
+    def add_batch(self, inp, out):
+        inps = inp.view(inp.shape[0] * inp.shape[1], inp.shape[2]).float()
+        outs = out.view(out.shape[0] * out.shape[1], out.shape[2]).float()
+        z = torch.matmul(inps, self.v_bar_t_s_inv.t())
+        t = torch.matmul(outs, self.u_bar)
+        self.tzt += torch.matmul(t.t(), z)
+        self.zzt += torch.matmul(z.t(), z)
+
+    def solve(self):
+        if self.target_rank == 0:
+            empty_u = torch.zeros(self.layer.weight.shape[0], 0, device="cpu", dtype=self.dtype)
+            empty_v = torch.zeros(0, self.layer.weight.shape[1], device="cpu", dtype=self.dtype)
+            return empty_u, empty_v
+
+        if self.buffer_rank == self.target_rank and self.reg_lambda == 0:
+            sqrt_sigma = torch.sqrt(torch.diag(self.c0[:self.target_rank, :self.target_rank]))
+            svd_u = torch.matmul(self.u_bar[:, :self.target_rank], sqrt_sigma).cpu().to(self.dtype)
+            svd_v = torch.matmul(sqrt_sigma, self.v_bar_t_s_inv[:self.target_rank, :]).cpu().to(self.dtype)
+            return svd_u, svd_v
+
+        eye = torch.eye(self.buffer_rank, device=self.dev, dtype=torch.float32)
+        G = self.zzt + self.reg_lambda * eye
+        eigvals, eigvecs = torch.linalg.eigh(G.double())
+        eigvals = eigvals.clamp_min(1e-8)
+        g_inv_sqrt = torch.matmul(eigvecs, torch.matmul(torch.diag(eigvals.rsqrt()), eigvecs.t())).float()
+
+        B = torch.matmul(self.tzt + self.reg_lambda * self.c0, g_inv_sqrt)
+        P, S, VT = torch.linalg.svd(B, full_matrices=False)
+
+        pk = P[:, :self.target_rank]
+        sqrt_lambda = torch.diag(torch.sqrt(S[:self.target_rank]))
+        qk_t = VT[:self.target_rank, :]
+
+        svd_u = torch.matmul(torch.matmul(self.u_bar, pk), sqrt_lambda).cpu().to(self.dtype)
+        svd_v = torch.matmul(torch.matmul(sqrt_lambda, qk_t), torch.matmul(g_inv_sqrt, self.v_bar_t_s_inv)).cpu().to(self.dtype)
+        return svd_u, svd_v
+
+
+@torch.no_grad()
+def whitening_buffered_refit(model_name, model, dataloader, profiling_mat, ratio, dev, buffer_size, reg_lambda):
+    print("Start buffered singular subspace refit...")
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+    if "opt" in model_name:
+        layers = model.model.decoder.layers
+        model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev)
+        model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.to(dev)
+        model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(dev)
+    else:
+        layers = model.model.layers
+        model.model.embed_tokens = model.model.embed_tokens.to(dev)
+        model.model.norm = model.model.norm.to(dev)
+    layers[0] = layers[0].to(dev)
+
+    dtype = next(iter(model.parameters())).dtype
+    inps = torch.zeros(
+        (len(dataloader), model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
+    )
+    cache = {'i': 0, 'attention_mask': None, "position_ids": None}
+
+    class Catcher(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+
+        def forward(self, inp, **kwargs):
+            inps[cache['i']] = inp
+            cache['i'] += 1
+            if cache['attention_mask'] is None:
+                cache['attention_mask'] = kwargs['attention_mask']
+                if "opt" not in model_name:
+                    cache['position_ids'] = kwargs['position_ids']
+            else:
+                cache['attention_mask'] = torch.cat((cache['attention_mask'], kwargs['attention_mask']), dim=0)
+                if "opt" not in model_name:
+                    cache['position_ids'] = torch.cat((cache['position_ids'], kwargs['position_ids']), dim=0)
+            raise ValueError
+
+    layers[0] = Catcher(layers[0])
+    for batch in dataloader:
+        try:
+            model(batch[0].to(dev))
+        except ValueError:
+            pass
+    layers[0] = layers[0].module
+    layers[0] = layers[0].cpu()
+    if "opt" in model_name:
+        model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
+        model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.cpu()
+        model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
+    else:
+        model.model.embed_tokens = model.model.embed_tokens.cpu()
+        model.model.norm = model.model.norm.cpu()
+    torch.cuda.empty_cache()
+
+    attention_masks = cache['attention_mask']
+    if "opt" not in model_name:
+        position_ids = cache['position_ids']
+
+    for i in tqdm(range(len(layers))):
+        layer = layers[i].to(dev)
+        subset = find_layers(layer)
+        refits = {}
+        if "llama" in model_name or "vicuna" in model_name:
+            svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio)
+            svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio)
+        elif "mistral" in model_name:
+            svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio)
+            svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio)
+        elif 'opt' in model_name:
+            svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio)
+
+        for name in subset:
+            refits[name] = buffered_subspace_refit(
+                subset[name],
+                profiling_mat[i][name].to(dev),
+                ratio,
+                buffer_size,
+                reg_lambda,
+                name,
+            )
+
+        def add_batch(name):
+            def tmp(_, inp, out):
+                refits[name].add_batch(inp[0].data, out.data)
+            return tmp
+
+        handles = []
+        for name in refits:
+            handles.append(subset[name].register_forward_hook(add_batch(name)))
+
+        if "opt" not in model_name:
+            layer(inps, attention_mask=attention_masks, position_ids=position_ids)[0]
+        else:
+            layer(inps, attention_mask=attention_masks)[0]
+
+        for h in handles:
+            h.remove()
+
+        for name in refits:
+            svd_u, svd_v = refits[name].solve()
+            svd_u, svd_v = svd_u.to(dtype), svd_v.to(dtype)
+            if 'opt' in model_name:
+                if "q_proj" in name:
+                    svd_decoder.self_attn.q_u_proj.weight.data = svd_u
+                    svd_decoder.self_attn.q_v_proj.weight.data = svd_v
+                    svd_decoder.self_attn.q_u_proj.bias.data = layer.self_attn.q_proj.bias.data
+                elif "k_proj" in name:
+                    svd_decoder.self_attn.k_u_proj.weight.data = svd_u
+                    svd_decoder.self_attn.k_v_proj.weight.data = svd_v
+                    svd_decoder.self_attn.k_u_proj.bias.data = layer.self_attn.k_proj.bias.data
+                elif "v_proj" in name:
+                    svd_decoder.self_attn.v_u_proj.weight.data = svd_u
+                    svd_decoder.self_attn.v_v_proj.weight.data = svd_v
+                    svd_decoder.self_attn.v_u_proj.bias.data = layer.self_attn.v_proj.bias.data
+                elif "out_proj" in name:
+                    svd_decoder.self_attn.out_u_proj.weight.data = svd_u
+                    svd_decoder.self_attn.out_v_proj.weight.data = svd_v
+                    svd_decoder.self_attn.out_u_proj.bias.data = layer.self_attn.out_proj.bias.data
+                elif "fc1" in name:
+                    svd_decoder.fc1_u_proj.weight.data = svd_u
+                    svd_decoder.fc1_v_proj.weight.data = svd_v
+                    svd_decoder.fc1_u_proj.bias.data = layer.fc1.bias.data
+                elif "fc2" in name:
+                    svd_decoder.fc2_u_proj.weight.data = svd_u
+                    svd_decoder.fc2_v_proj.weight.data = svd_v
+                    svd_decoder.fc2_u_proj.bias.data = layer.fc2.bias.data
+                    svd_decoder.self_attn_layer_norm = layer.self_attn_layer_norm
+                    svd_decoder.final_layer_norm = layer.final_layer_norm
+                    layer = svd_decoder
+            else:
+                if "q_proj" in name:
+                    svd_attn.q_u_proj.weight.data = svd_u
+                    svd_attn.q_v_proj.weight.data = svd_v
+                elif "k_proj" in name:
+                    svd_attn.k_u_proj.weight.data = svd_u
+                    svd_attn.k_v_proj.weight.data = svd_v
+                elif "v_proj" in name:
+                    svd_attn.v_u_proj.weight.data = svd_u
+                    svd_attn.v_v_proj.weight.data = svd_v
+                elif "o_proj" in name:
+                    svd_attn.o_u_proj.weight.data = svd_u
+                    svd_attn.o_v_proj.weight.data = svd_v
+                    layer.self_attn = svd_attn
+                elif "gate_proj" in name:
+                    svd_mlp.gate_u_proj.weight.data = svd_u
+                    svd_mlp.gate_v_proj.weight.data = svd_v
+                elif "down_proj" in name:
+                    svd_mlp.down_u_proj.weight.data = svd_u
+                    svd_mlp.down_v_proj.weight.data = svd_v
+                elif "up_proj" in name:
+                    svd_mlp.up_u_proj.weight.data = svd_u
+                    svd_mlp.up_v_proj.weight.data = svd_v
+                    layer.mlp = svd_mlp
+
+        layer = layer.to(dev)
+        if "opt" not in model_name:
+            outs = layer(inps, attention_mask=attention_masks, position_ids=position_ids)[0]
+        else:
+            outs = layer(inps, attention_mask=attention_masks)[0]
+        layers[i] = layer.cpu()
+        del refits
+        torch.cuda.empty_cache()
+        inps = outs
+        outs = None
+        del outs
+
+    model.config.use_cache = use_cache
+
+
 @torch.no_grad()
 def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, dev, direct_update=False):
     print("Start SVD decomposition then update...")
@@ -763,16 +998,18 @@ if __name__ == '__main__':
     parser.add_argument('--gen_seq_len', type=int, default=1024, help='generated sequence len for efficiency evaluation')
     parser.add_argument('--step', type=int, default=4, help='the step to run the compression')
     parser.add_argument('--lora', type=str, default=None, help='the lora updated weight path to run the accuracy evaluation')
-    parser.add_argument('--selection_method', type=str, default='topk', choices=['topk', 'task_aware_diag', 'task_aware_obs'], help='Singular-direction selection rule for whitening compression.')
+    parser.add_argument('--selection_method', type=str, default='topk', choices=['topk', 'task_aware_diag', 'task_aware_obs', 'bssr'], help='Singular-direction selection rule for whitening compression.')
     parser.add_argument('--selection_nsamples', type=int, default=16, help='Number of calibration samples used to estimate task-aware singular saliency.')
     parser.add_argument('--selection_candidate_extra', type=int, default=32, help='Additional candidate singular directions considered beyond the target rank for task-aware selection.')
+    parser.add_argument('--bssr_buffer_size', type=int, default=16, help='Buffered extra singular directions for BSSR.')
+    parser.add_argument('--bssr_lambda', type=float, default=1e-2, help='Ridge regularization strength for BSSR.')
     
     args = parser.parse_args()
     args.ratio = 1- args.ratio
     if args.step == 1:
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
         model = model.eval()
-        if args.selection_method in ["task_aware_diag", "task_aware_obs"]:
+        if args.selection_method in ["task_aware_diag", "task_aware_obs", "bssr"]:
             model = model.float()
         if args.profiling_mat_path is None:
             cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
@@ -792,6 +1029,18 @@ if __name__ == '__main__':
                 args.selection_candidate_extra,
                 args.DEV,
                 args.selection_method,
+            )
+        elif args.selection_method == "bssr":
+            dataloader, _ = get_loaders(args.dataset, nsamples=args.selection_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
+            whitening_buffered_refit(
+                args.model,
+                model,
+                dataloader,
+                profiling_mat,
+                args.ratio,
+                args.DEV,
+                args.bssr_buffer_size,
+                args.bssr_lambda,
             )
         else:
             whitening(args.model, model, profiling_mat, args.ratio, args.DEV)
