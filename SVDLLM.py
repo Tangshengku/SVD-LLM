@@ -352,6 +352,7 @@ def _prepare_task_aware_candidates(model_name, model, profiling_mat, ratio, cand
                 "v": torch.matmul(svd_ctx.VT[:candidate_rank, :], svd_ctx.scaling_matrix_inv).cpu(),
                 "sum_phi": torch.zeros(candidate_rank, dtype=torch.float64),
                 "sum_phi_sq": torch.zeros(candidate_rank, dtype=torch.float64),
+                "sum_phi_outer": torch.zeros(candidate_rank, candidate_rank, dtype=torch.float64),
                 "count": 0,
             }
             del svd_ctx
@@ -382,6 +383,7 @@ def _collect_task_aware_stats(model, calibration_loader, candidate_map, dev):
         phi = phi.reshape(-1, info["candidate_rank"])
         info["sum_phi"] += phi.sum(dim=0).double().cpu()
         info["sum_phi_sq"] += phi.pow(2).sum(dim=0).double().cpu()
+        info["sum_phi_outer"] += torch.matmul(phi.t(), phi).double().cpu()
         info["count"] += phi.shape[0]
         del module._task_aware_proj
 
@@ -411,7 +413,34 @@ def _collect_task_aware_stats(model, calibration_loader, candidate_map, dev):
     torch.cuda.empty_cache()
 
 
-def whitening_task_aware(model_name, model, profiling_mat, ratio, calibration_loader, candidate_extra, dev):
+def _select_task_aware_indices(info, selection_method):
+    if info["target_rank"] == 0:
+        return torch.empty(0, dtype=torch.long)
+    if info["candidate_rank"] <= info["target_rank"]:
+        return torch.arange(info["candidate_rank"], dtype=torch.long)
+
+    count = max(info["count"], 1)
+    sigma = info["sigma"].float()
+
+    if selection_method == "task_aware_diag":
+        h = (info["sum_phi"] / count).float()
+        fii = (info["sum_phi_sq"] / count).float()
+        saliency = -h * sigma + 0.5 * sigma.pow(2) * fii
+    elif selection_method == "task_aware_obs":
+        fisher = (info["sum_phi_outer"] / count).float()
+        eye = torch.eye(fisher.shape[0], dtype=fisher.dtype, device=fisher.device)
+        damping = 1e-6 * fisher.diag().mean().clamp_min(1.0)
+        fisher_inv = torch.linalg.inv(fisher + damping * eye)
+        saliency = 0.5 * sigma.pow(2) / fisher_inv.diag().clamp_min(1e-12)
+    else:
+        raise ValueError(f"Unknown selection_method: {selection_method}")
+
+    selected_idx = torch.topk(saliency, k=info["target_rank"], largest=True).indices
+    selected_idx = selected_idx[torch.argsort(saliency.index_select(0, selected_idx), descending=True)]
+    return selected_idx
+
+
+def whitening_task_aware(model_name, model, profiling_mat, ratio, calibration_loader, candidate_extra, dev, selection_method):
     model.eval()
     candidate_map = _prepare_task_aware_candidates(model_name, model, profiling_mat, ratio, candidate_extra, dev)
     _collect_task_aware_stats(model, calibration_loader, candidate_map, dev)
@@ -434,18 +463,7 @@ def whitening_task_aware(model_name, model, profiling_mat, ratio, calibration_lo
         for name in subset:
             info = candidate_map[subset[name]]
             svd_ctx = _compute_whitened_svd(subset[name].weight, profiling_mat[i][name], dev)
-            if info["target_rank"] == 0:
-                selected_idx = torch.empty(0, dtype=torch.long)
-            elif info["candidate_rank"] <= info["target_rank"]:
-                selected_idx = torch.arange(info["candidate_rank"], dtype=torch.long)
-            else:
-                count = max(info["count"], 1)
-                h = (info["sum_phi"] / count).float()
-                fii = (info["sum_phi_sq"] / count).float()
-                sigma = info["sigma"].float()
-                saliency = -h * sigma + 0.5 * sigma.pow(2) * fii
-                selected_idx = torch.topk(saliency, k=info["target_rank"], largest=True).indices
-                selected_idx = selected_idx[torch.argsort(saliency.index_select(0, selected_idx), descending=True)]
+            selected_idx = _select_task_aware_indices(info, selection_method)
             svd_u, svd_v = _build_factorized_weight(
                 svd_ctx.U,
                 svd_ctx.S,
@@ -745,7 +763,7 @@ if __name__ == '__main__':
     parser.add_argument('--gen_seq_len', type=int, default=1024, help='generated sequence len for efficiency evaluation')
     parser.add_argument('--step', type=int, default=4, help='the step to run the compression')
     parser.add_argument('--lora', type=str, default=None, help='the lora updated weight path to run the accuracy evaluation')
-    parser.add_argument('--selection_method', type=str, default='topk', choices=['topk', 'task_aware_diag'], help='Singular-direction selection rule for whitening compression.')
+    parser.add_argument('--selection_method', type=str, default='topk', choices=['topk', 'task_aware_diag', 'task_aware_obs'], help='Singular-direction selection rule for whitening compression.')
     parser.add_argument('--selection_nsamples', type=int, default=16, help='Number of calibration samples used to estimate task-aware singular saliency.')
     parser.add_argument('--selection_candidate_extra', type=int, default=32, help='Additional candidate singular directions considered beyond the target rank for task-aware selection.')
     
@@ -754,7 +772,7 @@ if __name__ == '__main__':
     if args.step == 1:
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
         model = model.eval()
-        if args.selection_method == "task_aware_diag":
+        if args.selection_method in ["task_aware_diag", "task_aware_obs"]:
             model = model.float()
         if args.profiling_mat_path is None:
             cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
@@ -763,7 +781,7 @@ if __name__ == '__main__':
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
-        if args.selection_method == "task_aware_diag":
+        if args.selection_method in ["task_aware_diag", "task_aware_obs"]:
             selection_loader, _ = get_loaders(args.dataset, nsamples=args.selection_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
             whitening_task_aware(
                 args.model,
@@ -773,11 +791,13 @@ if __name__ == '__main__':
                 selection_loader,
                 args.selection_candidate_extra,
                 args.DEV,
+                args.selection_method,
             )
         else:
             whitening(args.model, model, profiling_mat, args.ratio, args.DEV)
         if args.save_path is not None:
-            torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_task_aware_diag' + str(args.ratio) + '.pt')   # fp32
+            suffix = '_whitening_only_' + args.selection_method + '_' + str(args.ratio) if args.selection_method != 'topk' else '_whitening_only_' + str(args.ratio)
+            torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + suffix + '.pt')   # fp32
     elif args.step == 2:
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
         dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
