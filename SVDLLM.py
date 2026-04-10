@@ -67,11 +67,14 @@ def _collect_global_rank_items(rank_entries, budget):
 def _allocate_global_ranks(rank_entries, budget=None):
     items, budget = _collect_global_rank_items(rank_entries, budget)
     rank_schedule = {}
+    default_schedule = {}
     current_budget = 0
     for entry in rank_entries:
         layer_idx = entry["layer_idx"]
         rank_schedule.setdefault(layer_idx, {})
+        default_schedule.setdefault(layer_idx, {})
         rank_schedule[layer_idx][entry["name"]] = entry["default_rank"]
+        default_schedule[layer_idx][entry["name"]] = entry["default_rank"]
         current_budget += (entry["rows"] + entry["cols"]) * entry["default_rank"]
     items.sort(key=lambda x: x[0])
     for _, layer_idx, name, threshold_rank, width in items:
@@ -80,7 +83,7 @@ def _allocate_global_ranks(rank_entries, budget=None):
         if rank_schedule[layer_idx][name] >= threshold_rank:
             rank_schedule[layer_idx][name] -= 1
             current_budget -= width
-    return rank_schedule, budget, current_budget
+    return rank_schedule, default_schedule, budget, current_budget
 
 
 def _summarize_rank_schedule(rank_schedule):
@@ -91,6 +94,50 @@ def _summarize_rank_schedule(rank_schedule):
             kept += rank
             modules += 1
     return kept, modules
+
+
+def _log_global_rank_reallocation(rank_entries, default_schedule, rank_schedule, budget, actual_budget, max_lines=20):
+    changed = []
+    for entry in rank_entries:
+        layer_idx = entry["layer_idx"]
+        name = entry["name"]
+        default_rank = default_schedule[layer_idx][name]
+        new_rank = rank_schedule[layer_idx][name]
+        if default_rank != new_rank:
+            changed.append({
+                "layer_idx": layer_idx,
+                "name": name,
+                "default_rank": default_rank,
+                "new_rank": new_rank,
+                "delta": new_rank - default_rank,
+                "rows": entry["rows"],
+                "cols": entry["cols"],
+            })
+    print(
+        f"[Global Rank Reallocation] target_budget={budget}, actual_budget={actual_budget}, "
+        f"changed_modules={len(changed)}/{len(rank_entries)}"
+    )
+    if not changed:
+        print("[Global Rank Reallocation] No rank changes were made. The allocated schedule is identical to the default per-module schedule.")
+        return
+    changed.sort(key=lambda x: (x["delta"], x["layer_idx"], x["name"]))
+    print("[Global Rank Reallocation] Largest rank decreases:")
+    for item in changed[:max_lines]:
+        print(
+            f"  layer={item['layer_idx']} module={item['name']} "
+            f"rank {item['default_rank']} -> {item['new_rank']} "
+            f"(delta={item['delta']}, shape=({item['rows']},{item['cols']}))"
+        )
+    increased = [item for item in changed if item["delta"] > 0]
+    if increased:
+        increased.sort(key=lambda x: (-x["delta"], x["layer_idx"], x["name"]))
+        print("[Global Rank Reallocation] Largest rank increases:")
+        for item in increased[:max_lines]:
+            print(
+                f"  layer={item['layer_idx']} module={item['name']} "
+                f"rank {item['default_rank']} -> {item['new_rank']} "
+                f"(delta=+{item['delta']}, shape=({item['rows']},{item['cols']}))"
+            )
 
 
 
@@ -1237,9 +1284,10 @@ if __name__ == '__main__':
                             stat_dtype=torch.float32 if args.curvature_stat_dtype == 'float32' else torch.float64,
                         )
                         rank_entries = collect_whitened_singular_values(args.model, model, profiling_for_ranks, args.ratio, args.DEV, bi_whitening=True)
-                        rank_schedule, budget, actual_budget = _allocate_global_ranks(rank_entries)
+                        rank_schedule, default_schedule, budget, actual_budget = _allocate_global_ranks(rank_entries)
                         kept_ranks, rank_modules = _summarize_rank_schedule(rank_schedule)
                         print(f"[Global Rank Reallocation] budget={budget}, actual_budget={actual_budget}, modules={rank_modules}, total_kept_rank={kept_ranks}")
+                        _log_global_rank_reallocation(rank_entries, default_schedule, rank_schedule, budget, actual_budget)
                     profiling_mat = sequential_bi_whitening(
                         args.model,
                         model,
@@ -1267,26 +1315,29 @@ if __name__ == '__main__':
                     )
                     if args.global_rank_reallocation:
                         rank_entries = collect_whitened_singular_values(args.model, model, profiling_mat, args.ratio, args.DEV, bi_whitening=True)
-                        rank_schedule, budget, actual_budget = _allocate_global_ranks(rank_entries)
+                        rank_schedule, default_schedule, budget, actual_budget = _allocate_global_ranks(rank_entries)
                         kept_ranks, rank_modules = _summarize_rank_schedule(rank_schedule)
                         print(f"[Global Rank Reallocation] budget={budget}, actual_budget={actual_budget}, modules={rank_modules}, total_kept_rank={kept_ranks}")
+                        _log_global_rank_reallocation(rank_entries, default_schedule, rank_schedule, budget, actual_budget)
                     bi_whitening(args.model, model, profiling_mat, args.ratio, args.DEV, rank_schedule=rank_schedule)
             else:
                 profiling_mat = profle_svdllm_low_resource(args.model, model, cali_white_data, args.DEV)
                 if args.global_rank_reallocation:
                     rank_entries = collect_whitened_singular_values(args.model, model, profiling_mat, args.ratio, args.DEV, bi_whitening=False)
-                    rank_schedule, budget, actual_budget = _allocate_global_ranks(rank_entries)
+                    rank_schedule, default_schedule, budget, actual_budget = _allocate_global_ranks(rank_entries)
                     kept_ranks, rank_modules = _summarize_rank_schedule(rank_schedule)
                     print(f"[Global Rank Reallocation] budget={budget}, actual_budget={actual_budget}, modules={rank_modules}, total_kept_rank={kept_ranks}")
+                    _log_global_rank_reallocation(rank_entries, default_schedule, rank_schedule, budget, actual_budget)
             if args.save_path is not None:
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
             if args.global_rank_reallocation:
                 rank_entries = collect_whitened_singular_values(args.model, model, profiling_mat, args.ratio, args.DEV, bi_whitening=args.bi_whitening)
-                rank_schedule, budget, actual_budget = _allocate_global_ranks(rank_entries)
+                rank_schedule, default_schedule, budget, actual_budget = _allocate_global_ranks(rank_entries)
                 kept_ranks, rank_modules = _summarize_rank_schedule(rank_schedule)
                 print(f"[Global Rank Reallocation] budget={budget}, actual_budget={actual_budget}, modules={rank_modules}, total_kept_rank={kept_ranks}")
+                _log_global_rank_reallocation(rank_entries, default_schedule, rank_schedule, budget, actual_budget)
             if args.bi_whitening and not args.bi_whitening_sequential:
                 bi_whitening(args.model, model, profiling_mat, args.ratio, args.DEV, rank_schedule=rank_schedule)
         if args.bi_whitening and (args.profiling_mat_path is not None) and args.bi_whitening_sequential:
@@ -1309,18 +1360,20 @@ if __name__ == '__main__':
             profiling_mat = profle_svdllm_low_resource(args.model, model, cali_white_data, args.DEV)
             if args.global_rank_reallocation:
                 rank_entries = collect_whitened_singular_values(args.model, model, profiling_mat, args.ratio, args.DEV, bi_whitening=False)
-                rank_schedule, budget, actual_budget = _allocate_global_ranks(rank_entries)
+                rank_schedule, default_schedule, budget, actual_budget = _allocate_global_ranks(rank_entries)
                 kept_ranks, rank_modules = _summarize_rank_schedule(rank_schedule)
                 print(f"[Global Rank Reallocation] budget={budget}, actual_budget={actual_budget}, modules={rank_modules}, total_kept_rank={kept_ranks}")
+                _log_global_rank_reallocation(rank_entries, default_schedule, rank_schedule, budget, actual_budget)
             if args.save_path is not None:
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
             if args.global_rank_reallocation:
                 rank_entries = collect_whitened_singular_values(args.model, model, profiling_mat, args.ratio, args.DEV, bi_whitening=False)
-                rank_schedule, budget, actual_budget = _allocate_global_ranks(rank_entries)
+                rank_schedule, default_schedule, budget, actual_budget = _allocate_global_ranks(rank_entries)
                 kept_ranks, rank_modules = _summarize_rank_schedule(rank_schedule)
                 print(f"[Global Rank Reallocation] budget={budget}, actual_budget={actual_budget}, modules={rank_modules}, total_kept_rank={kept_ranks}")
+                _log_global_rank_reallocation(rank_entries, default_schedule, rank_schedule, budget, actual_budget)
         whitening_local_update(args.model, model, dataloader, profiling_mat, args.ratio, args.DEV, rank_schedule=rank_schedule)
         if args.save_path is not None:
             model = make_model_pickleable(model).cpu()
@@ -1334,9 +1387,10 @@ if __name__ == '__main__':
         rank_schedule = None
         if args.global_rank_reallocation:
             rank_entries = collect_direct_singular_values(args.model, model, args.ratio, args.DEV)
-            rank_schedule, budget, actual_budget = _allocate_global_ranks(rank_entries)
+            rank_schedule, default_schedule, budget, actual_budget = _allocate_global_ranks(rank_entries)
             kept_ranks, rank_modules = _summarize_rank_schedule(rank_schedule)
             print(f"[Global Rank Reallocation] budget={budget}, actual_budget={actual_budget}, modules={rank_modules}, total_kept_rank={kept_ranks}")
+            _log_global_rank_reallocation(rank_entries, default_schedule, rank_schedule, budget, actual_budget)
         whitening_local_update(model_name=args.model, model=model, dataloader=dataloader, profiling_mat=None, ratio=args.ratio, dev=args.DEV, direct_update=True, rank_schedule=rank_schedule)
         if args.save_path is not None:
             model = make_model_pickleable(model).cpu()
