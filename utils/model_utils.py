@@ -223,7 +223,7 @@ def get_model_from_local(model_id, base_model_id=None, reconstruct=False, device
     model_id = payload["base_model_id"]
     rebuilt_model, _ = get_model_from_huggingface(model_id, device_map=device_map, torch_dtype=torch_dtype)
     rebuilt_model = _apply_svd_structure(model_id, rebuilt_model, payload["state_dict"])
-    load_result = rebuilt_model.load_state_dict(payload["state_dict"], strict=False)
+    load_result = rebuilt_model.load_state_dict(payload["state_dict"], strict=True)
     if load_result.missing_keys or load_result.unexpected_keys:
         print("Warning: non-strict state_dict load when reconstructing local model.")
         print("Missing keys:", load_result.missing_keys[:20])
@@ -248,7 +248,7 @@ def load_dense_model_from_compressed_checkpoint(checkpoint_path, base_model_id=N
     for key, tensor in state_dict.items():
         if key in base_state and base_state[key].shape == tensor.shape:
             direct_state[key] = tensor
-    model.load_state_dict(direct_state, strict=False)
+    model.load_state_dict(direct_state, strict=True)
 
     if _is_opt_model(model_id):
         layers = model.model.decoder.layers

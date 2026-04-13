@@ -3,5 +3,5 @@ cache/*
 **/__pycache__
 utils/c4-*
 *.pdf
-compress_llama.sh
+*.sh
 *.pt
