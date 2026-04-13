@@ -42,6 +42,22 @@ def is_llama_style_model(model_name):
     return is_llama_family(model_name) or is_mistral_family(model_name)
 
 
+def resolve_runtime_device(dev):
+    if isinstance(dev, str) and dev.lower() == "auto":
+        if torch.cuda.is_available():
+            return "cuda:0"
+        return "cpu"
+    return dev
+
+
+def is_sharded_model(model):
+    return hasattr(model, "hf_device_map") and getattr(model, "hf_device_map", None) not in [None, {}]
+
+
+def ensure_unsharded_model(model, model_name, dev):
+    return dev
+
+
 def _to_cpu_structure(obj):
     if torch.is_tensor(obj):
         return obj.detach().cpu()
@@ -66,8 +82,22 @@ def _to_device_structure(obj, dev):
     return obj
 
 
+def _infer_module_device(module, fallback_dev):
+    for param in module.parameters(recurse=False):
+        return str(param.device)
+    for buf in module.buffers(recurse=False):
+        return str(buf.device)
+    for param in module.parameters():
+        return str(param.device)
+    for buf in module.buffers():
+        return str(buf.device)
+    return fallback_dev
+
+
 def _run_layer_with_kwargs(layer, hidden_states, layer_kwargs, dev):
-    kwargs = _to_device_structure(layer_kwargs, dev)
+    layer_dev = _infer_module_device(layer, dev)
+    kwargs = _to_device_structure(layer_kwargs, layer_dev)
+    hidden_states = hidden_states.to(layer_dev)
     return layer(hidden_states, **kwargs)[0]
 
 
@@ -131,20 +161,24 @@ def profle_svdllm(name, model, calib_loader, dev):
 
 @torch.no_grad()
 def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
+    sharded_model = is_sharded_model(model)
     if is_opt_model(model_name):
         layers = model.model.decoder.layers
-        model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev)
-        model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.to(dev)
-        model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(dev)
+        if not sharded_model:
+            model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev)
+            model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.to(dev)
+            model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(dev)
     else:
         layers = model.model.layers
-        model.model.embed_tokens = model.model.embed_tokens.to(dev)
-        model.model.norm = model.model.norm.to(dev)
-    layers[0] = layers[0].to(dev)
+        if not sharded_model:
+            model.model.embed_tokens = model.model.embed_tokens.to(dev)
+            model.model.norm = model.model.norm.to(dev)
+    if not sharded_model:
+        layers[0] = layers[0].to(dev)
 
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros(
-        (len(calib_loader), model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
+        (len(calib_loader), model.seqlen, model.config.hidden_size), dtype=dtype
     )
     cache = {'i': 0, 'layer_kwargs': []}
     class Catcher(nn.Module):
@@ -164,21 +198,24 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
         except ValueError:
             pass
     layers[0] = layers[0].module
-    layers[0] = layers[0].cpu()
+    if not sharded_model:
+        layers[0] = layers[0].cpu()
     if is_opt_model(model_name):
-        model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
-        model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.cpu()
-        model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
+        if not sharded_model:
+            model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
+            model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.cpu()
+            model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
     else:  
-        model.model.embed_tokens = model.model.embed_tokens.cpu()
-        model.model.norm = model.model.norm.cpu()
+        if not sharded_model:
+            model.model.embed_tokens = model.model.embed_tokens.cpu()
+            model.model.norm = model.model.norm.cpu()
     torch.cuda.empty_cache()
     outs = torch.zeros_like(inps)
     layer_kwargs = cache['layer_kwargs']
     profiling_mat = {}
     for i in tqdm(range(len(layers))):
         layer_profile = {}
-        layer = layers[i].to(dev)
+        layer = layers[i] if sharded_model else layers[i].to(dev)
         subset = find_layers(layer)        
         def hook(module, input, output):
             inp = input[0].detach().float()
@@ -197,7 +234,8 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
             outs[j] = _run_layer_with_kwargs(layer, inps[j].unsqueeze(0), layer_kwargs[j], dev)
         for h in handles:
             h.remove()
-        layer = layer.cpu()
+        if not sharded_model:
+            layer = layer.cpu()
         for name in subset:
             subset[name].scaling_diag_matrix = subset[name].scaling_diag_matrix.cpu()
         torch.cuda.empty_cache()
@@ -216,9 +254,10 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
             scaling_diag_matrix = raw_scaling_diag_matrix = subset[name].raw_scaling_diag_matrix = None
             del scaling_diag_matrix, raw_scaling_diag_matrix, subset[name].raw_scaling_diag_matrix
             torch.cuda.empty_cache()
-        layers[i] = layer.cpu()
+        if not sharded_model:
+            layers[i] = layer.cpu()
         profiling_mat[i] = layer_profile
-        inps = outs
+        inps = outs.cpu()
         layer_kwargs = [_to_cpu_structure({k: v for k, v in kwargs.items()}) for kwargs in layer_kwargs]
         torch.cuda.empty_cache()
     return profiling_mat
@@ -1281,9 +1320,11 @@ if __name__ == '__main__':
     parser.add_argument('--sem_lambda', type=float, default=1e-2, help='Ridge regularization strength for singular expert merging.')
     
     args = parser.parse_args()
+    args.DEV = resolve_runtime_device(args.DEV)
     args.ratio = 1- args.ratio
     if args.step == 1:
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
+        ensure_unsharded_model(model, args.model, args.DEV)
         model = model.eval()
         if args.selection_method in ["task_aware_diag", "task_aware_obs", "bssr", "sem"]:
             model = model.float()
@@ -1338,6 +1379,7 @@ if __name__ == '__main__':
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + suffix + '.pt')   # fp32
     elif args.step == 2:
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
+        ensure_unsharded_model(model, args.model, args.DEV)
         dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
         model = model.eval()
         model = model.float()  # need to set to float
@@ -1353,6 +1395,7 @@ if __name__ == '__main__':
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_then_update_' + str(args.ratio) + '.pt')  # fp32
     elif args.step == 3:
         model, tokenizer = get_model_from_huggingface(args.model)
+        ensure_unsharded_model(model, args.model, args.DEV)
         model = model.eval()
         model = model.float()
         dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
