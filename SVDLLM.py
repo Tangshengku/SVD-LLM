@@ -20,12 +20,63 @@ parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(current_path)
 
 
+def _model_name(model_name):
+    return model_name.lower()
+
+
+def is_opt_model(model_name):
+    return "opt" in _model_name(model_name)
+
+
+def is_llama_family(model_name):
+    name = _model_name(model_name)
+    return "llama" in name or "vicuna" in name
+
+
+def is_mistral_family(model_name):
+    name = _model_name(model_name)
+    return "mistral" in name or "qwen" in name
+
+
+def is_llama_style_model(model_name):
+    return is_llama_family(model_name) or is_mistral_family(model_name)
+
+
+def _to_cpu_structure(obj):
+    if torch.is_tensor(obj):
+        return obj.detach().cpu()
+    if isinstance(obj, tuple):
+        return tuple(_to_cpu_structure(x) for x in obj)
+    if isinstance(obj, list):
+        return [_to_cpu_structure(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _to_cpu_structure(v) for k, v in obj.items()}
+    return obj
+
+
+def _to_device_structure(obj, dev):
+    if torch.is_tensor(obj):
+        return obj.to(dev)
+    if isinstance(obj, tuple):
+        return tuple(_to_device_structure(x, dev) for x in obj)
+    if isinstance(obj, list):
+        return [_to_device_structure(x, dev) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _to_device_structure(v, dev) for k, v in obj.items()}
+    return obj
+
+
+def _run_layer_with_kwargs(layer, hidden_states, layer_kwargs, dev):
+    kwargs = _to_device_structure(layer_kwargs, dev)
+    return layer(hidden_states, **kwargs)[0]
+
+
 
 @torch.no_grad()
 def profle_svdllm(name, model, calib_loader, dev):
-    if "llama" in name or "mistral" in name or "vicuna" in name:
+    if is_llama_style_model(name):
         layers = model.model.layers
-    elif "opt" in name:
+    elif is_opt_model(name):
         layers = model.model.decoder.layers
     model = model.to(dev)
     print("Start obtaining the whitening matrix...")
@@ -80,7 +131,7 @@ def profle_svdllm(name, model, calib_loader, dev):
 
 @torch.no_grad()
 def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
-    if "opt" in model_name:
+    if is_opt_model(model_name):
         layers = model.model.decoder.layers
         model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev)
         model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.to(dev)
@@ -95,22 +146,15 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
     inps = torch.zeros(
         (len(calib_loader), model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
-    cache = {'i': 0, 'attention_mask': None, "position_ids": None}
+    cache = {'i': 0, 'layer_kwargs': []}
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
             self.module = module
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp.cpu()
+            cache['layer_kwargs'].append(_to_cpu_structure(kwargs))
             cache['i'] += 1
-            if cache['attention_mask'] is None:
-                cache['attention_mask'] = kwargs['attention_mask'].cpu()
-                if "opt" not in model_name:
-                    cache['position_ids'] = kwargs['position_ids'].cpu()
-            else:
-                cache['attention_mask'] = torch.cat((cache['attention_mask'], kwargs['attention_mask'].cpu()), dim=0)
-                if "opt" not in model_name:
-                    cache['position_ids'] = torch.cat((cache['position_ids'], kwargs['position_ids'].cpu()), dim=0)
             raise ValueError
     layers[0] = Catcher(layers[0])
     for batch in calib_loader:
@@ -121,7 +165,7 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
             pass
     layers[0] = layers[0].module
     layers[0] = layers[0].cpu()
-    if "opt" in model_name:
+    if is_opt_model(model_name):
         model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
         model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.cpu()
         model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
@@ -130,9 +174,7 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
         model.model.norm = model.model.norm.cpu()
     torch.cuda.empty_cache()
     outs = torch.zeros_like(inps)
-    attention_masks = cache['attention_mask']
-    if "opt" not in model_name:
-        position_ids = cache['position_ids']
+    layer_kwargs = cache['layer_kwargs']
     profiling_mat = {}
     for i in tqdm(range(len(layers))):
         layer_profile = {}
@@ -152,10 +194,7 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
             subset[name].scaling_diag_matrix = 0
             handles.append(subset[name].register_forward_hook(hook))
         for j in range(inps.shape[0]):
-            if "opt" not in model_name:
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_masks[j].unsqueeze(0).to(dev), position_ids=position_ids[j].unsqueeze(0).to(dev))[0]
-            else:
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_masks[j].unsqueeze(0).to(dev))[0]
+            outs[j] = _run_layer_with_kwargs(layer, inps[j].unsqueeze(0), layer_kwargs[j], dev)
         for h in handles:
             h.remove()
         layer = layer.cpu()
@@ -180,6 +219,7 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
         layers[i] = layer.cpu()
         profiling_mat[i] = layer_profile
         inps = outs
+        layer_kwargs = [_to_cpu_structure({k: v for k, v in kwargs.items()}) for kwargs in layer_kwargs]
         torch.cuda.empty_cache()
     return profiling_mat
      
@@ -187,7 +227,7 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
 @torch.no_grad()
 def whitening(model_name, model, profiling_mat, ratio, dev):
     model.eval()
-    if 'opt' in model_name:
+    if is_opt_model(model_name):
         layers = model.model.decoder.layers
     else:
         layers = model.model.layers
@@ -196,13 +236,13 @@ def whitening(model_name, model, profiling_mat, ratio, dev):
         layer = layers[i]
         subset = find_layers(layer)
         #### Replace Attn, MLP ####
-        if "llama" in model_name or "vicuna" in model_name:
+        if is_llama_family(model_name):
             svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio)
             svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio)
-        elif "mistral" in model_name:
+        elif is_mistral_family(model_name):
             svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio)
             svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio)
-        elif 'opt' in model_name:
+        elif is_opt_model(model_name):
             svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio)
         #### Replace Attn, MLP ####
         for name in subset:
@@ -228,7 +268,7 @@ def whitening(model_name, model, profiling_mat, ratio, dev):
             sqrtSigma = torch.sqrt(truc_sigma)
             svd_u = torch.matmul(truc_u, sqrtSigma).cpu().to(dtype)
             svd_v = torch.matmul(sqrtSigma, truc_v).cpu().to(dtype)
-            if 'opt' in model_name:
+            if is_opt_model(model_name):
                 if "q_proj" in name:
                     svd_decoder.self_attn.q_u_proj.weight.data = svd_u
                     svd_decoder.self_attn.q_v_proj.weight.data = svd_v
@@ -452,13 +492,13 @@ def whitening_task_aware(model_name, model, profiling_mat, ratio, calibration_lo
     for i in tqdm(range(len(layers))):
         layer = layers[i]
         subset = find_layers(layer)
-        if "llama" in model_name or "vicuna" in model_name:
+        if is_llama_family(model_name):
             svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio)
             svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio)
-        elif "mistral" in model_name:
+        elif is_mistral_family(model_name):
             svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio)
             svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio)
-        elif 'opt' in model_name:
+        elif is_opt_model(model_name):
             svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio)
         for name in subset:
             info = candidate_map[subset[name]]
@@ -472,7 +512,7 @@ def whitening_task_aware(model_name, model, profiling_mat, ratio, calibration_lo
                 selected_idx,
                 svd_ctx.dtype,
             )
-            if 'opt' in model_name:
+            if is_opt_model(model_name):
                 if "q_proj" in name:
                     svd_decoder.self_attn.q_u_proj.weight.data = svd_u
                     svd_decoder.self_attn.q_v_proj.weight.data = svd_v
@@ -691,7 +731,7 @@ def whitening_buffered_refit(model_name, model, dataloader, profiling_mat, ratio
     print("Start buffered singular subspace refit...")
     use_cache = model.config.use_cache
     model.config.use_cache = False
-    if "opt" in model_name:
+    if is_opt_model(model_name):
         layers = model.model.decoder.layers
         model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev)
         model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.to(dev)
@@ -706,7 +746,7 @@ def whitening_buffered_refit(model_name, model, dataloader, profiling_mat, ratio
     inps = torch.zeros(
         (len(dataloader), model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
-    cache = {'i': 0, 'attention_mask': None, "position_ids": None}
+    cache = {'i': 0, 'layer_kwargs': []}
 
     class Catcher(nn.Module):
         def __init__(self, module):
@@ -715,15 +755,8 @@ def whitening_buffered_refit(model_name, model, dataloader, profiling_mat, ratio
 
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
+            cache['layer_kwargs'].append(_to_cpu_structure(kwargs))
             cache['i'] += 1
-            if cache['attention_mask'] is None:
-                cache['attention_mask'] = kwargs['attention_mask']
-                if "opt" not in model_name:
-                    cache['position_ids'] = kwargs['position_ids']
-            else:
-                cache['attention_mask'] = torch.cat((cache['attention_mask'], kwargs['attention_mask']), dim=0)
-                if "opt" not in model_name:
-                    cache['position_ids'] = torch.cat((cache['position_ids'], kwargs['position_ids']), dim=0)
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -734,7 +767,7 @@ def whitening_buffered_refit(model_name, model, dataloader, profiling_mat, ratio
             pass
     layers[0] = layers[0].module
     layers[0] = layers[0].cpu()
-    if "opt" in model_name:
+    if is_opt_model(model_name):
         model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
         model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.cpu()
         model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
@@ -743,21 +776,19 @@ def whitening_buffered_refit(model_name, model, dataloader, profiling_mat, ratio
         model.model.norm = model.model.norm.cpu()
     torch.cuda.empty_cache()
 
-    attention_masks = cache['attention_mask']
-    if "opt" not in model_name:
-        position_ids = cache['position_ids']
+    layer_kwargs = cache['layer_kwargs']
 
     for i in tqdm(range(len(layers))):
         layer = layers[i].to(dev)
         subset = find_layers(layer)
         refits = {}
-        if "llama" in model_name or "vicuna" in model_name:
+        if is_llama_family(model_name):
             svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio)
             svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio)
-        elif "mistral" in model_name:
+        elif is_mistral_family(model_name):
             svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio)
             svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio)
-        elif 'opt' in model_name:
+        elif is_opt_model(model_name):
             svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio)
 
         for name in subset:
@@ -779,10 +810,8 @@ def whitening_buffered_refit(model_name, model, dataloader, profiling_mat, ratio
         for name in refits:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
 
-        if "opt" not in model_name:
-            layer(inps, attention_mask=attention_masks, position_ids=position_ids)[0]
-        else:
-            layer(inps, attention_mask=attention_masks)[0]
+        for j in range(inps.shape[0]):
+            _run_layer_with_kwargs(layer, inps[j].unsqueeze(0), layer_kwargs[j], dev)
 
         for h in handles:
             h.remove()
@@ -790,7 +819,7 @@ def whitening_buffered_refit(model_name, model, dataloader, profiling_mat, ratio
         for name in refits:
             svd_u, svd_v = refits[name].solve()
             svd_u, svd_v = svd_u.to(dtype), svd_v.to(dtype)
-            if 'opt' in model_name:
+            if is_opt_model(model_name):
                 if "q_proj" in name:
                     svd_decoder.self_attn.q_u_proj.weight.data = svd_u
                     svd_decoder.self_attn.q_v_proj.weight.data = svd_v
@@ -844,10 +873,9 @@ def whitening_buffered_refit(model_name, model, dataloader, profiling_mat, ratio
                     layer.mlp = svd_mlp
 
         layer = layer.to(dev)
-        if "opt" not in model_name:
-            outs = layer(inps, attention_mask=attention_masks, position_ids=position_ids)[0]
-        else:
-            outs = layer(inps, attention_mask=attention_masks)[0]
+        outs = torch.zeros_like(inps)
+        for j in range(inps.shape[0]):
+            outs[j] = _run_layer_with_kwargs(layer, inps[j].unsqueeze(0), layer_kwargs[j], dev)
         layers[i] = layer.cpu()
         del refits
         torch.cuda.empty_cache()
@@ -863,7 +891,7 @@ def whitening_singular_expert_merge(model_name, model, dataloader, profiling_mat
     print("Start singular expert merging...")
     use_cache = model.config.use_cache
     model.config.use_cache = False
-    if "opt" in model_name:
+    if is_opt_model(model_name):
         layers = model.model.decoder.layers
         model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev)
         model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.to(dev)
@@ -878,7 +906,7 @@ def whitening_singular_expert_merge(model_name, model, dataloader, profiling_mat
     inps = torch.zeros(
         (len(dataloader), model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
-    cache = {'i': 0, 'attention_mask': None, "position_ids": None}
+    cache = {'i': 0, 'layer_kwargs': []}
 
     class Catcher(nn.Module):
         def __init__(self, module):
@@ -887,15 +915,8 @@ def whitening_singular_expert_merge(model_name, model, dataloader, profiling_mat
 
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
+            cache['layer_kwargs'].append(_to_cpu_structure(kwargs))
             cache['i'] += 1
-            if cache['attention_mask'] is None:
-                cache['attention_mask'] = kwargs['attention_mask']
-                if "opt" not in model_name:
-                    cache['position_ids'] = kwargs['position_ids']
-            else:
-                cache['attention_mask'] = torch.cat((cache['attention_mask'], kwargs['attention_mask']), dim=0)
-                if "opt" not in model_name:
-                    cache['position_ids'] = torch.cat((cache['position_ids'], kwargs['position_ids']), dim=0)
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -906,7 +927,7 @@ def whitening_singular_expert_merge(model_name, model, dataloader, profiling_mat
             pass
     layers[0] = layers[0].module
     layers[0] = layers[0].cpu()
-    if "opt" in model_name:
+    if is_opt_model(model_name):
         model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
         model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.cpu()
         model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
@@ -915,21 +936,19 @@ def whitening_singular_expert_merge(model_name, model, dataloader, profiling_mat
         model.model.norm = model.model.norm.cpu()
     torch.cuda.empty_cache()
 
-    attention_masks = cache['attention_mask']
-    if "opt" not in model_name:
-        position_ids = cache['position_ids']
+    layer_kwargs = cache['layer_kwargs']
 
     for i in tqdm(range(len(layers))):
         layer = layers[i].to(dev)
         subset = find_layers(layer)
         mergers = {}
-        if "llama" in model_name or "vicuna" in model_name:
+        if is_llama_family(model_name):
             svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio)
             svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio)
-        elif "mistral" in model_name:
+        elif is_mistral_family(model_name):
             svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio)
             svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio)
-        elif 'opt' in model_name:
+        elif is_opt_model(model_name):
             svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio)
 
         for name in subset:
@@ -954,10 +973,8 @@ def whitening_singular_expert_merge(model_name, model, dataloader, profiling_mat
         for name in mergers:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
 
-        if "opt" not in model_name:
-            layer(inps, attention_mask=attention_masks, position_ids=position_ids)[0]
-        else:
-            layer(inps, attention_mask=attention_masks)[0]
+        for j in range(inps.shape[0]):
+            _run_layer_with_kwargs(layer, inps[j].unsqueeze(0), layer_kwargs[j], dev)
 
         for h in handles:
             h.remove()
@@ -965,7 +982,7 @@ def whitening_singular_expert_merge(model_name, model, dataloader, profiling_mat
         for name in merged_factors:
             svd_u, svd_v = merged_factors[name]
             svd_u, svd_v = svd_u.to(dtype), svd_v.to(dtype)
-            if 'opt' in model_name:
+            if is_opt_model(model_name):
                 if "q_proj" in name:
                     svd_decoder.self_attn.q_u_proj.weight.data = svd_u
                     svd_decoder.self_attn.q_v_proj.weight.data = svd_v
@@ -1019,10 +1036,9 @@ def whitening_singular_expert_merge(model_name, model, dataloader, profiling_mat
                     layer.mlp = svd_mlp
 
         layer = layer.to(dev)
-        if "opt" not in model_name:
-            outs = layer(inps, attention_mask=attention_masks, position_ids=position_ids)[0]
-        else:
-            outs = layer(inps, attention_mask=attention_masks)[0]
+        outs = torch.zeros_like(inps)
+        for j in range(inps.shape[0]):
+            outs[j] = _run_layer_with_kwargs(layer, inps[j].unsqueeze(0), layer_kwargs[j], dev)
         layers[i] = layer.cpu()
         del mergers, merged_factors
         torch.cuda.empty_cache()
@@ -1038,7 +1054,7 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
     print("Start SVD decomposition then update...")
     use_cache = model.config.use_cache
     model.config.use_cache = False
-    if "opt" in model_name:
+    if is_opt_model(model_name):
         layers = model.model.decoder.layers
         model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev)
         model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.to(dev)
@@ -1054,22 +1070,15 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
     inps = torch.zeros(
         (len(dataloader), model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
-    cache = {'i': 0, 'attention_mask': None, "position_ids": None}
+    cache = {'i': 0, 'layer_kwargs': []}
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
             self.module = module
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
+            cache['layer_kwargs'].append(_to_cpu_structure(kwargs))
             cache['i'] += 1
-            if cache['attention_mask'] is None:
-                cache['attention_mask'] = kwargs['attention_mask']
-                if "opt" not in model_name:
-                    cache['position_ids'] = kwargs['position_ids']
-            else:
-                cache['attention_mask'] = torch.cat((cache['attention_mask'], kwargs['attention_mask']), dim=0)
-                if "opt" not in model_name:
-                    cache['position_ids'] = torch.cat((cache['position_ids'], kwargs['position_ids']), dim=0)
             raise ValueError
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
@@ -1083,20 +1092,18 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
     model.model.norm = model.model.norm.cpu()
     torch.cuda.empty_cache()
     outs = torch.zeros_like(inps)
-    attention_masks = cache['attention_mask']
-    if "opt" not in model_name:
-        position_ids = cache['position_ids']
+    layer_kwargs = cache['layer_kwargs']
     for i in tqdm(range(len(layers))):
         layer = layers[i].to(dev)
         subset = find_layers(layer)
         gpts = {}
-        if "llama" in model_name or "vicuna" in model_name:
+        if is_llama_family(model_name):
             svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio)
             svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio)
-        elif "mistral" in model_name:
+        elif is_mistral_family(model_name):
             svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio)
             svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio)
-        elif 'opt' in model_name:
+        elif is_opt_model(model_name):
             svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio)
         for name in subset:
             if profiling_mat is not None:
@@ -1112,16 +1119,15 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
         handles = []
         for name in gpts:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
-        if "opt" not in model_name:
-            outs = layer(inps, attention_mask=attention_masks, position_ids=position_ids)[0]
-        else:
-            outs = layer(inps, attention_mask=attention_masks)[0]
+        outs = torch.zeros_like(inps)
+        for j in range(inps.shape[0]):
+            outs[j] = _run_layer_with_kwargs(layer, inps[j].unsqueeze(0), layer_kwargs[j], dev)
         for h in handles:
             h.remove()
         for name in gpts:
             svd_u, svd_v = gpts[name].fasterprune()
             svd_u, svd_v = svd_u.to(dtype), svd_v.to(dtype)
-            if 'opt' in model_name:
+            if is_opt_model(model_name):
                 if "q_proj" in name:
                     svd_decoder.self_attn.q_u_proj.weight.data = svd_u
                     svd_decoder.self_attn.q_v_proj.weight.data = svd_v
@@ -1174,10 +1180,9 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
                     svd_mlp.up_v_proj.weight.data = svd_v
                     layer.mlp = svd_mlp
         layer = layer.to(dev)
-        if "opt" not in model_name:
-            outs = layer(inps, attention_mask=attention_masks, position_ids=position_ids)[0]
-        else:
-            outs = layer(inps, attention_mask=attention_masks)[0]
+        outs = torch.zeros_like(inps)
+        for j in range(inps.shape[0]):
+            outs[j] = _run_layer_with_kwargs(layer, inps[j].unsqueeze(0), layer_kwargs[j], dev)
         layers[i] = layer.cpu()
         del gpts
         torch.cuda.empty_cache()
