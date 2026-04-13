@@ -317,4 +317,9 @@ class SVD_MistralAttention(nn.Module):
         if not output_attentions:
             attn_weights = None
 
+        # Newer Qwen/Mistral decoder blocks expect attention to return only
+        # `(attn_output, attn_weights)` and manage cache updates outside.
+        if "position_embeddings" in kwargs or "cache_position" in kwargs:
+            return attn_output, attn_weights
+
         return attn_output, attn_weights, past_key_value
