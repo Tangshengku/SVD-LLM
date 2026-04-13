@@ -111,6 +111,27 @@ def unwrap_model_for_save(module):
     return module
 
 
+def _infer_input_device(model, fallback_dev):
+    candidate_modules = []
+    if hasattr(model, "model"):
+        if hasattr(model.model, "embed_tokens"):
+            candidate_modules.append(model.model.embed_tokens)
+        if hasattr(model.model, "decoder") and hasattr(model.model.decoder, "embed_tokens"):
+            candidate_modules.append(model.model.decoder.embed_tokens)
+    for module in candidate_modules:
+        return _infer_module_device(module, fallback_dev)
+    return fallback_dev
+
+
+def _prepare_model_inputs(batch, model, dev):
+    target_dev = _infer_input_device(model, dev) if is_sharded_model(model) else dev
+    if isinstance(batch, dict):
+        return {k: v.to(target_dev) if torch.is_tensor(v) else v for k, v in batch.items()}
+    if isinstance(batch, (list, tuple)):
+        return [v.to(target_dev) if torch.is_tensor(v) else v for v in batch]
+    return batch.to(target_dev) if torch.is_tensor(batch) else batch
+
+
 
 @torch.no_grad()
 def profle_svdllm(name, model, calib_loader, dev):
@@ -134,7 +155,7 @@ def profle_svdllm(name, model, calib_loader, dev):
             module.raw_scaling_diag_matrix = 0
             module.register_forward_hook(hook)
     for batch in tqdm(calib_loader):
-        batch = {k: v.to(dev) for k, v in batch.items()}
+        batch = _prepare_model_inputs(batch, model, dev)
         model(**batch)
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear):
@@ -203,7 +224,7 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
     layers[0] = Catcher(layers[0])
     for batch in calib_loader:
         try:
-            batch = {k: v.to(dev) for k, v in batch.items()}
+            batch = _prepare_model_inputs(batch, model, dev)
             model(**batch)
         except ValueError:
             pass
@@ -811,7 +832,8 @@ def whitening_buffered_refit(model_name, model, dataloader, profiling_mat, ratio
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
         try:
-            model(batch[0].to(dev))
+            prepared_batch = _prepare_model_inputs(batch, model, dev)
+            model(prepared_batch[0])
         except ValueError:
             pass
     layers[0] = layers[0].module
@@ -971,7 +993,8 @@ def whitening_singular_expert_merge(model_name, model, dataloader, profiling_mat
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
         try:
-            model(batch[0].to(dev))
+            prepared_batch = _prepare_model_inputs(batch, model, dev)
+            model(prepared_batch[0])
         except ValueError:
             pass
     layers[0] = layers[0].module
@@ -1132,7 +1155,8 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
         try:
-            model(batch[0].to(dev))
+            prepared_batch = _prepare_model_inputs(batch, model, dev)
+            model(prepared_batch[0])
         except ValueError:
             pass
     layers[0] = layers[0].module
@@ -1437,9 +1461,19 @@ if __name__ == '__main__':
     elif args.step >= 4:
         print(f"evaluating {args.model_path}...")
         if args.model_path == "original":
-            model, tokenizer = get_model_from_huggingface(args.model)
+            model, tokenizer = get_model_from_huggingface(
+                args.model,
+                device_map="cpu",
+                torch_dtype=torch.float16,
+            )
         else:
-            model, tokenizer = get_model_from_local(args.model_path)
+            model, tokenizer = get_model_from_local(
+                args.model_path,
+                base_model_id=args.model,
+                reconstruct=True,
+                device_map="cpu",
+                torch_dtype=torch.float16,
+            )
             if args.lora is not None:
                 from utils.peft import PeftModel
                 model = PeftModel.from_pretrained(
