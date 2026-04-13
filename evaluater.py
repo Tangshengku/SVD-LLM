@@ -3,6 +3,7 @@ import numpy as np
 from tqdm import tqdm
 import time
 import itertools
+import json
 from utils.data_utils import get_test_data
 import os
 import sys
@@ -159,3 +160,60 @@ def eff_eval(model, tokenizer, dataset='wikitext2', original_len=4, generated_le
     print("Activation Memory: {} GB".format((end_memory - start_memory)/(1024 ** 3)))
     print("Throughput: {} tokens/sec".format(token_num / throughput))
 
+
+def lm_harness_eval(
+    model,
+    tokenizer,
+    tasks,
+    num_fewshot=0,
+    batch_size=1,
+    device="cuda",
+    limit=None,
+    bootstrap_iters=0,
+    write_out=False,
+    log_samples=False,
+    output_path=None,
+):
+    try:
+        from lm_eval import simple_evaluate
+        from lm_eval.models.huggingface import HFLM
+    except ImportError as exc:
+        raise ImportError(
+            "lm-evaluation-harness is required for task evaluation. "
+            "Install it with `pip install lm-eval` or add it to your environment."
+        ) from exc
+
+    if isinstance(tasks, str):
+        tasks = [task.strip() for task in tasks.split(",") if task.strip()]
+
+    model.eval()
+    model = model.to(device)
+
+    lm = HFLM(
+        pretrained=model,
+        tokenizer=tokenizer,
+        batch_size=batch_size,
+        device=device,
+    )
+
+    results = simple_evaluate(
+        model=lm,
+        tasks=tasks,
+        num_fewshot=num_fewshot,
+        batch_size=batch_size,
+        device=device,
+        limit=limit,
+        bootstrap_iters=bootstrap_iters,
+        write_out=write_out,
+        log_samples=log_samples,
+    )
+
+    printable = json.dumps(results["results"], indent=2, sort_keys=True)
+    print("LM Harness results:")
+    print(printable)
+
+    if output_path is not None:
+        with open(output_path, "w") as f:
+            json.dump(results, f, indent=2, sort_keys=True)
+
+    return results

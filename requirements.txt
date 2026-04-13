@@ -7,3 +7,4 @@ sentencepiece==0.1.99
 matplotlib==3.4.3
 evaluate
 accelerate
+lm-eval

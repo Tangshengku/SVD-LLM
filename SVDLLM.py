@@ -101,6 +101,16 @@ def _run_layer_with_kwargs(layer, hidden_states, layer_kwargs, dev):
     return layer(hidden_states, **kwargs)[0]
 
 
+def unwrap_model_for_save(module):
+    for child in module.modules():
+        if hasattr(child, "_old_forward"):
+            child.forward = child._old_forward
+            delattr(child, "_old_forward")
+        if hasattr(child, "_hf_hook"):
+            delattr(child, "_hf_hook")
+    return module
+
+
 
 @torch.no_grad()
 def profle_svdllm(name, model, calib_loader, dev):
@@ -1310,6 +1320,10 @@ if __name__ == '__main__':
     parser.add_argument('--gen_seq_len', type=int, default=1024, help='generated sequence len for efficiency evaluation')
     parser.add_argument('--step', type=int, default=4, help='the step to run the compression')
     parser.add_argument('--lora', type=str, default=None, help='the lora updated weight path to run the accuracy evaluation')
+    parser.add_argument('--lm_eval_tasks', type=str, default='mmlu,gsm8k,humaneval', help='Comma-separated lm-evaluation-harness tasks.')
+    parser.add_argument('--lm_eval_num_fewshot', type=int, default=0, help='Number of few-shot examples for lm-evaluation-harness.')
+    parser.add_argument('--lm_eval_limit', type=float, default=None, help='Optional example limit for lm-evaluation-harness.')
+    parser.add_argument('--lm_eval_output_path', type=str, default=None, help='Optional JSON output path for lm-evaluation-harness results.')
     parser.add_argument('--selection_method', type=str, default='topk', choices=['topk', 'task_aware_diag', 'task_aware_obs', 'bssr', 'sem'], help='Singular-direction selection rule for whitening compression.')
     parser.add_argument('--selection_nsamples', type=int, default=16, help='Number of calibration samples used to estimate task-aware singular saliency.')
     parser.add_argument('--selection_candidate_extra', type=int, default=32, help='Additional candidate singular directions considered beyond the target rank for task-aware selection.')
@@ -1375,6 +1389,7 @@ if __name__ == '__main__':
         else:
             whitening(args.model, model, profiling_mat, args.ratio, args.DEV)
         if args.save_path is not None:
+            unwrap_model_for_save(model)
             suffix = '_whitening_only_' + args.selection_method + '_' + str(args.ratio) if args.selection_method != 'topk' else '_whitening_only_' + str(args.ratio)
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + suffix + '.pt')   # fp32
     elif args.step == 2:
@@ -1392,6 +1407,7 @@ if __name__ == '__main__':
             profiling_mat = torch.load(args.profiling_mat_path)
         whitening_local_update(args.model, model, dataloader, profiling_mat, args.ratio, args.DEV)
         if args.save_path is not None:
+            unwrap_model_for_save(model)
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_then_update_' + str(args.ratio) + '.pt')  # fp32
     elif args.step == 3:
         model, tokenizer = get_model_from_huggingface(args.model)
@@ -1401,6 +1417,7 @@ if __name__ == '__main__':
         dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
         whitening_local_update(model_name=args.model, model=model, dataloader=dataloader, profiling_mat=None, ratio=args.ratio, dev=args.DEV, direct_update=True)
         if args.save_path is not None:
+            unwrap_model_for_save(model)
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_update_only_' + str(args.ratio) + '.pt')   # fp32
     elif args.step >= 4:
         print(f"evaluating {args.model_path}...")
@@ -1416,6 +1433,7 @@ if __name__ == '__main__':
                     torch_dtype=torch.float16,
                 )
                 model = model.merge_and_unload()
+                unwrap_model_for_save(model)
                 torch.save({'model': model, 'tokenizer': tokenizer}, args.lora + '/merge.pt')
         model.eval()
         model = model.float()
@@ -1424,3 +1442,14 @@ if __name__ == '__main__':
             ppl_eval(model, tokenizer, datasets=['wikitext2'], model_seq_len=args.model_seq_len, batch_size=args.eval_batch_size, device=args.DEV)
         elif args.step == 5:
             eff_eval(model, tokenizer, generated_len=args.gen_seq_len, batch_size=args.eval_batch_size, device=args.DEV)
+        elif args.step == 6:
+            lm_harness_eval(
+                model,
+                tokenizer,
+                tasks=args.lm_eval_tasks,
+                num_fewshot=args.lm_eval_num_fewshot,
+                batch_size=args.eval_batch_size,
+                device=args.DEV,
+                limit=args.lm_eval_limit,
+                output_path=args.lm_eval_output_path,
+            )

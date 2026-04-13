@@ -124,6 +124,17 @@ python SVDLLM.py \
 --step 5 \
 --model_path COMPRESSD_MODEL_SAVING_PATH  \
 ```
+- Task Evaluation with `lm-evaluation-harness`:
+```
+python SVDLLM.py \
+--step 6 \
+--model YOUR_MODEL_ID_OR_LOCAL_CHECKPOINT \
+--model_path COMPRESSD_MODEL_SAVING_PATH_OR_original \
+--lm_eval_tasks mmlu,gsm8k,humaneval \
+--lm_eval_num_fewshot 0 \
+--eval_batch_size 1
+```
+This path uses the Python `lm-evaluation-harness` package and can evaluate both the original model (`--model_path original`) and a locally saved compressed checkpoint. You can optionally save the raw JSON results with `--lm_eval_output_path RESULTS.json`.
 ## Citation
 If you find this work useful, please cite
 ```
