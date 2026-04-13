@@ -70,6 +70,27 @@ def _replace_linear_from_state_dict(parent_module, attr_name, weight_tensor, bia
     setattr(parent_module, attr_name, new_linear)
 
 
+def _replace_attention_projections_from_state_dict(attn_module, prefix, state_dict, projection_names):
+    for proj_name in projection_names:
+        u_key = f"{prefix}.{proj_name}_u_proj.weight"
+        v_key = f"{prefix}.{proj_name}_v_proj.weight"
+        if u_key not in state_dict or v_key not in state_dict:
+            continue
+        bias_key = f"{prefix}.{proj_name}_u_proj.bias"
+        bias_tensor = state_dict[bias_key] if bias_key in state_dict else None
+        _replace_linear_from_state_dict(
+            attn_module,
+            f"{proj_name}_u_proj",
+            state_dict[u_key],
+            bias_tensor,
+        )
+        _replace_linear_from_state_dict(
+            attn_module,
+            f"{proj_name}_v_proj",
+            state_dict[v_key],
+        )
+
+
 def _apply_svd_structure(model_id, model, state_dict):
     from component.svd_llama import SVD_LlamaAttention, SVD_LlamaMLP
     from component.svd_mistral import SVD_MistralAttention, SVD_MistralMLP
@@ -100,35 +121,19 @@ def _apply_svd_structure(model_id, model, state_dict):
             ratio = _compute_ratio_from_low_rank(low_rank, model.config.hidden_size, is_attention=True)
             if _is_llama_family(model_id):
                 layer.self_attn = SVD_LlamaAttention(config=model.config, ratio=ratio)
+                _replace_attention_projections_from_state_dict(
+                    layer.self_attn,
+                    f"{prefix}.self_attn",
+                    state_dict,
+                    ["q", "k", "v", "o"],
+                )
             else:
                 layer.self_attn = SVD_MistralAttention(config=model.config, ratio=ratio)
-                kv_bias = None
-                if f"{prefix}.self_attn.k_u_proj.bias" in state_dict:
-                    kv_bias = state_dict[f"{prefix}.self_attn.k_u_proj.bias"]
-                _replace_linear_from_state_dict(
+                _replace_attention_projections_from_state_dict(
                     layer.self_attn,
-                    "k_u_proj",
-                    state_dict[f"{prefix}.self_attn.k_u_proj.weight"],
-                    kv_bias,
-                )
-                _replace_linear_from_state_dict(
-                    layer.self_attn,
-                    "k_v_proj",
-                    state_dict[f"{prefix}.self_attn.k_v_proj.weight"],
-                )
-                kv_bias = None
-                if f"{prefix}.self_attn.v_u_proj.bias" in state_dict:
-                    kv_bias = state_dict[f"{prefix}.self_attn.v_u_proj.bias"]
-                _replace_linear_from_state_dict(
-                    layer.self_attn,
-                    "v_u_proj",
-                    state_dict[f"{prefix}.self_attn.v_u_proj.weight"],
-                    kv_bias,
-                )
-                _replace_linear_from_state_dict(
-                    layer.self_attn,
-                    "v_v_proj",
-                    state_dict[f"{prefix}.self_attn.v_v_proj.weight"],
+                    f"{prefix}.self_attn",
+                    state_dict,
+                    ["q", "k", "v", "o"],
                 )
 
         mlp_key = f"{prefix}.mlp.gate_u_proj.weight"
