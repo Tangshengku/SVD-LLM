@@ -135,6 +135,33 @@ python SVDLLM.py \
 --eval_batch_size 1
 ```
 This path uses the Python `lm-evaluation-harness` package and can evaluate both the original model (`--model_path original`) and a locally saved compressed checkpoint. You can optionally save the raw JSON results with `--lm_eval_output_path RESULTS.json`.
+For original Hugging Face models, you can use lm-eval parallelization:
+```
+python SVDLLM.py \
+--step 6 \
+--model Qwen/Qwen3-8B \
+--model_path original \
+--lm_eval_tasks mmlu,gsm8k,humaneval \
+--lm_eval_parallelize \
+--DEV auto \
+--eval_batch_size 1
+```
+For local compressed checkpoints, first export to a standard Hugging Face directory:
+```
+python export_hf_checkpoint.py \
+--checkpoint_path /path/to/compressed.pt \
+--base_model_id Qwen/Qwen3-8B \
+--output_dir /path/to/exported_hf_model \
+--safe_serialization
+```
+Then evaluate with 8-GPU data parallel using `lm-evaluation-harness` directly:
+```
+accelerate launch --num_processes 8 -m lm_eval \
+  --model hf \
+  --model_args pretrained=/path/to/exported_hf_model,trust_remote_code=True,dtype=float16 \
+  --tasks mmlu,gsm8k,humaneval \
+  --batch_size auto
+```
 ## Citation
 If you find this work useful, please cite
 ```

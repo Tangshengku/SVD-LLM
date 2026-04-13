@@ -1391,7 +1391,12 @@ if __name__ == '__main__':
         if args.save_path is not None:
             unwrap_model_for_save(model)
             suffix = '_whitening_only_' + args.selection_method + '_' + str(args.ratio) if args.selection_method != 'topk' else '_whitening_only_' + str(args.ratio)
-            torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + suffix + '.pt')   # fp32
+            save_compressed_checkpoint(
+                args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + suffix + '.pt',
+                model,
+                tokenizer,
+                args.model,
+            )
     elif args.step == 2:
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
         ensure_unsharded_model(model, args.model, args.DEV)
@@ -1408,7 +1413,12 @@ if __name__ == '__main__':
         whitening_local_update(args.model, model, dataloader, profiling_mat, args.ratio, args.DEV)
         if args.save_path is not None:
             unwrap_model_for_save(model)
-            torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_then_update_' + str(args.ratio) + '.pt')  # fp32
+            save_compressed_checkpoint(
+                args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_then_update_' + str(args.ratio) + '.pt',
+                model,
+                tokenizer,
+                args.model,
+            )
     elif args.step == 3:
         model, tokenizer = get_model_from_huggingface(args.model)
         ensure_unsharded_model(model, args.model, args.DEV)
@@ -1418,7 +1428,12 @@ if __name__ == '__main__':
         whitening_local_update(model_name=args.model, model=model, dataloader=dataloader, profiling_mat=None, ratio=args.ratio, dev=args.DEV, direct_update=True)
         if args.save_path is not None:
             unwrap_model_for_save(model)
-            torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_update_only_' + str(args.ratio) + '.pt')   # fp32
+            save_compressed_checkpoint(
+                args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_update_only_' + str(args.ratio) + '.pt',
+                model,
+                tokenizer,
+                args.model,
+            )
     elif args.step >= 4:
         print(f"evaluating {args.model_path}...")
         if args.model_path == "original":
@@ -1434,7 +1449,7 @@ if __name__ == '__main__':
                 )
                 model = model.merge_and_unload()
                 unwrap_model_for_save(model)
-                torch.save({'model': model, 'tokenizer': tokenizer}, args.lora + '/merge.pt')
+                save_compressed_checkpoint(args.lora + '/merge.pt', model, tokenizer, args.model)
         model.eval()
         model = model.float()
         model = model.to(args.DEV)
