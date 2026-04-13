@@ -83,6 +83,14 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
     return q_embed, k_embed
 
 
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
 class SVD_LlamaMLP(nn.Module):
     def __init__(
         self,
@@ -118,6 +126,8 @@ class SVD_LlamaAttention(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
+        self.num_key_value_heads = getattr(config, "num_key_value_heads", self.num_heads)
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.head_dim = self.hidden_size // self.num_heads
         self.max_position_embeddings = config.max_position_embeddings
         self.ratio = ratio # 1 means no truncate, just keep normal attn
@@ -131,10 +141,10 @@ class SVD_LlamaAttention(nn.Module):
         self.q_u_proj = nn.Linear(low_rank, self.num_heads * self.head_dim, bias=False)
         self.q_v_proj = nn.Linear(self.hidden_size, low_rank, bias=False)
 
-        self.k_u_proj = nn.Linear(low_rank, self.num_heads * self.head_dim, bias=False)
+        self.k_u_proj = nn.Linear(low_rank, self.num_key_value_heads * self.head_dim, bias=False)
         self.k_v_proj = nn.Linear(self.hidden_size, low_rank, bias=False)
 
-        self.v_u_proj = nn.Linear(low_rank, self.num_heads * self.head_dim, bias=False)
+        self.v_u_proj = nn.Linear(low_rank, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_v_proj = nn.Linear(self.hidden_size, low_rank, bias=False)
 
         self.o_u_proj = nn.Linear(low_rank, self.hidden_size, bias=False)
@@ -159,9 +169,9 @@ class SVD_LlamaAttention(nn.Module):
     
         query_states = self.q_u_proj(self.q_v_proj(hidden_states)).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        key_states = self.k_u_proj(self.k_v_proj(hidden_states)).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = self.k_u_proj(self.k_v_proj(hidden_states)).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        value_states = self.v_u_proj(self.v_v_proj(hidden_states)).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        value_states = self.v_u_proj(self.v_v_proj(hidden_states)).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
@@ -177,6 +187,9 @@ class SVD_LlamaAttention(nn.Module):
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
         past_key_value = (key_states, value_states) if use_cache else None
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
@@ -211,6 +224,9 @@ class SVD_LlamaAttention(nn.Module):
 
         if not output_attentions:
             attn_weights = None
+
+        if "position_embeddings" in kwargs or "cache_position" in kwargs:
+            return attn_output, attn_weights
 
         return attn_output, attn_weights, past_key_value
     
