@@ -257,7 +257,10 @@ def load_dense_model_from_compressed_checkpoint(checkpoint_path, base_model_id=N
     for key, tensor in state_dict.items():
         if key in base_state and base_state[key].shape == tensor.shape:
             direct_state[key] = tensor
-    model.load_state_dict(direct_state, strict=True)
+    load_result = model.load_state_dict(direct_state, strict=False)
+    if load_result.unexpected_keys:
+        print("Warning: unexpected keys while loading dense-model direct state.")
+        print("Unexpected keys:", load_result.unexpected_keys[:20])
 
     if _is_opt_model(model_id):
         layers = model.model.decoder.layers
