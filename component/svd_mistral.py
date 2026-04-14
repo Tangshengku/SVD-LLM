@@ -154,11 +154,24 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
     if position_ids is not None:
-        cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-        sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+        if cos.dim() == 3:
+            if cos.shape[0] == position_ids.shape[0] and cos.shape[1] == q.shape[-2]:
+                cos = cos.unsqueeze(unsqueeze_dim).to(dtype=q.dtype, device=q.device)
+                sin = sin.unsqueeze(unsqueeze_dim).to(dtype=q.dtype, device=q.device)
+            else:
+                gather_indices = position_ids.unsqueeze(-1).expand(-1, -1, cos.shape[-1])
+                cos = torch.gather(cos, 1, gather_indices).unsqueeze(unsqueeze_dim).to(dtype=q.dtype, device=q.device)
+                sin = torch.gather(sin, 1, gather_indices).unsqueeze(unsqueeze_dim).to(dtype=q.dtype, device=q.device)
+        else:
+            cos = cos[position_ids].unsqueeze(unsqueeze_dim).to(dtype=q.dtype, device=q.device)
+            sin = sin[position_ids].unsqueeze(unsqueeze_dim).to(dtype=q.dtype, device=q.device)
     else:
-        cos = cos[: q.shape[-2]].unsqueeze(unsqueeze_dim).to(dtype=q.dtype, device=q.device)
-        sin = sin[: q.shape[-2]].unsqueeze(unsqueeze_dim).to(dtype=q.dtype, device=q.device)
+        if cos.dim() == 3:
+            cos = cos[:, : q.shape[-2], :].unsqueeze(unsqueeze_dim).to(dtype=q.dtype, device=q.device)
+            sin = sin[:, : q.shape[-2], :].unsqueeze(unsqueeze_dim).to(dtype=q.dtype, device=q.device)
+        else:
+            cos = cos[: q.shape[-2]].unsqueeze(unsqueeze_dim).to(dtype=q.dtype, device=q.device)
+            sin = sin[: q.shape[-2]].unsqueeze(unsqueeze_dim).to(dtype=q.dtype, device=q.device)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
