@@ -42,7 +42,7 @@ def get_tokenizer_for_model_id(model_id, device_map="cpu"):
     return AutoTokenizer.from_pretrained(model_id, **tokenizer_kwargs)
 
 
-def get_model_from_huggingface(model_id, device_map="cpu", torch_dtype=torch.float16):
+def get_model_from_huggingface(model_id, device_map="auto", torch_dtype=torch.float16):
     from transformers import AutoModelForCausalLM
     tokenizer = get_tokenizer_for_model_id(model_id, device_map=device_map)
     model = AutoModelForCausalLM.from_pretrained(
