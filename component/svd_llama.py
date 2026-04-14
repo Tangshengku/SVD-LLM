@@ -72,12 +72,35 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
-    gather_indices = position_ids[:, None, :, None]  # [bs, 1, seq_len, 1]
-    gather_indices = gather_indices.repeat(1, cos.shape[1], 1, cos.shape[3])
-    cos = torch.gather(cos.repeat(gather_indices.shape[0], 1, 1, 1), 2, gather_indices)
-    sin = torch.gather(sin.repeat(gather_indices.shape[0], 1, 1, 1), 2, gather_indices)
-    
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    if position_ids is not None:
+        if cos.dim() == 4:
+            gather_indices = position_ids[:, None, :, None]
+            gather_indices = gather_indices.repeat(1, cos.shape[1], 1, cos.shape[3])
+            cos = torch.gather(cos.repeat(gather_indices.shape[0], 1, 1, 1), 2, gather_indices)
+            sin = torch.gather(sin.repeat(gather_indices.shape[0], 1, 1, 1), 2, gather_indices)
+        elif cos.dim() == 3:
+            if cos.shape[0] == position_ids.shape[0] and cos.shape[1] == q.shape[-2]:
+                cos = cos.unsqueeze(unsqueeze_dim).to(dtype=q.dtype, device=q.device)
+                sin = sin.unsqueeze(unsqueeze_dim).to(dtype=q.dtype, device=q.device)
+            else:
+                gather_indices = position_ids.unsqueeze(-1).expand(-1, -1, cos.shape[-1])
+                cos = torch.gather(cos, 1, gather_indices).unsqueeze(unsqueeze_dim).to(dtype=q.dtype, device=q.device)
+                sin = torch.gather(sin, 1, gather_indices).unsqueeze(unsqueeze_dim).to(dtype=q.dtype, device=q.device)
+        else:
+            cos = cos[position_ids].unsqueeze(unsqueeze_dim).to(dtype=q.dtype, device=q.device)
+            sin = sin[position_ids].unsqueeze(unsqueeze_dim).to(dtype=q.dtype, device=q.device)
+    else:
+        if cos.dim() == 4:
+            cos = cos[:, :, : q.shape[-2], :].to(dtype=q.dtype, device=q.device)
+            sin = sin[:, :, : q.shape[-2], :].to(dtype=q.dtype, device=q.device)
+        elif cos.dim() == 3:
+            cos = cos[:, : q.shape[-2], :].unsqueeze(unsqueeze_dim).to(dtype=q.dtype, device=q.device)
+            sin = sin[:, : q.shape[-2], :].unsqueeze(unsqueeze_dim).to(dtype=q.dtype, device=q.device)
+        else:
+            cos = cos[: q.shape[-2]].unsqueeze(unsqueeze_dim).to(dtype=q.dtype, device=q.device)
+            sin = sin[: q.shape[-2]].unsqueeze(unsqueeze_dim).to(dtype=q.dtype, device=q.device)
+
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -150,7 +173,12 @@ class SVD_LlamaAttention(nn.Module):
         self.o_u_proj = nn.Linear(low_rank, self.hidden_size, bias=False)
         self.o_v_proj = nn.Linear(self.num_heads * self.head_dim, low_rank, bias=False)
 
-        self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
+        self.rope_theta = getattr(config, "rope_theta", 10000)
+        self.rotary_emb = LlamaRotaryEmbedding(
+            self.head_dim,
+            max_position_embeddings=self.max_position_embeddings,
+            base=self.rope_theta,
+        )
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -176,9 +204,15 @@ class SVD_LlamaAttention(nn.Module):
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
- 
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        position_embeddings = kwargs.get("position_embeddings", None)
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            # Newer HF Llama/Qwen paths already pass the correctly scaled rotary
+            # embeddings, including llama3 rope variants. Use them directly.
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        else:
+            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         # [bsz, nh, t, hd]
 
         if past_key_value is not None:

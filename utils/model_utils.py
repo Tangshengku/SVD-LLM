@@ -31,11 +31,15 @@ def _is_mistral_family(model_id):
 
 
 def get_tokenizer_for_model_id(model_id, device_map="cpu"):
-    from transformers import LlamaTokenizer, AutoTokenizer
-    model_id_lower = model_id.lower()
-    if "opt" in model_id_lower or "mistral" in model_id_lower or "qwen" in model_id_lower:
-        return AutoTokenizer.from_pretrained(model_id, device_map=device_map, trust_remote_code=True, use_fast=False)
-    return LlamaTokenizer.from_pretrained(model_id, device_map="cpu", trust_remote_code=True)
+    from transformers import AutoTokenizer
+
+    tokenizer_kwargs = {
+        "trust_remote_code": True,
+        "use_fast": False,
+    }
+    if device_map is not None:
+        tokenizer_kwargs["device_map"] = device_map
+    return AutoTokenizer.from_pretrained(model_id, **tokenizer_kwargs)
 
 
 def get_model_from_huggingface(model_id, device_map="cpu", torch_dtype=torch.float16):
