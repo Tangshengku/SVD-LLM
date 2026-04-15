@@ -878,13 +878,13 @@ def main():
             json.dump(genome_to_serializable(spaces, best_genome), handle, indent=2)
         log(f"Saved config to {result_path}")
 
-        if args.profiling_mat_path is None:
-            profiling_path = os.path.join(
-                args.save_path,
-                f"{prefix}_profiling_{args.dataset}_{args.whitening_nsamples}_{args.seed}.pt",
-            )
-            torch.save(profiling_mat, profiling_path)
-            log(f"Saved profiling matrices to {profiling_path}")
+        # if args.profiling_mat_path is None:
+        #     profiling_path = os.path.join(
+        #         args.save_path,
+        #         f"{prefix}_profiling_{args.dataset}_{args.whitening_nsamples}_{args.seed}.pt",
+        #     )
+        #     torch.save(profiling_mat, profiling_path)
+        #     log(f"Saved profiling matrices to {profiling_path}")
 
         if args.save_model:
             model_path = os.path.join(args.save_path, f"{prefix}_evo_svd_{args.ratio}.pt")
