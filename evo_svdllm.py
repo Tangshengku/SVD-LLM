@@ -5,6 +5,7 @@ import json
 import math
 import os
 import random
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -16,6 +17,11 @@ from SVDLLM import profle_svdllm_low_resource
 from component.low_rank_linear import LowRankLinear, ZeroLinear
 from utils.data_utils import get_calib_train_data, get_loaders
 from utils.model_utils import find_layers, get_model_from_huggingface
+
+
+def log(message: str) -> None:
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message}", flush=True)
 
 
 @dataclass
@@ -83,6 +89,10 @@ def build_search_spaces(
 ) -> List[WeightSearchSpace]:
     layer_root, layers = get_transformer_layers(model_name, model)
     spaces: List[WeightSearchSpace] = []
+    log(
+        f"Building search spaces from {len(layers)} transformer layers "
+        f"(rank_step={rank_step}, boundary_window={boundary_window}, tail_count={tail_count})"
+    )
 
     for layer_idx in tqdm(range(len(layers)), desc="Precomputing whitened SVD"):
         layer = layers[layer_idx]
@@ -139,6 +149,7 @@ def build_search_spaces(
 
             del weight, scaling_diag_matrix, scaling_matrix_inv, whitened_weight, u, s, vt, right_v
             torch.cuda.empty_cache()
+    log(f"Finished SVD precomputation for {len(spaces)} searchable linear weights")
     return spaces
 
 
@@ -194,6 +205,7 @@ def rank_delta_utility(space: WeightSearchSpace, old_rank: int, new_rank: int) -
 def greedy_initialization(spaces: Sequence[WeightSearchSpace], budget: int) -> List[int]:
     ranks = [0 for _ in spaces]
     current_cost = 0
+    steps = 0
     while True:
         best_idx = None
         best_score = -1.0
@@ -214,6 +226,8 @@ def greedy_initialization(spaces: Sequence[WeightSearchSpace], budget: int) -> L
             break
         current_cost += spaces[best_idx].cost(best_next_rank) - spaces[best_idx].cost(ranks[best_idx])
         ranks[best_idx] = best_next_rank
+        steps += 1
+    log(f"Greedy initialization finished after {steps} rank-allocation steps")
     return ranks
 
 
@@ -424,9 +438,11 @@ def compute_nll(model, batches: Sequence[torch.Tensor], device: str) -> float:
 def precompute_teacher_logits(model, batches: Sequence[torch.Tensor], device: str) -> List[torch.Tensor]:
     targets = []
     model.eval()
+    log(f"Starting dense teacher-logit precomputation on {len(batches)} search batches")
     for batch in tqdm(batches, desc="Computing dense teacher logits"):
         logits = model(batch.to(device), use_cache=False).logits[:, :-1, :].float().cpu()
         targets.append(logits)
+    log("Finished dense teacher-logit precomputation")
     return targets
 
 
@@ -513,14 +529,27 @@ def main():
     args = parse_args()
     random.seed(args.seed)
     torch.manual_seed(args.seed)
+    run_start = time.time()
 
+    log(
+        f"Launching evolutionary SVD search | model={args.model} | ratio={args.ratio} | "
+        f"dataset={args.dataset} | fitness={args.fitness_fn} | generations={args.generations} | "
+        f"offspring={args.offspring} | device={args.DEV}"
+    )
+
+    log("Loading dense model and tokenizer")
     model, tokenizer = get_model_from_huggingface(args.model)
     model.eval()
     model.seqlen = args.model_seq_len
     model = model.to(args.DEV)
     model.config.use_cache = False
+    log(f"Loaded model; sequence length set to {args.model_seq_len}")
 
     if args.profiling_mat_path is None:
+        log(
+            f"Profiling matrices not provided; collecting whitening stats "
+            f"with {args.whitening_nsamples} calibration samples"
+        )
         whitening_data = get_calib_train_data(
             args.dataset,
             tokenizer,
@@ -529,14 +558,18 @@ def main():
             seed=args.seed,
         )
         profiling_mat = profle_svdllm_low_resource(args.model, model, whitening_data, args.DEV)
+        log("Whitening/profile collection finished")
     else:
+        log(f"Loading profiling matrices from {args.profiling_mat_path}")
         profiling_mat = torch.load(args.profiling_mat_path, map_location="cpu")
+        log("Loaded profiling matrices from disk")
 
     # The low-resource profiling path moves major submodules back to CPU.
     # Move the full dense model to the target device again before search-time evaluation.
     model = model.to(args.DEV)
     model.eval()
     model.config.use_cache = False
+    log(f"Dense model moved back to {args.DEV} for search-time evaluation")
 
     spaces = build_search_spaces(
         args.model,
@@ -552,15 +585,32 @@ def main():
 
     total_dense_params = sum(space.dense_params for space in spaces)
     budget = int((1.0 - args.ratio) * total_dense_params)
+    attn_weights = sum(1 for space in spaces if space.group == "attn")
+    mlp_weights = sum(1 for space in spaces if space.group == "mlp")
+    log(
+        f"Search space ready: {len(spaces)} weights "
+        f"({attn_weights} attention, {mlp_weights} mlp) | "
+        f"dense_params={total_dense_params} | target_kept_budget={budget}"
+    )
     initial_ranks = greedy_initialization(spaces, budget)
     parent = build_topk_genome(spaces, initial_ranks)
     repair_budget(parent, spaces, budget)
+    log(
+        f"Initial genome prepared | kept_params={total_cost(spaces, parent['ranks'])} | "
+        f"active_weights={sum(rank > 0 for rank in parent['ranks'])}"
+    )
 
+    log(f"Preparing {args.search_nsamples} search batches from {args.dataset}")
     search_batches = get_search_batches(args.dataset, tokenizer, args.search_nsamples, args.model_seq_len, args.seed)
+    total_search_tokens = sum(batch.numel() for batch in search_batches)
+    log(f"Search batches ready | batches={len(search_batches)} | tokens={total_search_tokens}")
     teacher_logits = None
     if args.fitness_fn in ["kl", "hyb"]:
         teacher_logits = precompute_teacher_logits(model, search_batches, args.DEV)
+    else:
+        log("Teacher logits skipped because fitness does not require them")
 
+    log("Evaluating initial parent genome")
     parent_score = evaluate_genome(
         model,
         spaces,
@@ -574,18 +624,21 @@ def main():
     best_genome = {"ranks": list(parent["ranks"]), "selected": [list(item) for item in parent["selected"]]}
     best_score = parent_score
 
-    print(f"Initial fitness: {parent_score:.6f}")
-    print(f"Initial kept params: {total_cost(spaces, parent['ranks'])}/{budget}")
+    log(f"Initial fitness={parent_score:.6f}")
+    log(f"Initial kept params={total_cost(spaces, parent['ranks'])}/{budget}")
 
     for generation in range(args.generations):
+        generation_start = time.time()
+        log(f"Generation {generation + 1}/{args.generations} started")
         candidates = [parent]
         for _ in range(args.offspring):
             candidates.append(
                 mutate_offspring(parent, spaces, args.mutation_granularity, args.max_mutations, budget)
             )
+        log(f"Generated {len(candidates) - 1} offspring candidates")
 
         fitnesses = []
-        for candidate in candidates:
+        for candidate_idx, candidate in enumerate(candidates):
             score = evaluate_genome(
                 model,
                 spaces,
@@ -597,6 +650,11 @@ def main():
                 args.hybrid_alpha,
             )
             fitnesses.append(score)
+            if candidate_idx == 0 or candidate_idx == len(candidates) - 1 or len(candidates) <= 4:
+                log(
+                    f"Generation {generation + 1}: evaluated candidate "
+                    f"{candidate_idx + 1}/{len(candidates)} | fitness={score:.6f}"
+                )
 
         best_idx = min(range(len(candidates)), key=lambda idx: fitnesses[idx])
         parent = {
@@ -611,13 +669,18 @@ def main():
                 "ranks": list(parent["ranks"]),
                 "selected": [list(item) for item in parent["selected"]],
             }
+            improvement_status = "new_best"
+        else:
+            improvement_status = "no_global_improvement"
 
-        print(
-            f"Generation {generation + 1}/{args.generations} | "
+        log(
+            f"Generation {generation + 1}/{args.generations} finished | "
             f"parent_fitness={parent_score:.6f} | best_fitness={best_score:.6f} | "
-            f"kept_params={total_cost(spaces, parent['ranks'])}/{budget}"
+            f"kept_params={total_cost(spaces, parent['ranks'])}/{budget} | "
+            f"status={improvement_status} | elapsed={time.time() - generation_start:.1f}s"
         )
 
+    log("Applying best genome to the model")
     apply_genome(model, spaces, best_genome)
 
     if args.save_path is not None:
@@ -626,7 +689,7 @@ def main():
         result_path = os.path.join(args.save_path, f"{prefix}_evo_svd_config.json")
         with open(result_path, "w", encoding="utf-8") as handle:
             json.dump(genome_to_serializable(spaces, best_genome), handle, indent=2)
-        print(f"Saved config to {result_path}")
+        log(f"Saved config to {result_path}")
 
         if args.profiling_mat_path is None:
             profiling_path = os.path.join(
@@ -634,12 +697,14 @@ def main():
                 f"{prefix}_profiling_{args.dataset}_{args.whitening_nsamples}_{args.seed}.pt",
             )
             torch.save(profiling_mat, profiling_path)
-            print(f"Saved profiling matrices to {profiling_path}")
+            log(f"Saved profiling matrices to {profiling_path}")
 
         if args.save_model:
             model_path = os.path.join(args.save_path, f"{prefix}_evo_svd_{args.ratio}.pt")
             torch.save({"model": model.cpu(), "tokenizer": tokenizer}, model_path)
-            print(f"Saved compressed model to {model_path}")
+            log(f"Saved compressed model to {model_path}")
+
+    log(f"Run finished successfully in {time.time() - run_start:.1f}s")
 
 
 if __name__ == "__main__":
