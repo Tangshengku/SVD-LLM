@@ -379,10 +379,22 @@ def build_factor_weights(space: WeightSearchSpace, selected: Sequence[int]) -> T
         )
     idx = torch.tensor(sorted(selected), dtype=torch.long)
     sigma = torch.sqrt(space.singular_values_sq[idx]).to(torch.float32)
-    left = space.left_u[:, idx].to(torch.float32)
-    right = space.right_v[idx, :].to(torch.float32)
-    u_weight = (left * sigma.unsqueeze(0)).to(space.dtype)
-    v_weight = (sigma.unsqueeze(1) * right).to(space.dtype)
+    left = space.left_u[:, idx].to(torch.float32) * sigma.unsqueeze(0)
+    right = sigma.unsqueeze(1) * space.right_v[idx, :].to(torch.float32)
+
+    # Balance every rank-1 component before casting to low precision.
+    # This preserves the product U @ V but reduces peak magnitude and helps avoid fp16 overflow.
+    for col_idx in range(left.shape[1]):
+        left_max = left[:, col_idx].abs().max().item()
+        right_max = right[col_idx, :].abs().max().item()
+        if left_max == 0.0 or right_max == 0.0:
+            continue
+        scale = math.sqrt(right_max / left_max)
+        left[:, col_idx] = left[:, col_idx] * scale
+        right[col_idx, :] = right[col_idx, :] / scale
+
+    u_weight = left.to(space.dtype)
+    v_weight = right.to(space.dtype)
     return u_weight.cpu(), v_weight.cpu()
 
 
@@ -405,6 +417,14 @@ def apply_genome(model, spaces: Sequence[WeightSearchSpace], genome: Dict[str, L
             )
         else:
             u_weight, v_weight = build_factor_weights(space, selected)
+            if not torch.isfinite(u_weight).all():
+                raise RuntimeError(
+                    f"Non-finite U factor generated for {space.name} at rank {rank}"
+                )
+            if not torch.isfinite(v_weight).all():
+                raise RuntimeError(
+                    f"Non-finite V factor generated for {space.name} at rank {rank}"
+                )
             module = LowRankLinear(
                 space.in_features,
                 space.out_features,
@@ -439,8 +459,11 @@ def precompute_teacher_logits(model, batches: Sequence[torch.Tensor], device: st
     targets = []
     model.eval()
     log(f"Starting dense teacher-logit precomputation on {len(batches)} search batches")
-    for batch in tqdm(batches, desc="Computing dense teacher logits"):
-        logits = model(batch.to(device), use_cache=False).logits[:, :-1, :].float().cpu()
+    for batch_idx, batch in enumerate(tqdm(batches, desc="Computing dense teacher logits")):
+        logits = model(batch.to(device), use_cache=False).logits[:, :-1, :].float()
+        if not torch.isfinite(logits).all():
+            raise RuntimeError(f"Non-finite dense teacher logits detected on batch {batch_idx}")
+        logits = logits.cpu()
         targets.append(logits)
     log("Finished dense teacher-logit precomputation")
     return targets
@@ -450,12 +473,22 @@ def precompute_teacher_logits(model, batches: Sequence[torch.Tensor], device: st
 def compute_kl(model, batches: Sequence[torch.Tensor], teacher_logits: Sequence[torch.Tensor], device: str) -> float:
     losses = []
     model.eval()
-    for batch, teacher in zip(batches, teacher_logits):
+    for batch_idx, (batch, teacher) in enumerate(zip(batches, teacher_logits)):
         student_logits = model(batch.to(device), use_cache=False).logits[:, :-1, :].float()
+        if not torch.isfinite(student_logits).all():
+            raise RuntimeError(f"Non-finite student logits detected during KL computation on batch {batch_idx}")
         teacher = teacher.to(student_logits.device)
-        teacher_prob = torch.softmax(teacher, dim=-1)
+        teacher_log_prob = torch.log_softmax(teacher, dim=-1)
         student_log_prob = torch.log_softmax(student_logits, dim=-1)
-        losses.append(torch.nn.functional.kl_div(student_log_prob, teacher_prob, reduction="batchmean").item())
+        loss = torch.nn.functional.kl_div(
+            student_log_prob,
+            teacher_log_prob,
+            reduction="batchmean",
+            log_target=True,
+        )
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"Non-finite KL loss detected on batch {batch_idx}")
+        losses.append(loss.item())
     return float(sum(losses) / max(len(losses), 1))
 
 
