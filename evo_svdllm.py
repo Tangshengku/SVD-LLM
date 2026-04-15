@@ -814,13 +814,10 @@ def main():
             )
         log(f"Generated {len(candidates) - 1} offspring candidates")
 
-        # Apply parent genome once; offspring are evaluated via cheap diff-apply + rollback.
-        apply_genome(model, spaces, parent)
-
         fitnesses = []
         for candidate_idx, candidate in enumerate(candidates):
             if candidate_idx == 0:
-                # Parent genome already applied — just evaluate.
+                # Parent genome remains applied from the previous step.
                 rollback = None
             else:
                 rollback = apply_genome_diff(model, spaces, parent, candidate)
@@ -843,11 +840,15 @@ def main():
                 )
 
         best_idx = min(range(len(candidates)), key=lambda idx: fitnesses[idx])
+        previous_parent = parent
         parent = {
             "ranks": list(candidates[best_idx]["ranks"]),
             "selected": [list(item) for item in candidates[best_idx]["selected"]],
         }
         parent_score = fitnesses[best_idx]
+
+        if best_idx != 0:
+            apply_genome_diff(model, spaces, previous_parent, parent)
 
         if parent_score < best_score:
             best_score = parent_score
