@@ -378,9 +378,12 @@ def build_factor_weights(space: WeightSearchSpace, selected: Sequence[int]) -> T
             torch.zeros((0, space.in_features), dtype=space.dtype),
         )
     idx = torch.tensor(sorted(selected), dtype=torch.long)
-    sigma = torch.sqrt(space.singular_values_sq[idx]).to(torch.float32)
-    left = space.left_u[:, idx].to(torch.float32) * sigma.unsqueeze(0)
-    right = sigma.unsqueeze(1) * space.right_v[idx, :].to(torch.float32)
+    # singular_values_sq stores s^2, so s^{1/2} = (s^2)^{1/4}.
+    # Balanced split: left = U * s^{1/2}, right = s^{1/2} * right_v,
+    # so left @ right = U @ diag(s) @ right_v (correct W approximation).
+    sigma_half = space.singular_values_sq[idx].pow(0.25).to(torch.float32)
+    left = space.left_u[:, idx].to(torch.float32) * sigma_half.unsqueeze(0)
+    right = sigma_half.unsqueeze(1) * space.right_v[idx, :].to(torch.float32)
 
     # Balance every rank-1 component before casting to low precision.
     # This preserves the product U @ V but reduces peak magnitude and helps avoid fp16 overflow.
@@ -392,6 +395,12 @@ def build_factor_weights(space: WeightSearchSpace, selected: Sequence[int]) -> T
         scale = math.sqrt(right_max / left_max)
         left[:, col_idx] = left[:, col_idx] * scale
         right[col_idx, :] = right[col_idx, :] / scale
+
+    # Safety clamp: prevent fp16 overflow (max ~65504) from ill-conditioned whitening matrices.
+    if space.dtype in (torch.float16, torch.bfloat16):
+        fp_max = torch.finfo(space.dtype).max * 0.9
+        left = left.clamp(-fp_max, fp_max)
+        right = right.clamp(-fp_max, fp_max)
 
     u_weight = left.to(space.dtype)
     v_weight = right.to(space.dtype)
