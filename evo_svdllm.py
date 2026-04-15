@@ -387,14 +387,13 @@ def build_factor_weights(space: WeightSearchSpace, selected: Sequence[int]) -> T
 
     # Balance every rank-1 component before casting to low precision.
     # This preserves the product U @ V but reduces peak magnitude and helps avoid fp16 overflow.
-    for col_idx in range(left.shape[1]):
-        left_max = left[:, col_idx].abs().max().item()
-        right_max = right[col_idx, :].abs().max().item()
-        if left_max == 0.0 or right_max == 0.0:
-            continue
-        scale = math.sqrt(right_max / left_max)
-        left[:, col_idx] = left[:, col_idx] * scale
-        right[col_idx, :] = right[col_idx, :] / scale
+    left_max = left.abs().max(dim=0).values   # [rank]
+    right_max = right.abs().max(dim=1).values  # [rank]
+    nonzero = (left_max > 0) & (right_max > 0)
+    scale = torch.ones(left.shape[1], dtype=torch.float32)
+    scale[nonzero] = (right_max[nonzero] / left_max[nonzero]).sqrt()
+    left = left * scale.unsqueeze(0)
+    right = right / scale.unsqueeze(1)
 
     # Safety clamp: prevent fp16 overflow (max ~65504) from ill-conditioned whitening matrices.
     if space.dtype in (torch.float16, torch.bfloat16):
