@@ -196,7 +196,7 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
      
  
 @torch.no_grad()
-def whitening(model_name, model, profiling_mat, ratio, dev):
+def whitening(model_name, model, profiling_mat, ratio, dev, init_scheme="uniform"):
     model.eval()
     if 'opt' in model_name:
         layers = model.model.decoder.layers
@@ -208,13 +208,13 @@ def whitening(model_name, model, profiling_mat, ratio, dev):
         subset = find_layers(layer)
         #### Replace Attn, MLP ####
         if "llama" in model_name or "vicuna" in model_name:
-            svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio)
-            svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio)
+            svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio, init_scheme=init_scheme)
+            svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio, init_scheme=init_scheme)
         elif "mistral" in model_name:
-            svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio)
-            svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio)
+            svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio, init_scheme=init_scheme)
+            svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio, init_scheme=init_scheme)
         elif 'opt' in model_name:
-            svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio)
+            svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio, init_scheme=init_scheme)
         #### Replace Attn, MLP ####
         for name in subset:
             W = subset[name].weight.data.float().to(dev)
@@ -298,7 +298,7 @@ def whitening(model_name, model, profiling_mat, ratio, dev):
 
 
 @torch.no_grad()
-def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, dev, direct_update=False):
+def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, dev, direct_update=False, init_scheme="uniform"):
     print("Start SVD decomposition then update...")
     use_cache = model.config.use_cache
     model.config.use_cache = False
@@ -345,13 +345,13 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
         subset = find_layers(layer)
         gpts = {}
         if "llama" in model_name or "vicuna" in model_name:
-            svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio)
-            svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio)
+            svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio, init_scheme=init_scheme)
+            svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio, init_scheme=init_scheme)
         elif "mistral" in model_name:
-            svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio)
-            svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio)
+            svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio, init_scheme=init_scheme)
+            svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio, init_scheme=init_scheme)
         elif 'opt' in model_name:
-            svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio)
+            svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio, init_scheme=init_scheme)
         for name in subset:
             if profiling_mat is not None:
                 scaling_diag_matrix = profiling_mat[i][name].to(dev)
@@ -516,6 +516,13 @@ if __name__ == '__main__':
     parser.add_argument('--gen_seq_len', type=int, default=1024, help='generated sequence len for efficiency evaluation')
     parser.add_argument('--step', type=int, default=4, help='the step to run the compression')
     parser.add_argument('--lora', type=str, default=None, help='the lora updated weight path to run the accuracy evaluation')
+    parser.add_argument(
+        '--init_scheme',
+        type=str,
+        default='uniform',
+        choices=['uniform', 'xavier_uniform', 'kaiming_uniform', 'default'],
+        help='Initialization scheme for freshly created SVD low-rank modules before decomposition weights are loaded.',
+    )
     
     args = parser.parse_args()
     args.ratio = 1- args.ratio
@@ -529,7 +536,7 @@ if __name__ == '__main__':
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
-        whitening(args.model, model, profiling_mat, args.ratio, args.DEV)
+        whitening(args.model, model, profiling_mat, args.ratio, args.DEV, init_scheme=args.init_scheme)
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_' + str(args.ratio) + '.pt')   # fp32
     elif args.step == 2:
@@ -544,7 +551,7 @@ if __name__ == '__main__':
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
-        whitening_local_update(args.model, model, dataloader, profiling_mat, args.ratio, args.DEV)
+        whitening_local_update(args.model, model, dataloader, profiling_mat, args.ratio, args.DEV, init_scheme=args.init_scheme)
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_then_update_' + str(args.ratio) + '.pt')  # fp32
     elif args.step == 3:
@@ -552,7 +559,7 @@ if __name__ == '__main__':
         model = model.eval()
         model = model.float()
         dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
-        whitening_local_update(model_name=args.model, model=model, dataloader=dataloader, profiling_mat=None, ratio=args.ratio, dev=args.DEV, direct_update=True)
+        whitening_local_update(model_name=args.model, model=model, dataloader=dataloader, profiling_mat=None, ratio=args.ratio, dev=args.DEV, direct_update=True, init_scheme=args.init_scheme)
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_update_only_' + str(args.ratio) + '.pt')   # fp32
     elif args.step >= 4:

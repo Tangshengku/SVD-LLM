@@ -55,6 +55,28 @@ logger = logging.get_logger(__name__)
 _CONFIG_FOR_DOC = "MistralConfig"
 
 
+def _init_linear(linear: nn.Linear, init_scheme: str) -> None:
+    if init_scheme == "uniform":
+        bound = 1 / math.sqrt(linear.in_features) if linear.in_features > 0 else 0.0
+        nn.init.uniform_(linear.weight, -bound, bound)
+        if linear.bias is not None:
+            nn.init.uniform_(linear.bias, -bound, bound)
+    elif init_scheme == "xavier_uniform":
+        nn.init.xavier_uniform_(linear.weight)
+        if linear.bias is not None:
+            nn.init.zeros_(linear.bias)
+    elif init_scheme == "kaiming_uniform":
+        nn.init.kaiming_uniform_(linear.weight, a=math.sqrt(5))
+        if linear.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(linear.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0.0
+            nn.init.uniform_(linear.bias, -bound, bound)
+    elif init_scheme == "default":
+        linear.reset_parameters()
+    else:
+        raise ValueError(f"Unsupported init_scheme: {init_scheme}")
+
+
 # Copied from transformers.models.llama.modeling_llama._get_unpad_data
 def _get_unpad_data(attention_mask):
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
@@ -162,13 +184,15 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 
 class SVD_MistralMLP(nn.Module):
     def __init__(self, config,
-                 ratio=1  # 1 means no truncate, just keep normal MLP
+                 ratio=1,  # 1 means no truncate, just keep normal MLP
+                 init_scheme: str = "uniform",
                  ):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.ratio = ratio
+        self.init_scheme = init_scheme
         low_rank = int(self.intermediate_size * self.hidden_size * self.ratio / (self.intermediate_size + self.hidden_size))
         self.gate_u_proj = nn.Linear(low_rank, self.intermediate_size, bias=False)
         self.gate_v_proj = nn.Linear(self.hidden_size, low_rank, bias=False)
@@ -179,6 +203,18 @@ class SVD_MistralMLP(nn.Module):
         self.up_u_proj = nn.Linear(low_rank, self.intermediate_size, bias=False)
         self.up_v_proj = nn.Linear(self.hidden_size, low_rank, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for linear in (
+            self.gate_u_proj,
+            self.gate_v_proj,
+            self.down_u_proj,
+            self.down_v_proj,
+            self.up_u_proj,
+            self.up_v_proj,
+        ):
+            _init_linear(linear, self.init_scheme)
 
     def forward(self, x):
         up = self.up_u_proj(self.up_v_proj(x))
@@ -206,9 +242,11 @@ class SVD_MistralAttention(nn.Module):
     """
 
     def __init__(self, config: MistralConfig,
-                 ratio=1):
+                 ratio=1,
+                 init_scheme: str = "uniform"):
         super().__init__()
         self.config = config
+        self.init_scheme = init_scheme
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.hidden_size // self.num_heads
@@ -239,6 +277,20 @@ class SVD_MistralAttention(nn.Module):
             max_position_embeddings=self.max_position_embeddings,
             base=self.rope_theta,
         )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for linear in (
+            self.q_u_proj,
+            self.q_v_proj,
+            self.k_u_proj,
+            self.k_v_proj,
+            self.v_u_proj,
+            self.v_v_proj,
+            self.o_u_proj,
+            self.o_v_proj,
+        ):
+            _init_linear(linear, self.init_scheme)
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()

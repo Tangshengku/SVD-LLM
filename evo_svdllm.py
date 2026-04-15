@@ -231,6 +231,61 @@ def greedy_initialization(spaces: Sequence[WeightSearchSpace], budget: int) -> L
     return ranks
 
 
+def layer_key(space: WeightSearchSpace) -> str:
+    parts = space.name.split(".")
+    if "layers" in parts:
+        layer_pos = parts.index("layers")
+        if layer_pos + 1 < len(parts):
+            return ".".join(parts[: layer_pos + 2])
+    return space.name.rsplit(".", 1)[0]
+
+
+def uniform_initialization(spaces: Sequence[WeightSearchSpace], budget: int) -> List[int]:
+    ranks = [0 for _ in spaces]
+    current_cost = 0
+    steps = 0
+    layer_to_indices: Dict[str, List[int]] = {}
+    for idx, space in enumerate(spaces):
+        layer_to_indices.setdefault(layer_key(space), []).append(idx)
+    layer_order = sorted(layer_to_indices)
+
+    while True:
+        progressed = False
+        for layer in layer_order:
+            candidate_indices = []
+            for idx in layer_to_indices[layer]:
+                space = spaces[idx]
+                next_level = next_rank(space, ranks[idx])
+                if next_level is None:
+                    continue
+                delta_cost = space.cost(next_level) - space.cost(ranks[idx])
+                if current_cost + delta_cost > budget:
+                    continue
+                fill = next_level / max(space.max_rank, 1)
+                candidate_indices.append((fill, delta_cost, idx, next_level))
+            if not candidate_indices:
+                continue
+            _, delta_cost, best_idx, best_next_rank = min(candidate_indices, key=lambda item: (item[0], item[1], item[2]))
+            current_cost += delta_cost
+            ranks[best_idx] = best_next_rank
+            steps += 1
+            progressed = True
+        if not progressed:
+            break
+    log(f"Uniform initialization finished after {steps} strict per-layer rank-allocation steps")
+    return ranks
+
+
+def initialize_ranks(
+    spaces: Sequence[WeightSearchSpace], budget: int, strategy: str
+) -> List[int]:
+    if strategy == "greedy":
+        return greedy_initialization(spaces, budget)
+    if strategy == "uniform":
+        return uniform_initialization(spaces, budget)
+    raise ValueError(f"Unsupported init strategy: {strategy}")
+
+
 def build_topk_genome(spaces: Sequence[WeightSearchSpace], ranks: Sequence[int]) -> Dict[str, List[List[int]]]:
     return {"ranks": list(ranks), "selected": [space.topk_selection(rank) for space, rank in zip(spaces, ranks)]}
 
@@ -633,6 +688,12 @@ def parse_args():
     parser.add_argument("--boundary_window", type=int, default=8, help="Boundary search window size.")
     parser.add_argument("--tail_count", type=int, default=8, help="Tail-pool size per weight.")
     parser.add_argument("--mutation_granularity", choices=["group", "weight"], default="group")
+    parser.add_argument(
+        "--init_strategy",
+        choices=["greedy", "uniform"],
+        default="greedy",
+        help="Initial rank-allocation strategy for the first genome.",
+    )
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
     parser.add_argument("--DEV", type=str, default="cuda", help="Search device.")
     parser.add_argument("--eval_batch_size", type=int, default=4, help="Mini-batch size for fitness forward passes.")
@@ -706,11 +767,12 @@ def main():
         f"({attn_weights} attention, {mlp_weights} mlp) | "
         f"dense_params={total_dense_params} | target_kept_budget={budget}"
     )
-    initial_ranks = greedy_initialization(spaces, budget)
+    initial_ranks = initialize_ranks(spaces, budget, args.init_strategy)
     parent = build_topk_genome(spaces, initial_ranks)
     repair_budget(parent, spaces, budget)
     log(
-        f"Initial genome prepared | kept_params={total_cost(spaces, parent['ranks'])} | "
+        f"Initial genome prepared | init_strategy={args.init_strategy} | "
+        f"kept_params={total_cost(spaces, parent['ranks'])} | "
         f"active_weights={sum(rank > 0 for rank in parent['ranks'])}"
     )
 

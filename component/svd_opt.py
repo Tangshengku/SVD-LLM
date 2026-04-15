@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """ PyTorch OPT model."""
+import math
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -49,6 +50,28 @@ OPT_PRETRAINED_MODEL_ARCHIVE_LIST = [
     "facebook/opt-30b",
     # See all OPT models at https://huggingface.co/models?filter=opt
 ]
+
+
+def _init_linear(linear: nn.Linear, init_scheme: str) -> None:
+    if init_scheme == "uniform":
+        bound = 1 / math.sqrt(linear.in_features) if linear.in_features > 0 else 0.0
+        nn.init.uniform_(linear.weight, -bound, bound)
+        if linear.bias is not None:
+            nn.init.uniform_(linear.bias, -bound, bound)
+    elif init_scheme == "xavier_uniform":
+        nn.init.xavier_uniform_(linear.weight)
+        if linear.bias is not None:
+            nn.init.zeros_(linear.bias)
+    elif init_scheme == "kaiming_uniform":
+        nn.init.kaiming_uniform_(linear.weight, a=math.sqrt(5))
+        if linear.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(linear.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0.0
+            nn.init.uniform_(linear.bias, -bound, bound)
+    elif init_scheme == "default":
+        linear.reset_parameters()
+    else:
+        raise ValueError(f"Unsupported init_scheme: {init_scheme}")
 
 
 # Copied from transformers.models.llama.modeling_llama._get_unpad_data
@@ -96,10 +119,12 @@ class SVDOPTAttention(nn.Module):
         config: OPTConfig,
         is_decoder: bool = False,
         ratio=1,
+        init_scheme: str = "uniform",
         **kwargs,
     ):
         super().__init__()
         self.config = config
+        self.init_scheme = init_scheme
 
         def _handle_deprecated_argument(config_arg_name, config, fn_arg_name, kwargs):
             """
@@ -158,6 +183,27 @@ class SVDOPTAttention(nn.Module):
             self.out_v_proj = nn.Linear(self.embed_dim, low_rank, bias=False)
         else:
             self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=self.enable_bias)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        linears = []
+        if self.ratio != 1:
+            linears.extend(
+                [
+                    self.q_u_proj,
+                    self.q_v_proj,
+                    self.k_u_proj,
+                    self.k_v_proj,
+                    self.v_u_proj,
+                    self.v_v_proj,
+                    self.out_u_proj,
+                    self.out_v_proj,
+                ]
+            )
+        else:
+            linears.extend([self.q_proj, self.k_proj, self.v_proj, self.out_proj])
+        for linear in linears:
+            _init_linear(linear, self.init_scheme)
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -309,11 +355,12 @@ class SVDOPTAttention(nn.Module):
 
 
 class SVDOPTDecoderLayer(nn.Module):
-    def __init__(self, config: OPTConfig, ratio = 1):
+    def __init__(self, config: OPTConfig, ratio = 1, init_scheme: str = "uniform"):
         super().__init__()
         self.embed_dim = config.hidden_size
+        self.init_scheme = init_scheme
 
-        self.self_attn = SVDOPTAttention(config=config, ratio=ratio, is_decoder=True)
+        self.self_attn = SVDOPTAttention(config=config, ratio=ratio, is_decoder=True, init_scheme=init_scheme)
 
         self.do_layer_norm_before = config.do_layer_norm_before
         self.dropout = config.dropout
@@ -336,6 +383,16 @@ class SVDOPTDecoderLayer(nn.Module):
         else:
             self.fc2 = nn.Linear(config.ffn_dim, self.embed_dim, bias=config.enable_bias)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim, elementwise_affine=config.layer_norm_elementwise_affine)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        linears = []
+        if self.ratio != 1:
+            linears.extend([self.fc1_u_proj, self.fc1_v_proj, self.fc2_u_proj, self.fc2_v_proj])
+        else:
+            linears.extend([self.fc1, self.fc2])
+        for linear in linears:
+            _init_linear(linear, self.init_scheme)
 
     def forward(
         self,
@@ -419,4 +476,3 @@ class SVDOPTDecoderLayer(nn.Module):
             outputs += (present_key_value,)
 
         return outputs
-
