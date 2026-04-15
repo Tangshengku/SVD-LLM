@@ -110,7 +110,32 @@ SVD-LLM can also be integrated with quantization methods to achieve a better com
 bash svdllm_gptq.sh
 ```
 
-### 4. Evaluation
+### 4. Evolutionary Search for Rank Allocation and Singular Positions
+`evo_svdllm.py` implements a training-free evolutionary search on top of truncation-aware whitening. It searches a non-uniform per-weight rank allocation under a global compression budget and can also swap singular values near the truncation boundary.
+```
+python evo_svdllm.py \
+--model HUGGINGFACE_MODEL_REPO \
+--ratio COMPRESSION_RATIO \
+--dataset wikitext2 \
+--whitening_nsamples 256 \
+--search_nsamples 16 \
+--model_seq_len 2048 \
+--fitness_fn kl \
+--generations 50 \
+--offspring 8 \
+--rank_step 8 \
+--boundary_window 8 \
+--tail_count 8 \
+--mutation_granularity group \
+--save_path OUTPUT_DIR \
+--save_model
+```
+Important defaults:
+- `--fitness_fn kl` compares the compressed model against dense teacher logits on calibration text. `ppl` and `hyb` are also supported.
+- `--mutation_granularity group` transfers rank only within attention or MLP pools, matching the recommended search space in `Evo_writeups.pdf`.
+- `--rank_step`, `--boundary_window`, and `--tail_count` control the discrete rank levels and the singular-value search neighborhood.
+
+### 5. Evaluation
 - Perplexity Evaluation:
 ```
 python SVDLLM.py \
