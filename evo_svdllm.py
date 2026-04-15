@@ -532,6 +532,12 @@ def main():
     else:
         profiling_mat = torch.load(args.profiling_mat_path, map_location="cpu")
 
+    # The low-resource profiling path moves major submodules back to CPU.
+    # Move the full dense model to the target device again before search-time evaluation.
+    model = model.to(args.DEV)
+    model.eval()
+    model.config.use_cache = False
+
     spaces = build_search_spaces(
         args.model,
         model,

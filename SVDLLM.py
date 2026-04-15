@@ -19,6 +19,30 @@ parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(current_path)
 
 
+def _move_nested_to_cpu(value):
+    if torch.is_tensor(value):
+        return value.cpu()
+    if isinstance(value, tuple):
+        return tuple(_move_nested_to_cpu(item) for item in value)
+    if isinstance(value, list):
+        return [_move_nested_to_cpu(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _move_nested_to_cpu(item) for key, item in value.items()}
+    return value
+
+
+def _move_nested_to_device(value, device):
+    if torch.is_tensor(value):
+        return value.to(device)
+    if isinstance(value, tuple):
+        return tuple(_move_nested_to_device(item, device) for item in value)
+    if isinstance(value, list):
+        return [_move_nested_to_device(item, device) for item in value]
+    if isinstance(value, dict):
+        return {key: _move_nested_to_device(item, device) for key, item in value.items()}
+    return value
+
+
 
 @torch.no_grad()
 def profle_svdllm(name, model, calib_loader, dev):
@@ -94,22 +118,15 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
     inps = torch.zeros(
         (len(calib_loader), model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
-    cache = {'i': 0, 'attention_mask': None, "position_ids": None}
+    cache = {'i': 0, 'layer_kwargs': []}
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
             self.module = module
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp.cpu()
+            cache['layer_kwargs'].append(_move_nested_to_cpu(kwargs))
             cache['i'] += 1
-            if cache['attention_mask'] is None:
-                cache['attention_mask'] = kwargs['attention_mask'].cpu()
-                if "opt" not in model_name:
-                    cache['position_ids'] = kwargs['position_ids'].cpu()
-            else:
-                cache['attention_mask'] = torch.cat((cache['attention_mask'], kwargs['attention_mask'].cpu()), dim=0)
-                if "opt" not in model_name:
-                    cache['position_ids'] = torch.cat((cache['position_ids'], kwargs['position_ids'].cpu()), dim=0)
             raise ValueError
     layers[0] = Catcher(layers[0])
     for batch in calib_loader:
@@ -129,9 +146,6 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
         model.model.norm = model.model.norm.cpu()
     torch.cuda.empty_cache()
     outs = torch.zeros_like(inps)
-    attention_masks = cache['attention_mask']
-    if "opt" not in model_name:
-        position_ids = cache['position_ids']
     profiling_mat = {}
     for i in tqdm(range(len(layers))):
         layer_profile = {}
@@ -151,10 +165,8 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
             subset[name].scaling_diag_matrix = 0
             handles.append(subset[name].register_forward_hook(hook))
         for j in range(inps.shape[0]):
-            if "opt" not in model_name:
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_masks[j].unsqueeze(0).to(dev), position_ids=position_ids[j].unsqueeze(0).to(dev))[0]
-            else:
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_masks[j].unsqueeze(0).to(dev))[0]
+            layer_kwargs = _move_nested_to_device(cache['layer_kwargs'][j], dev)
+            outs[j] = layer(inps[j].unsqueeze(0), **layer_kwargs)[0]
         for h in handles:
             h.remove()
         layer = layer.cpu()
@@ -306,22 +318,15 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
     inps = torch.zeros(
         (len(dataloader), model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
-    cache = {'i': 0, 'attention_mask': None, "position_ids": None}
+    cache = {'i': 0, 'layer_kwargs': []}
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
             self.module = module
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
+            cache['layer_kwargs'].append(kwargs)
             cache['i'] += 1
-            if cache['attention_mask'] is None:
-                cache['attention_mask'] = kwargs['attention_mask']
-                if "opt" not in model_name:
-                    cache['position_ids'] = kwargs['position_ids']
-            else:
-                cache['attention_mask'] = torch.cat((cache['attention_mask'], kwargs['attention_mask']), dim=0)
-                if "opt" not in model_name:
-                    cache['position_ids'] = torch.cat((cache['position_ids'], kwargs['position_ids']), dim=0)
             raise ValueError
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
@@ -335,9 +340,6 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
     model.model.norm = model.model.norm.cpu()
     torch.cuda.empty_cache()
     outs = torch.zeros_like(inps)
-    attention_masks = cache['attention_mask']
-    if "opt" not in model_name:
-        position_ids = cache['position_ids']
     for i in tqdm(range(len(layers))):
         layer = layers[i].to(dev)
         subset = find_layers(layer)
@@ -364,10 +366,8 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
         handles = []
         for name in gpts:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
-        if "opt" not in model_name:
-            outs = layer(inps, attention_mask=attention_masks, position_ids=position_ids)[0]
-        else:
-            outs = layer(inps, attention_mask=attention_masks)[0]
+        for j in range(inps.shape[0]):
+            outs[j] = layer(inps[j].unsqueeze(0), **cache['layer_kwargs'][j])[0]
         for h in handles:
             h.remove()
         for name in gpts:
@@ -426,10 +426,8 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
                     svd_mlp.up_v_proj.weight.data = svd_v
                     layer.mlp = svd_mlp
         layer = layer.to(dev)
-        if "opt" not in model_name:
-            outs = layer(inps, attention_mask=attention_masks, position_ids=position_ids)[0]
-        else:
-            outs = layer(inps, attention_mask=attention_masks)[0]
+        for j in range(inps.shape[0]):
+            outs[j] = layer(inps[j].unsqueeze(0), **cache['layer_kwargs'][j])[0]
         layers[i] = layer.cpu()
         del gpts
         torch.cuda.empty_cache()
