@@ -406,6 +406,31 @@ def build_factor_weights(space: WeightSearchSpace, selected: Sequence[int]) -> T
     return u_weight.cpu(), v_weight.cpu()
 
 
+def _make_module(space: WeightSearchSpace, rank: int, selected: Sequence[int]) -> nn.Module:
+    if rank == 0:
+        module = ZeroLinear(
+            space.in_features,
+            space.out_features,
+            bias=space.bias,
+            dtype=space.dtype,
+            device=space.device,
+        )
+    else:
+        u_weight, v_weight = build_factor_weights(space, selected)
+        if not torch.isfinite(u_weight).all():
+            raise RuntimeError(f"Non-finite U factor generated for {space.name} at rank {rank}")
+        if not torch.isfinite(v_weight).all():
+            raise RuntimeError(f"Non-finite V factor generated for {space.name} at rank {rank}")
+        module = LowRankLinear(
+            space.in_features,
+            space.out_features,
+            u_weight.to(device=space.device, dtype=space.dtype),
+            v_weight.to(device=space.device, dtype=space.dtype),
+            bias=None if space.bias is None else space.bias.to(device=space.device, dtype=space.dtype),
+        )
+    return module.to(device=space.device, dtype=space.dtype)
+
+
 @torch.no_grad()
 def apply_genome(model, spaces: Sequence[WeightSearchSpace], genome: Dict[str, List[List[int]]]) -> None:
     for idx, space in enumerate(spaces):
@@ -414,52 +439,70 @@ def apply_genome(model, spaces: Sequence[WeightSearchSpace], genome: Dict[str, L
         if len(selected) != rank:
             selected = normalize_selection(space, rank, selected)
             genome["selected"][idx] = selected
-
-        if rank == 0:
-            module = ZeroLinear(
-                space.in_features,
-                space.out_features,
-                bias=space.bias,
-                dtype=space.dtype,
-                device=space.device,
-            )
-        else:
-            u_weight, v_weight = build_factor_weights(space, selected)
-            if not torch.isfinite(u_weight).all():
-                raise RuntimeError(
-                    f"Non-finite U factor generated for {space.name} at rank {rank}"
-                )
-            if not torch.isfinite(v_weight).all():
-                raise RuntimeError(
-                    f"Non-finite V factor generated for {space.name} at rank {rank}"
-                )
-            module = LowRankLinear(
-                space.in_features,
-                space.out_features,
-                u_weight.to(device=space.device, dtype=space.dtype),
-                v_weight.to(device=space.device, dtype=space.dtype),
-                bias=None if space.bias is None else space.bias.to(device=space.device, dtype=space.dtype),
-            )
-        module = module.to(device=space.device, dtype=space.dtype)
-        set_submodule(model, space.name, module)
+        set_submodule(model, space.name, _make_module(space, rank, selected))
 
 
 @torch.no_grad()
-def compute_nll(model, batches: Sequence[torch.Tensor], device: str) -> float:
-    losses = []
+def apply_genome_diff(
+    model,
+    spaces: Sequence[WeightSearchSpace],
+    base_genome: Dict[str, List[List[int]]],
+    new_genome: Dict[str, List[List[int]]],
+) -> List[Tuple[str, nn.Module]]:
+    """Apply only the spaces that changed relative to base_genome.
+
+    Returns a rollback list of (module_path, old_module) so the base genome
+    can be restored cheaply with rollback_modules().
+    """
+    rollback: List[Tuple[str, nn.Module]] = []
+    for idx, space in enumerate(spaces):
+        if (base_genome["ranks"][idx] == new_genome["ranks"][idx] and
+                base_genome["selected"][idx] == new_genome["selected"][idx]):
+            continue
+        rollback.append((space.name, model.get_submodule(space.name)))
+        selected = new_genome["selected"][idx]
+        rank = new_genome["ranks"][idx]
+        if len(selected) != rank:
+            selected = normalize_selection(space, rank, selected)
+            new_genome["selected"][idx] = selected
+        set_submodule(model, space.name, _make_module(space, rank, selected))
+    return rollback
+
+
+def rollback_modules(model: nn.Module, rollback: List[Tuple[str, nn.Module]]) -> None:
+    for name, module in rollback:
+        set_submodule(model, name, module)
+
+
+def _iter_minibatches(
+    samples: Sequence[torch.Tensor], batch_size: int
+) -> List[torch.Tensor]:
+    """Concatenate samples into chunks of batch_size along dim 0."""
+    chunks = []
+    for start in range(0, len(samples), batch_size):
+        chunks.append(torch.cat(list(samples[start : start + batch_size]), dim=0))
+    return chunks
+
+
+@torch.no_grad()
+def compute_nll(model, batches: Sequence[torch.Tensor], device: str, eval_batch_size: int = 1) -> float:
     model.eval()
-    for batch in batches:
-        batch = batch.to(device)
-        logits = model(batch, use_cache=False).logits
+    total_loss = 0.0
+    total_tokens = 0
+    for chunk in tqdm(_iter_minibatches(batches, eval_batch_size), desc="computing nll"):
+        chunk = chunk.to(device)                          # [bs, seqlen]
+        logits = model(chunk, use_cache=False).logits
         shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = batch[:, 1:].contiguous()
+        shift_labels = chunk[:, 1:].contiguous()
+        n_tokens = shift_labels.numel()
         loss = torch.nn.functional.cross_entropy(
             shift_logits.view(-1, shift_logits.shape[-1]),
             shift_labels.view(-1),
-            reduction="mean",
+            reduction="sum",
         )
-        losses.append(loss.item())
-    return float(sum(losses) / max(len(losses), 1))
+        total_loss += loss.item()
+        total_tokens += n_tokens
+    return total_loss / total_tokens
 
 
 @torch.no_grad()
@@ -478,26 +521,60 @@ def precompute_teacher_logits(model, batches: Sequence[torch.Tensor], device: st
 
 
 @torch.no_grad()
-def compute_kl(model, batches: Sequence[torch.Tensor], teacher_logits: Sequence[torch.Tensor], device: str) -> float:
-    losses = []
+def compute_kl(
+    model,
+    batches: Sequence[torch.Tensor],
+    teacher_logits: Sequence[torch.Tensor],
+    device: str,
+    eval_batch_size: int = 1,
+) -> float:
     model.eval()
-    for batch_idx, (batch, teacher) in enumerate(zip(batches, teacher_logits)):
-        student_logits = model(batch.to(device), use_cache=False).logits[:, :-1, :].float()
+    total_loss = 0.0
+    total_seqs = 0
+    for chunk, teacher_chunk in tqdm(zip(
+        _iter_minibatches(batches, eval_batch_size),
+        _iter_minibatches(teacher_logits, eval_batch_size)), desc="computing kl"
+    ):
+        chunk = chunk.to(device)
+        student_logits = model(chunk, use_cache=False).logits[:, :-1, :].float()
         if not torch.isfinite(student_logits).all():
-            raise RuntimeError(f"Non-finite student logits detected during KL computation on batch {batch_idx}")
-        teacher = teacher.to(student_logits.device)
-        teacher_log_prob = torch.log_softmax(teacher, dim=-1)
+            raise RuntimeError("Non-finite student logits detected during KL computation")
+        teacher_log_prob = torch.log_softmax(teacher_chunk.to(device), dim=-1)
         student_log_prob = torch.log_softmax(student_logits, dim=-1)
+        # batchmean divides by batch size; accumulate as sum then divide once at end
         loss = torch.nn.functional.kl_div(
             student_log_prob,
             teacher_log_prob,
-            reduction="batchmean",
+            reduction="sum",
             log_target=True,
         )
         if not torch.isfinite(loss):
-            raise RuntimeError(f"Non-finite KL loss detected on batch {batch_idx}")
-        losses.append(loss.item())
-    return float(sum(losses) / max(len(losses), 1))
+            raise RuntimeError("Non-finite KL loss detected")
+        total_loss += loss.item()
+        total_seqs += chunk.shape[0]
+    # Normalize by total number of (sequence, position) pairs to match batchmean semantics
+    seqlen_minus_one = batches[0].shape[1] - 1
+    return total_loss / (total_seqs * seqlen_minus_one)
+
+
+@torch.no_grad()
+def compute_fitness(
+    model,
+    batches: Sequence[torch.Tensor],
+    device: str,
+    fitness_fn: str,
+    teacher_logits: Optional[Sequence[torch.Tensor]] = None,
+    alpha: float = 0.5,
+    eval_batch_size: int = 1,
+) -> float:
+    """Evaluate fitness of the model in its current state (genome already applied)."""
+    if fitness_fn == "ppl":
+        return math.exp(compute_nll(model, batches, device, eval_batch_size))
+    if fitness_fn == "kl":
+        return compute_kl(model, batches, teacher_logits, device, eval_batch_size)
+    nll = compute_nll(model, batches, device, eval_batch_size)
+    kl = compute_kl(model, batches, teacher_logits, device, eval_batch_size)
+    return alpha * kl + (1.0 - alpha) * nll
 
 
 @torch.no_grad()
@@ -510,15 +587,10 @@ def evaluate_genome(
     fitness_fn: str,
     teacher_logits: Optional[Sequence[torch.Tensor]] = None,
     alpha: float = 0.5,
+    eval_batch_size: int = 1,
 ) -> float:
     apply_genome(model, spaces, genome)
-    if fitness_fn == "ppl":
-        return math.exp(compute_nll(model, batches, device))
-    if fitness_fn == "kl":
-        return compute_kl(model, batches, teacher_logits, device)
-    nll = compute_nll(model, batches, device)
-    kl = compute_kl(model, batches, teacher_logits, device)
-    return alpha * kl + (1.0 - alpha) * nll
+    return compute_fitness(model, batches, device, fitness_fn, teacher_logits, alpha, eval_batch_size)
 
 
 def get_search_batches(dataset: str, tokenizer, nsamples: int, seqlen: int, seed: int) -> List[torch.Tensor]:
@@ -563,6 +635,7 @@ def parse_args():
     parser.add_argument("--mutation_granularity", choices=["group", "weight"], default="group")
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
     parser.add_argument("--DEV", type=str, default="cuda", help="Search device.")
+    parser.add_argument("--eval_batch_size", type=int, default=4, help="Mini-batch size for fitness forward passes.")
     return parser.parse_args()
 
 
@@ -661,6 +734,7 @@ def main():
         args.fitness_fn,
         teacher_logits,
         args.hybrid_alpha,
+        args.eval_batch_size,
     )
     best_genome = {"ranks": list(parent["ranks"]), "selected": [list(item) for item in parent["selected"]]}
     best_score = parent_score
@@ -678,18 +752,27 @@ def main():
             )
         log(f"Generated {len(candidates) - 1} offspring candidates")
 
+        # Apply parent genome once; offspring are evaluated via cheap diff-apply + rollback.
+        apply_genome(model, spaces, parent)
+
         fitnesses = []
         for candidate_idx, candidate in enumerate(candidates):
-            score = evaluate_genome(
+            if candidate_idx == 0:
+                # Parent genome already applied — just evaluate.
+                rollback = None
+            else:
+                rollback = apply_genome_diff(model, spaces, parent, candidate)
+            score = compute_fitness(
                 model,
-                spaces,
-                candidate,
                 search_batches,
                 args.DEV,
                 args.fitness_fn,
                 teacher_logits,
                 args.hybrid_alpha,
+                args.eval_batch_size,
             )
+            if rollback is not None:
+                rollback_modules(model, rollback)
             fitnesses.append(score)
             if candidate_idx == 0 or candidate_idx == len(candidates) - 1 or len(candidates) <= 4:
                 log(
