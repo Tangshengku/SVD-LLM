@@ -491,7 +491,7 @@ def compute_nll(model, batches: Sequence[torch.Tensor], device: str, eval_batch_
     total_tokens = 0
     for chunk in tqdm(_iter_minibatches(batches, eval_batch_size), desc="computing nll"):
         chunk = chunk.to(device)                          # [bs, seqlen]
-        logits = model(chunk, use_cache=False).logits
+        logits = model(chunk, use_cache=False).logits.float()  # fp32 prevents log_softmax underflow
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = chunk[:, 1:].contiguous()
         n_tokens = shift_labels.numel()
