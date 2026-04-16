@@ -17,37 +17,37 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" PyTorch Mistral model."""
-import inspect
+"""PyTorch Mistral low-rank modules compatible with recent Transformers releases."""
 import math
 import warnings
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-import torch.utils.checkpoint
 from torch import nn
-from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from transformers.activations import ACT2FN
-from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
-# from transormers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
-from transformers.modeling_utils import PreTrainedModel
+try:
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+except ImportError:
+    ALL_ATTENTION_FUNCTIONS = None
 from transformers.utils import (
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
-    is_flash_attn_2_available,
     logging,
-    replace_return_docstrings,
 )
-from transformers.models.mistral import MistralConfig
-
-
-if is_flash_attn_2_available():
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
-    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
-
-    _flash_supports_window_size = "window_size" in list(inspect.signature(flash_attn_func).parameters)
+try:
+    from transformers.models.mistral import MistralConfig
+except ImportError:
+    from transformers import MistralConfig
+try:
+    from transformers.models.mistral.modeling_mistral import (
+        apply_rotary_pos_emb as hf_apply_rotary_pos_emb,
+        eager_attention_forward as hf_eager_attention_forward,
+        repeat_kv as hf_repeat_kv,
+    )
+except ImportError:
+    hf_apply_rotary_pos_emb = None
+    hf_eager_attention_forward = None
+    hf_repeat_kv = None
 
 
 logger = logging.get_logger(__name__)
@@ -154,29 +154,28 @@ def rotate_half(x):
 
 
 # Copied from transformers.models.llama.modeling_llama.apply_rotary_pos_emb
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    """Apply RoPE to q/k while accepting both old and new Transformers tensor layouts."""
+    if hf_apply_rotary_pos_emb is not None and cos.dim() == 3:
+        return hf_apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=unsqueeze_dim)
 
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`):
-            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
-            used to pass offsetted position ids when working with a KV-cache.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+    if position_ids is not None:
+        cos = cos[position_ids].unsqueeze(unsqueeze_dim)
+        sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+    else:
+        if cos.dim() == 2:
+            cos = cos.unsqueeze(0).unsqueeze(0)
+            sin = sin.unsqueeze(0).unsqueeze(0)
+        elif cos.dim() == 3:
+            cos = cos.unsqueeze(unsqueeze_dim)
+            sin = sin.unsqueeze(unsqueeze_dim)
+        elif cos.dim() != 4:
+            raise ValueError(f"Unsupported RoPE tensor rank: cos={cos.dim()}, sin={sin.dim()}")
+
+        if cos.shape[-2] != q.shape[-2]:
+            cos = cos[..., -q.shape[-2] :, :]
+            sin = sin[..., -q.shape[-2] :, :]
+
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -228,11 +227,52 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
     num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
     """
+    if hf_repeat_kv is not None:
+        return hf_repeat_kv(hidden_states, n_rep)
+
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def eager_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs,
+):
+    if hf_eager_attention_forward is not None:
+        return hf_eager_attention_forward(
+            module,
+            query,
+            key,
+            value,
+            attention_mask,
+            scaling=scaling,
+            dropout=dropout,
+            **kwargs,
+        )
+
+    key_states = repeat_kv(key, module.num_key_value_groups)
+    value_states = repeat_kv(value, module.num_key_value_groups)
+
+    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    if attention_mask is not None:
+        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+        attn_weights = attn_weights + causal_mask
+
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    attn_output = torch.matmul(attn_weights, value_states)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+
+    return attn_output, attn_weights
 
 
 class SVD_MistralAttention(nn.Module):
@@ -241,20 +281,27 @@ class SVD_MistralAttention(nn.Module):
     and "Generating Long Sequences with Sparse Transformers".
     """
 
-    def __init__(self, config: MistralConfig,
-                 ratio=1,
-                 init_scheme: str = "uniform"):
+    def __init__(
+        self,
+        config: MistralConfig,
+        ratio=1,
+        init_scheme: str = "uniform",
+        layer_idx: Optional[int] = None,
+    ):
         super().__init__()
         self.config = config
         self.init_scheme = init_scheme
+        self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
+        self.head_dim = getattr(config, "head_dim", None) or self.hidden_size // self.num_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
+        self.scaling = self.head_dim ** -0.5
         self.is_causal = True
+        self.attention_dropout = getattr(config, "attention_dropout", 0.0)
         self.ratio = ratio # 1 means no truncate, just keep normal attn
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
@@ -300,15 +347,20 @@ class SVD_MistralAttention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        past_key_values: Optional[object] = None,
+        past_key_value: Optional[object] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if "padding_mask" in kwargs:
             warnings.warn(
                 "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
             )
+        if past_key_values is None:
+            past_key_values = past_key_value
         bsz, q_len, _ = hidden_states.size()
         query_states = self.q_u_proj(self.q_v_proj(hidden_states))
         key_states = self.k_u_proj(self.k_v_proj(hidden_states))
@@ -319,54 +371,56 @@ class SVD_MistralAttention(nn.Module):
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            kv_seq_len += past_key_value[0].shape[-2]
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        is_legacy_cache = isinstance(past_key_values, tuple)
+        if is_legacy_cache and past_key_values is not None:
+            kv_seq_len += past_key_values[0].shape[-2]
+        if position_embeddings is None:
+            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        else:
+            cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
-        if past_key_value is not None:
+        if past_key_values is not None and hasattr(past_key_values, "update"):
+            cache_kwargs = {"cache_position": cache_position}
+            if position_embeddings is not None:
+                cache_kwargs["sin"] = sin
+                cache_kwargs["cos"] = cos
+            key_states, value_states = past_key_values.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
+            kv_seq_len = key_states.shape[-2]
+        elif is_legacy_cache:
             # reuse k, v, self_attention
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+            key_states = torch.cat([past_key_values[0], key_states], dim=2)
+            value_states = torch.cat([past_key_values[1], value_states], dim=2)
+            kv_seq_len = key_states.shape[-2]
 
-        past_key_value = (key_states, value_states) if use_cache else None
+        present_key_value = (key_states, value_states) if use_cache and is_legacy_cache else None
 
-        # repeat k/v heads if n_kv_heads < n_heads
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        attention_interface = eager_attention_forward
+        if ALL_ATTENTION_FUNCTIONS is not None and getattr(self.config, "_attn_implementation", "eager") != "eager":
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=getattr(self.config, "sliding_window", None),
+            **kwargs,
+        )
 
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
-
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
-
-            attn_weights = attn_weights + attention_mask
-
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = torch.matmul(attn_weights, value_states)
-
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
 
         attn_output = self.o_u_proj(self.o_v_proj(attn_output))
 
         if not output_attentions:
             attn_weights = None
 
-        return attn_output, attn_weights, past_key_value
+        if hasattr(past_key_values, "update") or position_embeddings is not None or cache_position is not None:
+            return attn_output, attn_weights
+
+        return attn_output, attn_weights, present_key_value

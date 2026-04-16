@@ -211,7 +211,12 @@ def whitening(model_name, model, profiling_mat, ratio, dev, init_scheme="uniform
             svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio, init_scheme=init_scheme)
             svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio, init_scheme=init_scheme)
         elif "mistral" in model_name:
-            svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio, init_scheme=init_scheme)
+            svd_attn = SVD_MistralAttention(
+                config=model.config,
+                ratio=ratio,
+                init_scheme=init_scheme,
+                layer_idx=getattr(layer.self_attn, "layer_idx", None),
+            )
             svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio, init_scheme=init_scheme)
         elif 'opt' in model_name:
             svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio, init_scheme=init_scheme)
@@ -348,7 +353,12 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
             svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio, init_scheme=init_scheme)
             svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio, init_scheme=init_scheme)
         elif "mistral" in model_name:
-            svd_attn = SVD_MistralAttention(config=model.config, ratio=ratio, init_scheme=init_scheme)
+            svd_attn = SVD_MistralAttention(
+                config=model.config,
+                ratio=ratio,
+                init_scheme=init_scheme,
+                layer_idx=getattr(layer.self_attn, "layer_idx", None),
+            )
             svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio, init_scheme=init_scheme)
         elif 'opt' in model_name:
             svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio, init_scheme=init_scheme)
