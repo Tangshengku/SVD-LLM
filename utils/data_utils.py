@@ -9,11 +9,60 @@ current_path = os.path.dirname(os.path.abspath(__file__))
 parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(current_path)
 
+
+EVOL_CODEALPACA_DATASET = "theblackcat102/evol-codealpaca-v1"
+
+
+def _cache_safe_name(name):
+    return name.replace("/", "_")
+
+
+def _is_evol_codealpaca(name):
+    normalized = name.lower()
+    return normalized in {
+        "evol-codealpaca",
+        "evol-codealpaca-v1",
+        EVOL_CODEALPACA_DATASET.lower(),
+    }
+
+
+def _format_instruction_sample(sample):
+    parts = []
+    instruction = sample.get("instruction")
+    input_text = sample.get("input")
+    output = sample.get("output")
+
+    if instruction:
+        parts.append(f"Instruction:\n{instruction.strip()}")
+    if input_text:
+        parts.append(f"Input:\n{input_text.strip()}")
+    if output:
+        parts.append(f"Response:\n{output.strip()}")
+    if not parts:
+        raise ValueError("Unsupported sample format for instruction dataset.")
+    return "\n\n".join(parts)
+
+
+def _load_training_texts(name, dataset_cache_dir=None):
+    if name == "c4":
+        traindata = load_dataset("json", data_files="utils/c4-train.json")["train"]
+        return list(traindata["text"])
+    if name == "ptb":
+        traindata = load_dataset("ptb_text_only", "penn_treebank", split="train", cache_dir=dataset_cache_dir)
+        return list(traindata["sentence"])
+    if name == "wikitext2":
+        traindata = load_dataset("wikitext", "wikitext-2-raw-v1", split="train", cache_dir=dataset_cache_dir)
+        return list(traindata["text"])
+    if _is_evol_codealpaca(name):
+        traindata = load_dataset(EVOL_CODEALPACA_DATASET, split="train", cache_dir=dataset_cache_dir)
+        return [_format_instruction_sample(sample) for sample in traindata]
+    raise NotImplementedError(f"Unsupported dataset: {name}")
+
 def get_calib_train_data(name, tokenizer, nsamples, seqlen=2048, seed=3, batch_size=1, dataset_cache_dir=None):
     import random
     random.seed(seed)
     cache_file = (
-        f"cache/{name}_{nsamples}_{seqlen}_{seed}_{batch_size}.pt"
+        f"cache/{_cache_safe_name(name)}_{nsamples}_{seqlen}_{seed}_{batch_size}.pt"
     )
     nsamples += 1 #############################
     if not os.path.exists("cache"):
@@ -21,17 +70,7 @@ def get_calib_train_data(name, tokenizer, nsamples, seqlen=2048, seed=3, batch_s
     if os.path.exists(cache_file):
         traindataset = torch.load(cache_file)
         return traindataset
-    if name == "c4":
-        traindata = load_dataset("json", data_files="utils/c4-train.json")['train']
-        tot_text = "\n\n".join(traindata["text"])
-    elif name == "ptb":
-        traindata = load_dataset('ptb_text_only', 'penn_treebank', split='train', cache_dir=dataset_cache_dir)
-        tot_text = "\n\n".join(traindata["sentence"])
-    elif name == "wikitext2":
-        traindata = load_dataset("wikitext", "wikitext-2-raw-v1", split="train", cache_dir=dataset_cache_dir)
-        tot_text = "\n\n".join(traindata["text"])
-    else:
-        raise NotImplementedError
+    tot_text = "\n\n".join(_load_training_texts(name, dataset_cache_dir))
     traindataset = []
     for s in range(nsamples):
         i = random.randint(0, len(tot_text) - seqlen - 1)
@@ -49,6 +88,20 @@ def get_calib_train_data(name, tokenizer, nsamples, seqlen=2048, seed=3, batch_s
             inp = torch.cat((inp, trainenc.input_ids[:, :seqlen]), dim=0)
     torch.save(traindataset, cache_file)
     return traindataset
+
+
+def _sample_from_joined_training_texts(name, nsamples, seed, seqlen, tokenizer, dataset_cache_dir=None):
+    trainenc = tokenizer("\n\n".join(_load_training_texts(name, dataset_cache_dir)), return_tensors="pt")
+    random.seed(seed)
+    trainloader = []
+    for _ in range(nsamples):
+        i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
+        j = i + seqlen
+        inp = trainenc.input_ids[:, i:j]
+        tar = inp.clone()
+        tar[:, :-1] = -100
+        trainloader.append((inp, tar))
+    return trainloader
 
 
 
@@ -192,6 +245,8 @@ def get_loaders(name, nsamples=128, seed=0, seqlen=2048, tokenizer=None):
         if 'new' in name:
             return get_c4_new(nsamples, seed, seqlen, tokenizer)
         return get_c4(nsamples, seed, seqlen, tokenizer)
+    if _is_evol_codealpaca(name):
+        return _sample_from_joined_training_texts(name, nsamples, seed, seqlen, tokenizer), None
     
     
     

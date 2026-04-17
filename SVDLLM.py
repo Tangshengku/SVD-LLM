@@ -514,7 +514,12 @@ if __name__ == '__main__':
     parser.add_argument('--model_path', type=str, default=None, help='local compressed model path or whitening information path')
     parser.add_argument('--ratio', type=float, default=0.2, help='Target compression ratio,(0,1), default=0.2, means only keeping about 20% of the params.')
     parser.add_argument('--run_low_resource', action='store_true', help='whether to run whitening in low resource, exp, compress LLaMA-7B below 15G gpu')
-    parser.add_argument('--dataset', type=str, default='wikitext2',help='Where to extract calibration data from [wikitext2, ptb, c4]')
+    parser.add_argument(
+        '--dataset',
+        type=str,
+        default='wikitext2',
+        help='Where to extract calibration data from [wikitext2, ptb, c4, evol-codealpaca, theblackcat102/evol-codealpaca-v1]',
+    )
     parser.add_argument('--whitening_nsamples', type=int, default=256, help='Number of calibration data samples for whitening.')
     parser.add_argument('--updating_nsamples', type=int, default=16, help='Number of calibration data samples for udpating.')
     parser.add_argument('--save_path', type=str, default=None, help='the path to save the compressed model checkpoints.`')

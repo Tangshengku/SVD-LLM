@@ -134,6 +134,7 @@ Important defaults:
 - `--fitness_fn kl` compares the compressed model against dense teacher logits on calibration text. `ppl` and `hyb` are also supported.
 - `--mutation_granularity group` transfers rank only within attention or MLP pools, matching the recommended search space in `Evo_writeups.pdf`.
 - `--rank_step`, `--boundary_window`, and `--tail_count` control the discrete rank levels and the singular-value search neighborhood.
+- `--dataset` also accepts `evol-codealpaca` or `theblackcat102/evol-codealpaca-v1` for instruction/code-style calibration text.
 
 ### 5. Evaluation
 - Perplexity Evaluation:
