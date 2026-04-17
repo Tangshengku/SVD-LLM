@@ -4,3 +4,10 @@ cache/*
 utils/c4-*
 EvoPress-main/
 *.pdf
+*.pt
+results/
+llama*
+mistral*
+*.sh
+evo_output*
+svdllm_0.6_hf/

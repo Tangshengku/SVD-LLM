@@ -224,7 +224,9 @@ def get_test_data(name, tokenizer, seq_len=2048, batch_size = 4):
         test_data = load_dataset('ptb_text_only', 'penn_treebank', split='test')
         test_dataset = process_data(test_data, tokenizer, seq_len, 'sentence')
     elif 'c4' in name:
-        test_data = load_dataset("json", data_files="utils/c4-validation.json")['train']
+        test_data = load_dataset(
+        'allenai/c4', data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split='validation'
+    )
         test_dataset = process_data(test_data[0:2000], tokenizer, seq_len, 'text')
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     return test_loader

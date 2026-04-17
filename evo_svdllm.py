@@ -418,7 +418,7 @@ def mutate_offspring(
         lambda genome: mutate_rank_transfer(genome, spaces, mutation_granularity),
         lambda genome: mutate_boundary_swap(genome, spaces),
         lambda genome: mutate_tail_promotion(genome, spaces),
-        lambda genome: mutate_mask_reset(genome, spaces),
+        # lambda genome: mutate_mask_reset(genome, spaces),
     ]
     for _ in range(random.randint(1, max_mutations)):
         random.choice(mutation_fns)(offspring)
