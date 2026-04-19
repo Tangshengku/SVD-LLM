@@ -1,7 +1,7 @@
 
 
 # disable the boundary_window and tail collection
-export CUDA_VISIBLE_DEVICES=2
+export CUDA_VISIBLE_DEVICES=0
 
 python evo_svdllm.py \
     --model mistralai/Mistral-7B-v0.1 \
@@ -11,7 +11,7 @@ python evo_svdllm.py \
     --search_nsamples 32 \
     --model_seq_len 2048 \
     --fitness_fn kl \
-    --generations 200 \
+    --generations 400 \
     --offspring 16 \
     --rank_step 128 \
     --boundary_window 32 \
@@ -19,7 +19,8 @@ python evo_svdllm.py \
     --mutation_granularity group \
     --eval_batch_size 16 \
     --init_strategy uniform \
-    --save_path /nfs/scistore19/alistgrp/stang/SVD-LLM/evo_output_mistral_rank_step128_kl_200generation_bw32_tc32 \
+    --max_mutations 10 \
+    --save_path /nfs/scistore19/alistgrp/stang/SVD-LLM/evo_output_mistral_rank_step128_kl_400generation \
     --save_model
 
 # python evo_svdllm.py \
