@@ -676,7 +676,12 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, required=True, help="Dense Hugging Face model name or local path.")
     parser.add_argument("--ratio", type=float, default=0.2, help="Target compression ratio in parameter reduction.")
-    parser.add_argument("--dataset", type=str, default="wikitext2", help="Calibration dataset.")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="wikitext2",
+        help="Calibration/search dataset. Supports single datasets and mixtures like mix:wikitext2,evol-codealpaca,tulu-math.",
+    )
     parser.add_argument("--whitening_nsamples", type=int, default=256, help="Calibration samples for whitening.")
     parser.add_argument("--search_nsamples", type=int, default=16, help="Calibration samples for evolutionary search.")
     parser.add_argument("--model_seq_len", type=int, default=2048, help="Sequence length.")

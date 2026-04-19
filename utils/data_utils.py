@@ -11,6 +11,7 @@ sys.path.append(current_path)
 
 
 EVOL_CODEALPACA_DATASET = "theblackcat102/evol-codealpaca-v1"
+TULU_MATH_DATASET = "allenai/tulu-3-sft-personas-math"
 
 
 def _cache_safe_name(name):
@@ -24,6 +25,37 @@ def _is_evol_codealpaca(name):
         "evol-codealpaca-v1",
         EVOL_CODEALPACA_DATASET.lower(),
     }
+
+
+def _is_tulu_math(name):
+    normalized = name.lower()
+    return normalized in {
+        "tulu-math",
+        "personas-math",
+        "tulu-3-sft-personas-math",
+        TULU_MATH_DATASET.lower(),
+    }
+
+
+def _is_mixture_dataset(name):
+    return name.startswith("mix:")
+
+
+def _split_mixture_dataset(name):
+    if not _is_mixture_dataset(name):
+        return [name]
+    parts = [part.strip() for part in name[4:].split(",") if part.strip()]
+    if not parts:
+        raise ValueError("Mixture dataset spec must include at least one dataset, e.g. mix:wikitext2,evol-codealpaca,tulu-math")
+    return parts
+
+
+def _allocate_mixture_counts(total, n_sources):
+    if n_sources <= 0:
+        raise ValueError("n_sources must be positive")
+    base = total // n_sources
+    remainder = total % n_sources
+    return [base + (1 if idx < remainder else 0) for idx in range(n_sources)]
 
 
 def _format_instruction_sample(sample):
@@ -43,7 +75,37 @@ def _format_instruction_sample(sample):
     return "\n\n".join(parts)
 
 
+def _format_chat_messages(messages):
+    formatted = []
+    for message in messages:
+        role = message.get("role", "unknown").strip().title()
+        content = message.get("content", "").strip()
+        if content:
+            formatted.append(f"{role}:\n{content}")
+    return "\n\n".join(formatted)
+
+
+def _format_math_sample(sample):
+    parts = []
+    prompt = sample.get("prompt")
+    if prompt:
+        parts.append(f"Prompt:\n{prompt.strip()}")
+    messages = sample.get("messages")
+    if messages:
+        formatted_messages = _format_chat_messages(messages)
+        if formatted_messages:
+            parts.append(formatted_messages)
+    if not parts:
+        raise ValueError("Unsupported sample format for math dataset.")
+    return "\n\n".join(parts)
+
+
 def _load_training_texts(name, dataset_cache_dir=None):
+    if _is_mixture_dataset(name):
+        texts = []
+        for dataset_name in _split_mixture_dataset(name):
+            texts.extend(_load_training_texts(dataset_name, dataset_cache_dir))
+        return texts
     if name == "c4":
         traindata = load_dataset("json", data_files="utils/c4-train.json")["train"]
         return list(traindata["text"])
@@ -56,42 +118,47 @@ def _load_training_texts(name, dataset_cache_dir=None):
     if _is_evol_codealpaca(name):
         traindata = load_dataset(EVOL_CODEALPACA_DATASET, split="train", cache_dir=dataset_cache_dir)
         return [_format_instruction_sample(sample) for sample in traindata]
+    if _is_tulu_math(name):
+        traindata = load_dataset(TULU_MATH_DATASET, split="train", cache_dir=dataset_cache_dir)
+        return [_format_math_sample(sample) for sample in traindata]
     raise NotImplementedError(f"Unsupported dataset: {name}")
 
-def get_calib_train_data(name, tokenizer, nsamples, seqlen=2048, seed=3, batch_size=1, dataset_cache_dir=None):
-    import random
+
+def _build_calibration_chunks_from_texts(texts, tokenizer, nsamples, seqlen, seed, batch_size):
     random.seed(seed)
-    cache_file = (
-        f"cache/{_cache_safe_name(name)}_{nsamples}_{seqlen}_{seed}_{batch_size}.pt"
-    )
-    nsamples += 1 #############################
-    if not os.path.exists("cache"):
-        os.makedirs("cache")
-    if os.path.exists(cache_file):
-        traindataset = torch.load(cache_file)
-        return traindataset
-    tot_text = "\n\n".join(_load_training_texts(name, dataset_cache_dir))
+    tot_text = "\n\n".join(texts)
     traindataset = []
-    for s in range(nsamples):
+    total_steps = nsamples + 1
+    pending_batch = None
+    pending_count = 0
+
+    for _ in range(total_steps):
         i = random.randint(0, len(tot_text) - seqlen - 1)
         j = i + seqlen * 10
         trainenc = tokenizer(tot_text[i:j], return_tensors="pt")
         if trainenc.input_ids.shape[1] < seqlen:
-            s = s - 1
             continue
-        if s % batch_size == 0:
-            if s != 0:
-                attention_mask = torch.ones_like(inp)
-                traindataset.append({"input_ids": inp, "attention_mask": attention_mask})
-            inp = trainenc.input_ids[:, :seqlen]
+        current = trainenc.input_ids[:, :seqlen]
+        if pending_batch is None:
+            pending_batch = current
+            pending_count = 1
         else:
-            inp = torch.cat((inp, trainenc.input_ids[:, :seqlen]), dim=0)
-    torch.save(traindataset, cache_file)
+            pending_batch = torch.cat((pending_batch, current), dim=0)
+            pending_count += 1
+        if pending_count == batch_size:
+            attention_mask = torch.ones_like(pending_batch)
+            traindataset.append({"input_ids": pending_batch, "attention_mask": attention_mask})
+            pending_batch = None
+            pending_count = 0
+
+    if pending_batch is not None:
+        attention_mask = torch.ones_like(pending_batch)
+        traindataset.append({"input_ids": pending_batch, "attention_mask": attention_mask})
     return traindataset
 
 
-def _sample_from_joined_training_texts(name, nsamples, seed, seqlen, tokenizer, dataset_cache_dir=None):
-    trainenc = tokenizer("\n\n".join(_load_training_texts(name, dataset_cache_dir)), return_tensors="pt")
+def _sample_loader_from_texts(texts, nsamples, seed, seqlen, tokenizer):
+    trainenc = tokenizer("\n\n".join(texts), return_tensors="pt")
     random.seed(seed)
     trainloader = []
     for _ in range(nsamples):
@@ -102,6 +169,90 @@ def _sample_from_joined_training_texts(name, nsamples, seed, seqlen, tokenizer, 
         tar[:, :-1] = -100
         trainloader.append((inp, tar))
     return trainloader
+
+
+def _build_mixture_calibration_data(name, tokenizer, nsamples, seqlen, seed, batch_size, dataset_cache_dir=None):
+    dataset_names = _split_mixture_dataset(name)
+    counts = _allocate_mixture_counts(nsamples, len(dataset_names))
+    mixed = []
+    for idx, (dataset_name, count) in enumerate(zip(dataset_names, counts)):
+        if count <= 0:
+            continue
+        texts = _load_training_texts(dataset_name, dataset_cache_dir)
+        mixed.extend(
+            _build_calibration_chunks_from_texts(
+                texts=texts,
+                tokenizer=tokenizer,
+                nsamples=count,
+                seqlen=seqlen,
+                seed=seed + idx,
+                batch_size=batch_size,
+            )
+        )
+    return mixed
+
+
+def _build_mixture_loader(name, nsamples, seed, seqlen, tokenizer, dataset_cache_dir=None):
+    dataset_names = _split_mixture_dataset(name)
+    counts = _allocate_mixture_counts(nsamples, len(dataset_names))
+    trainloader = []
+    for idx, (dataset_name, count) in enumerate(zip(dataset_names, counts)):
+        if count <= 0:
+            continue
+        texts = _load_training_texts(dataset_name, dataset_cache_dir)
+        trainloader.extend(
+            _sample_loader_from_texts(
+                texts=texts,
+                nsamples=count,
+                seed=seed + idx,
+                seqlen=seqlen,
+                tokenizer=tokenizer,
+            )
+        )
+    return trainloader
+
+def get_calib_train_data(name, tokenizer, nsamples, seqlen=2048, seed=3, batch_size=1, dataset_cache_dir=None):
+    import random
+    random.seed(seed)
+    cache_file = (
+        f"cache/{_cache_safe_name(name)}_{nsamples}_{seqlen}_{seed}_{batch_size}.pt"
+    )
+    if not os.path.exists("cache"):
+        os.makedirs("cache")
+    if os.path.exists(cache_file):
+        traindataset = torch.load(cache_file)
+        return traindataset
+    if _is_mixture_dataset(name):
+        traindataset = _build_mixture_calibration_data(
+            name=name,
+            tokenizer=tokenizer,
+            nsamples=nsamples,
+            seqlen=seqlen,
+            seed=seed,
+            batch_size=batch_size,
+            dataset_cache_dir=dataset_cache_dir,
+        )
+    else:
+        traindataset = _build_calibration_chunks_from_texts(
+            texts=_load_training_texts(name, dataset_cache_dir),
+            tokenizer=tokenizer,
+            nsamples=nsamples,
+            seqlen=seqlen,
+            seed=seed,
+            batch_size=batch_size,
+        )
+    torch.save(traindataset, cache_file)
+    return traindataset
+
+
+def _sample_from_joined_training_texts(name, nsamples, seed, seqlen, tokenizer, dataset_cache_dir=None):
+    return _sample_loader_from_texts(
+        texts=_load_training_texts(name, dataset_cache_dir),
+        nsamples=nsamples,
+        seed=seed,
+        seqlen=seqlen,
+        tokenizer=tokenizer,
+    )
 
 
 
@@ -245,7 +396,11 @@ def get_loaders(name, nsamples=128, seed=0, seqlen=2048, tokenizer=None):
         if 'new' in name:
             return get_c4_new(nsamples, seed, seqlen, tokenizer)
         return get_c4(nsamples, seed, seqlen, tokenizer)
+    if _is_mixture_dataset(name):
+        return _build_mixture_loader(name, nsamples, seed, seqlen, tokenizer), None
     if _is_evol_codealpaca(name):
+        return _sample_from_joined_training_texts(name, nsamples, seed, seqlen, tokenizer), None
+    if _is_tulu_math(name):
         return _sample_from_joined_training_texts(name, nsamples, seed, seqlen, tokenizer), None
     
     

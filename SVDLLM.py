@@ -518,7 +518,7 @@ if __name__ == '__main__':
         '--dataset',
         type=str,
         default='wikitext2',
-        help='Where to extract calibration data from [wikitext2, ptb, c4, evol-codealpaca, theblackcat102/evol-codealpaca-v1]',
+        help='Calibration data source. Supports single datasets like [wikitext2, ptb, c4, evol-codealpaca, theblackcat102/evol-codealpaca-v1, tulu-math, allenai/tulu-3-sft-personas-math] and mixtures like mix:wikitext2,evol-codealpaca,tulu-math',
     )
     parser.add_argument('--whitening_nsamples', type=int, default=256, help='Number of calibration data samples for whitening.')
     parser.add_argument('--updating_nsamples', type=int, default=16, help='Number of calibration data samples for udpating.')

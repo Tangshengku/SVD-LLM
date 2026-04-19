@@ -135,6 +135,8 @@ Important defaults:
 - `--mutation_granularity group` now applies rank-transfer mutations within both the attention and MLP pools during the same mutation step.
 - `--rank_step`, `--boundary_window`, and `--tail_count` control the discrete rank levels and the singular-value search neighborhood.
 - `--dataset` also accepts `evol-codealpaca` or `theblackcat102/evol-codealpaca-v1` for instruction/code-style calibration text.
+- `--dataset` also accepts `tulu-math` or `allenai/tulu-3-sft-personas-math` for math-style instruction calibration text.
+- Mixtures are supported with `mix:`. For example, `mix:wikitext2,evol-codealpaca,tulu-math` splits the requested sample count as evenly as possible across the listed sources, so `256` samples becomes roughly `86/85/85`.
 
 ### 5. Evaluation
 - Perplexity Evaluation:
