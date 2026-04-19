@@ -303,30 +303,34 @@ def mutate_rank_transfer(
     spaces: Sequence[WeightSearchSpace],
     mutation_granularity: str,
 ) -> bool:
+    def mutate_within_indices(candidate_indices: Sequence[int]) -> bool:
+        donors = [idx for idx in candidate_indices if previous_rank(spaces[idx], genome["ranks"][idx]) is not None]
+        receivers = [idx for idx in candidate_indices if next_rank(spaces[idx], genome["ranks"][idx]) is not None]
+        if not donors or not receivers:
+            return False
+
+        donor = random.choice(donors)
+        receivers = [idx for idx in receivers if idx != donor]
+        if not receivers:
+            return False
+        receiver = random.choice(receivers)
+
+        donor_rank = previous_rank(spaces[donor], genome["ranks"][donor])
+        receiver_rank = next_rank(spaces[receiver], genome["ranks"][receiver])
+        genome["ranks"][donor] = donor_rank
+        genome["ranks"][receiver] = receiver_rank
+        genome["selected"][donor] = normalize_selection(spaces[donor], donor_rank, genome["selected"][donor])
+        genome["selected"][receiver] = normalize_selection(spaces[receiver], receiver_rank, genome["selected"][receiver])
+        return True
+
     if mutation_granularity == "group":
-        group_name = random.choice(["attn", "mlp"])
-        candidate_indices = [idx for idx, space in enumerate(spaces) if space.group == group_name]
-    else:
-        candidate_indices = list(range(len(spaces)))
+        mutated = False
+        for group_name in ("attn", "mlp"):
+            candidate_indices = [idx for idx, space in enumerate(spaces) if space.group == group_name]
+            mutated = mutate_within_indices(candidate_indices) or mutated
+        return mutated
 
-    donors = [idx for idx in candidate_indices if previous_rank(spaces[idx], genome["ranks"][idx]) is not None]
-    receivers = [idx for idx in candidate_indices if next_rank(spaces[idx], genome["ranks"][idx]) is not None]
-    if not donors or not receivers:
-        return False
-
-    donor = random.choice(donors)
-    receivers = [idx for idx in receivers if idx != donor]
-    if not receivers:
-        return False
-    receiver = random.choice(receivers)
-
-    donor_rank = previous_rank(spaces[donor], genome["ranks"][donor])
-    receiver_rank = next_rank(spaces[receiver], genome["ranks"][receiver])
-    genome["ranks"][donor] = donor_rank
-    genome["ranks"][receiver] = receiver_rank
-    genome["selected"][donor] = normalize_selection(spaces[donor], donor_rank, genome["selected"][donor])
-    genome["selected"][receiver] = normalize_selection(spaces[receiver], receiver_rank, genome["selected"][receiver])
-    return True
+    return mutate_within_indices(list(range(len(spaces))))
 
 
 def mutate_boundary_swap(genome: Dict[str, List[List[int]]], spaces: Sequence[WeightSearchSpace]) -> bool:

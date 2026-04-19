@@ -132,7 +132,7 @@ python evo_svdllm.py \
 ```
 Important defaults:
 - `--fitness_fn kl` compares the compressed model against dense teacher logits on calibration text. `ppl` and `hyb` are also supported.
-- `--mutation_granularity group` transfers rank only within attention or MLP pools, matching the recommended search space in `Evo_writeups.pdf`.
+- `--mutation_granularity group` now applies rank-transfer mutations within both the attention and MLP pools during the same mutation step.
 - `--rank_step`, `--boundary_window`, and `--tail_count` control the discrete rank levels and the singular-value search neighborhood.
 - `--dataset` also accepts `evol-codealpaca` or `theblackcat102/evol-codealpaca-v1` for instruction/code-style calibration text.
 
