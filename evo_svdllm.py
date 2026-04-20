@@ -420,7 +420,7 @@ def mutate_offspring(
     offspring = {"ranks": list(parent["ranks"]), "selected": [list(item) for item in parent["selected"]]}
     mutation_fns = [
         lambda genome: mutate_rank_transfer(genome, spaces, mutation_granularity),
-        # lambda genome: mutate_boundary_swap(genome, spaces),
+        lambda genome: mutate_boundary_swap(genome, spaces),
         # lambda genome: mutate_tail_promotion(genome, spaces),
         # lambda genome: mutate_mask_reset(genome, spaces),
     ]
