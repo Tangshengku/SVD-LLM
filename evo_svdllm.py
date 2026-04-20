@@ -33,9 +33,10 @@ class WeightSearchSpace:
     dense_params: int
     max_rank: int
     rank_levels: List[int]
-    singular_values_sq: torch.Tensor
-    left_u: torch.Tensor
-    right_v: torch.Tensor
+    source_names: List[str]
+    singular_values_sq_by_source: List[torch.Tensor]
+    left_u_by_source: List[torch.Tensor]
+    right_v_by_source: List[torch.Tensor]
     bias: Optional[torch.Tensor]
     dtype: torch.dtype
     device: torch.device
@@ -47,6 +48,15 @@ class WeightSearchSpace:
 
     def topk_selection(self, rank: int) -> List[int]:
         return list(range(rank))
+
+    def singular_values_sq(self, source_idx: int) -> torch.Tensor:
+        return self.singular_values_sq_by_source[source_idx]
+
+    def left_u(self, source_idx: int) -> torch.Tensor:
+        return self.left_u_by_source[source_idx]
+
+    def right_v(self, source_idx: int) -> torch.Tensor:
+        return self.right_v_by_source[source_idx]
 
 
 def get_transformer_layers(model_name: str, model) -> Tuple[str, Sequence[nn.Module]]:
@@ -77,11 +87,18 @@ def clone_bias(module: nn.Linear) -> Optional[torch.Tensor]:
     return module.bias.detach().cpu().clone()
 
 
+def parse_source_datasets(spec: str) -> List[str]:
+    datasets = [item.strip() for item in spec.split(",") if item.strip()]
+    if not datasets:
+        raise ValueError("At least one source dataset must be provided.")
+    return datasets
+
+
 @torch.no_grad()
 def build_search_spaces(
     model_name: str,
     model,
-    profiling_mat: Dict[int, Dict[str, torch.Tensor]],
+    profiling_mats: Dict[str, Dict[int, Dict[str, torch.Tensor]]],
     rank_step: int,
     boundary_window: int,
     tail_count: int,
@@ -89,9 +106,11 @@ def build_search_spaces(
 ) -> List[WeightSearchSpace]:
     layer_root, layers = get_transformer_layers(model_name, model)
     spaces: List[WeightSearchSpace] = []
+    source_names = list(profiling_mats.keys())
     log(
         f"Building search spaces from {len(layers)} transformer layers "
-        f"(rank_step={rank_step}, boundary_window={boundary_window}, tail_count={tail_count})"
+        f"(rank_step={rank_step}, boundary_window={boundary_window}, tail_count={tail_count}, "
+        f"sources={source_names})"
     )
 
     for layer_idx in tqdm(range(len(layers)), desc="Precomputing whitened SVD"):
@@ -108,19 +127,27 @@ def build_search_spaces(
             if max_rank <= 0:
                 continue
 
-            scaling_diag_matrix = profiling_mat[layer_idx][local_name].to(device).float()
-            try:
-                scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix)
-            except Exception:
-                scaling_diag_matrix = scaling_diag_matrix + 1e-6 * torch.eye(
-                    scaling_diag_matrix.shape[0], device=device, dtype=scaling_diag_matrix.dtype
-                )
-                scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix)
+            singular_values_sq_by_source = []
+            left_u_by_source = []
+            right_v_by_source = []
+            for source_name in source_names:
+                scaling_diag_matrix = profiling_mats[source_name][layer_idx][local_name].to(device).float()
+                try:
+                    scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix)
+                except Exception:
+                    scaling_diag_matrix = scaling_diag_matrix + 1e-6 * torch.eye(
+                        scaling_diag_matrix.shape[0], device=device, dtype=scaling_diag_matrix.dtype
+                    )
+                    scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix)
 
-            whitened_weight = torch.matmul(weight, scaling_diag_matrix)
-            u, s, vt = torch.linalg.svd(whitened_weight, full_matrices=False)
-            right_v = torch.matmul(vt, scaling_matrix_inv).cpu()
-            singular_values_sq = (s.cpu() ** 2)
+                whitened_weight = torch.matmul(weight, scaling_diag_matrix)
+                u, s, vt = torch.linalg.svd(whitened_weight, full_matrices=False)
+                right_v = torch.matmul(vt, scaling_matrix_inv).cpu()
+                singular_values_sq_by_source.append(s.cpu() ** 2)
+                left_u_by_source.append(u.cpu())
+                right_v_by_source.append(right_v)
+                del scaling_diag_matrix, scaling_matrix_inv, whitened_weight, u, s, vt, right_v
+
             rank_levels = sorted(set([0] + list(range(rank_step, max_rank + 1, rank_step)) + [max_rank]))
 
             boundary_cap = min(full_rank, max_rank + boundary_window + 1)
@@ -136,9 +163,10 @@ def build_search_spaces(
                     dense_params=dense_params,
                     max_rank=max_rank,
                     rank_levels=rank_levels,
-                    singular_values_sq=singular_values_sq,
-                    left_u=u.cpu(),
-                    right_v=right_v,
+                    source_names=list(source_names),
+                    singular_values_sq_by_source=singular_values_sq_by_source,
+                    left_u_by_source=left_u_by_source,
+                    right_v_by_source=right_v_by_source,
                     bias=clone_bias(module),
                     dtype=module.weight.dtype,
                     device=module.weight.device,
@@ -147,7 +175,7 @@ def build_search_spaces(
                 )
             )
 
-            del weight, scaling_diag_matrix, scaling_matrix_inv, whitened_weight, u, s, vt, right_v
+            del weight
             torch.cuda.empty_cache()
     log(f"Finished SVD precomputation for {len(spaces)} searchable linear weights")
     return spaces
@@ -171,14 +199,14 @@ def next_rank(space: WeightSearchSpace, rank: int) -> Optional[int]:
     return space.rank_levels[idx + 1]
 
 
-def normalize_selection(space: WeightSearchSpace, rank: int, selected: Sequence[int]) -> List[int]:
+def normalize_selection(space: WeightSearchSpace, source_idx: int, rank: int, selected: Sequence[int]) -> List[int]:
     if rank == 0:
         return []
-    legal = [idx for idx in sorted(set(selected)) if 0 <= idx < len(space.singular_values_sq)]
+    legal = [idx for idx in sorted(set(selected)) if 0 <= idx < len(space.singular_values_sq(source_idx))]
     if len(legal) > rank:
         legal = legal[:rank]
     if len(legal) < rank:
-        for idx in range(len(space.singular_values_sq)):
+        for idx in range(len(space.singular_values_sq(source_idx))):
             if idx not in legal:
                 legal.append(idx)
             if len(legal) == rank:
@@ -190,12 +218,12 @@ def total_cost(spaces: Sequence[WeightSearchSpace], ranks: Sequence[int]) -> int
     return sum(space.cost(rank) for space, rank in zip(spaces, ranks))
 
 
-def rank_delta_utility(space: WeightSearchSpace, old_rank: int, new_rank: int) -> float:
+def rank_delta_utility(space: WeightSearchSpace, source_idx: int, old_rank: int, new_rank: int) -> float:
     lo = min(old_rank, new_rank)
     hi = max(old_rank, new_rank)
     if hi <= lo:
         return 0.0
-    utility = space.singular_values_sq[lo:hi].sum().item()
+    utility = space.singular_values_sq(source_idx)[lo:hi].sum().item()
     delta_cost = abs(space.cost(hi) - space.cost(lo))
     if delta_cost == 0:
         return float("inf")
@@ -217,7 +245,7 @@ def greedy_initialization(spaces: Sequence[WeightSearchSpace], budget: int) -> L
             new_cost = current_cost + space.cost(next_level) - space.cost(ranks[idx])
             if new_cost > budget:
                 continue
-            score = rank_delta_utility(space, ranks[idx], next_level)
+            score = rank_delta_utility(space, 0, ranks[idx], next_level)
             if score > best_score:
                 best_idx = idx
                 best_score = score
@@ -287,14 +315,18 @@ def initialize_ranks(
 
 
 def build_topk_genome(spaces: Sequence[WeightSearchSpace], ranks: Sequence[int]) -> Dict[str, List[List[int]]]:
-    return {"ranks": list(ranks), "selected": [space.topk_selection(rank) for space, rank in zip(spaces, ranks)]}
+    return {
+        "ranks": list(ranks),
+        "selected": [space.topk_selection(rank) for space, rank in zip(spaces, ranks)],
+        "sources": [0 for _ in spaces],
+    }
 
 
 def boundary_candidates(space: WeightSearchSpace, rank: int) -> List[int]:
     if rank == 0:
         return []
     start = max(0, rank - space.boundary_window)
-    end = min(len(space.singular_values_sq), rank + space.boundary_window)
+    end = min(space.left_u_by_source[0].shape[1], rank + space.boundary_window)
     return list(range(start, end))
 
 
@@ -319,8 +351,12 @@ def mutate_rank_transfer(
         receiver_rank = next_rank(spaces[receiver], genome["ranks"][receiver])
         genome["ranks"][donor] = donor_rank
         genome["ranks"][receiver] = receiver_rank
-        genome["selected"][donor] = normalize_selection(spaces[donor], donor_rank, genome["selected"][donor])
-        genome["selected"][receiver] = normalize_selection(spaces[receiver], receiver_rank, genome["selected"][receiver])
+        genome["selected"][donor] = normalize_selection(
+            spaces[donor], genome["sources"][donor], donor_rank, genome["selected"][donor]
+        )
+        genome["selected"][receiver] = normalize_selection(
+            spaces[receiver], genome["sources"][receiver], receiver_rank, genome["selected"][receiver]
+        )
         return True
 
     if mutation_granularity == "group":
@@ -352,7 +388,9 @@ def mutate_boundary_swap(genome: Dict[str, List[List[int]]], spaces: Sequence[We
     selected = set(genome["selected"][idx])
     selected.remove(random.choice(retained_boundary))
     selected.add(random.choice(dropped_boundary))
-    genome["selected"][idx] = normalize_selection(spaces[idx], genome["ranks"][idx], selected)
+    genome["selected"][idx] = normalize_selection(
+        spaces[idx], genome["sources"][idx], genome["ranks"][idx], selected
+    )
     return True
 
 
@@ -375,7 +413,9 @@ def mutate_tail_promotion(genome: Dict[str, List[List[int]]], spaces: Sequence[W
     selected = set(genome["selected"][idx])
     selected.remove(random.choice(retained_boundary))
     selected.add(random.choice(tail))
-    genome["selected"][idx] = normalize_selection(spaces[idx], genome["ranks"][idx], selected)
+    genome["selected"][idx] = normalize_selection(
+        spaces[idx], genome["sources"][idx], genome["ranks"][idx], selected
+    )
     return True
 
 
@@ -388,6 +428,22 @@ def mutate_mask_reset(genome: Dict[str, List[List[int]]], spaces: Sequence[Weigh
     return True
 
 
+def mutate_source_choice(genome: Dict[str, List[List[int]]], spaces: Sequence[WeightSearchSpace]) -> bool:
+    eligible = [idx for idx, space in enumerate(spaces) if len(space.source_names) > 1]
+    if not eligible:
+        return False
+    idx = random.choice(eligible)
+    current_source = genome["sources"][idx]
+    candidates = [source_idx for source_idx in range(len(spaces[idx].source_names)) if source_idx != current_source]
+    if not candidates:
+        return False
+    genome["sources"][idx] = random.choice(candidates)
+    genome["selected"][idx] = normalize_selection(
+        spaces[idx], genome["sources"][idx], genome["ranks"][idx], genome["selected"][idx]
+    )
+    return True
+
+
 def repair_budget(genome: Dict[str, List[List[int]]], spaces: Sequence[WeightSearchSpace], budget: int) -> None:
     while total_cost(spaces, genome["ranks"]) > budget:
         best_idx = None
@@ -397,7 +453,7 @@ def repair_budget(genome: Dict[str, List[List[int]]], spaces: Sequence[WeightSea
             prev_level = previous_rank(space, genome["ranks"][idx])
             if prev_level is None:
                 continue
-            score = rank_delta_utility(space, prev_level, genome["ranks"][idx])
+            score = rank_delta_utility(space, genome["sources"][idx], prev_level, genome["ranks"][idx])
             if score < best_score:
                 best_idx = idx
                 best_score = score
@@ -406,7 +462,7 @@ def repair_budget(genome: Dict[str, List[List[int]]], spaces: Sequence[WeightSea
             raise RuntimeError("Unable to repair the genome to satisfy the budget.")
         genome["ranks"][best_idx] = best_prev_rank
         genome["selected"][best_idx] = normalize_selection(
-            spaces[best_idx], best_prev_rank, genome["selected"][best_idx]
+            spaces[best_idx], genome["sources"][best_idx], best_prev_rank, genome["selected"][best_idx]
         )
 
 
@@ -417,10 +473,15 @@ def mutate_offspring(
     max_mutations: int,
     budget: int,
 ) -> Dict[str, List[List[int]]]:
-    offspring = {"ranks": list(parent["ranks"]), "selected": [list(item) for item in parent["selected"]]}
+    offspring = {
+        "ranks": list(parent["ranks"]),
+        "selected": [list(item) for item in parent["selected"]],
+        "sources": list(parent["sources"]),
+    }
     mutation_fns = [
         lambda genome: mutate_rank_transfer(genome, spaces, mutation_granularity),
         lambda genome: mutate_boundary_swap(genome, spaces),
+        lambda genome: mutate_source_choice(genome, spaces),
         # lambda genome: mutate_tail_promotion(genome, spaces),
         # lambda genome: mutate_mask_reset(genome, spaces),
     ]
@@ -430,7 +491,7 @@ def mutate_offspring(
     return offspring
 
 
-def build_factor_weights(space: WeightSearchSpace, selected: Sequence[int]) -> Tuple[torch.Tensor, torch.Tensor]:
+def build_factor_weights(space: WeightSearchSpace, source_idx: int, selected: Sequence[int]) -> Tuple[torch.Tensor, torch.Tensor]:
     if not selected:
         return (
             torch.zeros((space.out_features, 0), dtype=space.dtype),
@@ -440,9 +501,9 @@ def build_factor_weights(space: WeightSearchSpace, selected: Sequence[int]) -> T
     # singular_values_sq stores s^2, so s^{1/2} = (s^2)^{1/4}.
     # Balanced split: left = U * s^{1/2}, right = s^{1/2} * right_v,
     # so left @ right = U @ diag(s) @ right_v (correct W approximation).
-    sigma_half = space.singular_values_sq[idx].pow(0.25).to(torch.float32)
-    left = space.left_u[:, idx].to(torch.float32) * sigma_half.unsqueeze(0)
-    right = sigma_half.unsqueeze(1) * space.right_v[idx, :].to(torch.float32)
+    sigma_half = space.singular_values_sq(source_idx)[idx].pow(0.25).to(torch.float32)
+    left = space.left_u(source_idx)[:, idx].to(torch.float32) * sigma_half.unsqueeze(0)
+    right = sigma_half.unsqueeze(1) * space.right_v(source_idx)[idx, :].to(torch.float32)
 
     # Balance every rank-1 component before casting to low precision.
     # This preserves the product U @ V but reduces peak magnitude and helps avoid fp16 overflow.
@@ -465,7 +526,7 @@ def build_factor_weights(space: WeightSearchSpace, selected: Sequence[int]) -> T
     return u_weight.cpu(), v_weight.cpu()
 
 
-def _make_module(space: WeightSearchSpace, rank: int, selected: Sequence[int]) -> nn.Module:
+def _make_module(space: WeightSearchSpace, source_idx: int, rank: int, selected: Sequence[int]) -> nn.Module:
     if rank == 0:
         module = ZeroLinear(
             space.in_features,
@@ -475,11 +536,15 @@ def _make_module(space: WeightSearchSpace, rank: int, selected: Sequence[int]) -
             device=space.device,
         )
     else:
-        u_weight, v_weight = build_factor_weights(space, selected)
+        u_weight, v_weight = build_factor_weights(space, source_idx, selected)
         if not torch.isfinite(u_weight).all():
-            raise RuntimeError(f"Non-finite U factor generated for {space.name} at rank {rank}")
+            raise RuntimeError(
+                f"Non-finite U factor generated for {space.name} at rank {rank} from source {space.source_names[source_idx]}"
+            )
         if not torch.isfinite(v_weight).all():
-            raise RuntimeError(f"Non-finite V factor generated for {space.name} at rank {rank}")
+            raise RuntimeError(
+                f"Non-finite V factor generated for {space.name} at rank {rank} from source {space.source_names[source_idx]}"
+            )
         module = LowRankLinear(
             space.in_features,
             space.out_features,
@@ -493,12 +558,13 @@ def _make_module(space: WeightSearchSpace, rank: int, selected: Sequence[int]) -
 @torch.no_grad()
 def apply_genome(model, spaces: Sequence[WeightSearchSpace], genome: Dict[str, List[List[int]]]) -> None:
     for idx, space in enumerate(spaces):
+        source_idx = genome["sources"][idx]
         selected = genome["selected"][idx]
         rank = genome["ranks"][idx]
         if len(selected) != rank:
-            selected = normalize_selection(space, rank, selected)
+            selected = normalize_selection(space, source_idx, rank, selected)
             genome["selected"][idx] = selected
-        set_submodule(model, space.name, _make_module(space, rank, selected))
+        set_submodule(model, space.name, _make_module(space, source_idx, rank, selected))
 
 
 @torch.no_grad()
@@ -515,16 +581,20 @@ def apply_genome_diff(
     """
     rollback: List[Tuple[str, nn.Module]] = []
     for idx, space in enumerate(spaces):
-        if (base_genome["ranks"][idx] == new_genome["ranks"][idx] and
-                base_genome["selected"][idx] == new_genome["selected"][idx]):
+        if (
+            base_genome["ranks"][idx] == new_genome["ranks"][idx]
+            and base_genome["selected"][idx] == new_genome["selected"][idx]
+            and base_genome["sources"][idx] == new_genome["sources"][idx]
+        ):
             continue
         rollback.append((space.name, model.get_submodule(space.name)))
+        source_idx = new_genome["sources"][idx]
         selected = new_genome["selected"][idx]
         rank = new_genome["ranks"][idx]
         if len(selected) != rank:
-            selected = normalize_selection(space, rank, selected)
+            selected = normalize_selection(space, source_idx, rank, selected)
             new_genome["selected"][idx] = selected
-        set_submodule(model, space.name, _make_module(space, rank, selected))
+        set_submodule(model, space.name, _make_module(space, source_idx, rank, selected))
     return rollback
 
 
@@ -659,7 +729,7 @@ def get_search_batches(dataset: str, tokenizer, nsamples: int, seqlen: int, seed
 
 def genome_to_serializable(spaces: Sequence[WeightSearchSpace], genome: Dict[str, List[List[int]]]) -> Dict[str, object]:
     per_weight = []
-    for space, rank, selected in zip(spaces, genome["ranks"], genome["selected"]):
+    for idx, (space, rank, selected) in enumerate(zip(spaces, genome["ranks"], genome["selected"])):
         per_weight.append(
             {
                 "name": space.name,
@@ -667,9 +737,14 @@ def genome_to_serializable(spaces: Sequence[WeightSearchSpace], genome: Dict[str
                 "rank": rank,
                 "cost": space.cost(rank),
                 "selected": list(selected),
+                "source": space.source_names[genome["sources"][idx]],
             }
         )
-    return {"total_cost": total_cost(spaces, genome["ranks"]), "weights": per_weight}
+    return {
+        "total_cost": total_cost(spaces, genome["ranks"]),
+        "source_datasets": list(spaces[0].source_names) if spaces else [],
+        "weights": per_weight,
+    }
 
 
 def parse_args():
@@ -681,6 +756,12 @@ def parse_args():
         type=str,
         default="wikitext2",
         help="Calibration/search dataset. Supports single datasets and mixtures like mix:wikitext2,evol-codealpaca,tulu-math.",
+    )
+    parser.add_argument(
+        "--source_datasets",
+        type=str,
+        default="wikitext2,evol-codealpaca,tulu-math",
+        help="Comma-separated datasets used to build source-specific whitening profiles for per-weight source mutation.",
     )
     parser.add_argument("--whitening_nsamples", type=int, default=256, help="Calibration samples for whitening.")
     parser.add_argument("--search_nsamples", type=int, default=16, help="Calibration samples for evolutionary search.")
@@ -711,6 +792,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    source_datasets = parse_source_datasets(args.source_datasets)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     run_start = time.time()
@@ -718,7 +800,7 @@ def main():
     log(
         f"Launching evolutionary SVD search | model={args.model} | ratio={args.ratio} | "
         f"dataset={args.dataset} | fitness={args.fitness_fn} | generations={args.generations} | "
-        f"offspring={args.offspring} | device={args.DEV}"
+        f"offspring={args.offspring} | sources={source_datasets} | device={args.DEV}"
     )
 
     log("Loading dense model and tokenizer")
@@ -730,22 +812,29 @@ def main():
     log(f"Loaded model; sequence length set to {args.model_seq_len}")
 
     if args.profiling_mat_path is None:
-        log(
-            f"Profiling matrices not provided; collecting whitening stats "
-            f"with {args.whitening_nsamples} calibration samples"
-        )
-        whitening_data = get_calib_train_data(
-            args.dataset,
-            tokenizer,
-            args.whitening_nsamples,
-            seqlen=args.model_seq_len,
-            seed=args.seed,
-        )
-        profiling_mat = profle_svdllm_low_resource(args.model, model, whitening_data, args.DEV)
+        profiling_mats = {}
+        for source_idx, source_name in enumerate(source_datasets):
+            log(
+                f"Collecting whitening stats for source={source_name} "
+                f"with {args.whitening_nsamples} calibration samples"
+            )
+            whitening_data = get_calib_train_data(
+                source_name,
+                tokenizer,
+                args.whitening_nsamples,
+                seqlen=args.model_seq_len,
+                seed=args.seed + source_idx,
+            )
+            profiling_mats[source_name] = profle_svdllm_low_resource(args.model, model, whitening_data, args.DEV)
         log("Whitening/profile collection finished")
     else:
+        if len(source_datasets) != 1:
+            raise ValueError(
+                "--profiling_mat_path currently supports only a single source dataset. "
+                "Leave it unset to compute multiple source-specific profiles."
+            )
         log(f"Loading profiling matrices from {args.profiling_mat_path}")
-        profiling_mat = torch.load(args.profiling_mat_path, map_location="cpu")
+        profiling_mats = {source_datasets[0]: torch.load(args.profiling_mat_path, map_location="cpu")}
         log("Loaded profiling matrices from disk")
 
     # The low-resource profiling path moves major submodules back to CPU.
@@ -758,7 +847,7 @@ def main():
     spaces = build_search_spaces(
         args.model,
         model,
-        profiling_mat,
+        profiling_mats,
         rank_step=args.rank_step,
         boundary_window=args.boundary_window,
         tail_count=args.tail_count,
@@ -782,7 +871,8 @@ def main():
     log(
         f"Initial genome prepared | init_strategy={args.init_strategy} | "
         f"kept_params={total_cost(spaces, parent['ranks'])} | "
-        f"active_weights={sum(rank > 0 for rank in parent['ranks'])}"
+        f"active_weights={sum(rank > 0 for rank in parent['ranks'])} | "
+        f"default_source={source_datasets[0]}"
     )
 
     log(f"Preparing {args.search_nsamples} search batches from {args.dataset}")
@@ -807,7 +897,11 @@ def main():
         args.hybrid_alpha,
         args.eval_batch_size,
     )
-    best_genome = {"ranks": list(parent["ranks"]), "selected": [list(item) for item in parent["selected"]]}
+    best_genome = {
+        "ranks": list(parent["ranks"]),
+        "selected": [list(item) for item in parent["selected"]],
+        "sources": list(parent["sources"]),
+    }
     best_score = parent_score
 
     log(f"Initial fitness={parent_score:.6f}")
@@ -853,6 +947,7 @@ def main():
         parent = {
             "ranks": list(candidates[best_idx]["ranks"]),
             "selected": [list(item) for item in candidates[best_idx]["selected"]],
+            "sources": list(candidates[best_idx]["sources"]),
         }
         parent_score = fitnesses[best_idx]
 
@@ -864,6 +959,7 @@ def main():
             best_genome = {
                 "ranks": list(parent["ranks"]),
                 "selected": [list(item) for item in parent["selected"]],
+                "sources": list(parent["sources"]),
             }
             improvement_status = "new_best"
         else:
