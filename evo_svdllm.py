@@ -764,6 +764,12 @@ def parse_args():
         help="Comma-separated datasets used to build source-specific whitening profiles for per-weight source mutation.",
     )
     parser.add_argument("--whitening_nsamples", type=int, default=256, help="Calibration samples for whitening.")
+    parser.add_argument(
+        "--profile_batch_size",
+        type=int,
+        default=8,
+        help="Mini-batch size used inside low-resource whitening profiling.",
+    )
     parser.add_argument("--search_nsamples", type=int, default=16, help="Calibration samples for evolutionary search.")
     parser.add_argument("--model_seq_len", type=int, default=2048, help="Sequence length.")
     parser.add_argument("--profiling_mat_path", type=str, default=None, help="Load precomputed whitening matrices.")
@@ -825,7 +831,9 @@ def main():
                 seqlen=args.model_seq_len,
                 seed=args.seed + source_idx,
             )
-            profiling_mats[source_name] = profle_svdllm_low_resource(args.model, model, whitening_data, args.DEV)
+            profiling_mats[source_name] = profle_svdllm_low_resource(
+                args.model, model, whitening_data, args.DEV, profile_batch_size=args.profile_batch_size
+            )
         log("Whitening/profile collection finished")
     else:
         if len(source_datasets) != 1:

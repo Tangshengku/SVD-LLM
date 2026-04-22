@@ -43,6 +43,19 @@ def _move_nested_to_device(value, device):
     return value
 
 
+def _stack_nested(values):
+    first = values[0]
+    if torch.is_tensor(first):
+        return torch.cat(values, dim=0)
+    if isinstance(first, tuple):
+        return tuple(_stack_nested([item[idx] for item in values]) for idx in range(len(first)))
+    if isinstance(first, list):
+        return [_stack_nested([item[idx] for item in values]) for idx in range(len(first))]
+    if isinstance(first, dict):
+        return {key: _stack_nested([item[key] for item in values]) for key in first}
+    return first
+
+
 
 @torch.no_grad()
 def profle_svdllm(name, model, calib_loader, dev):
@@ -102,7 +115,9 @@ def profle_svdllm(name, model, calib_loader, dev):
         
 
 @torch.no_grad()
-def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
+def profle_svdllm_low_resource(model_name, model, calib_loader, dev, profile_batch_size=8):
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
     if "opt" in model_name:
         layers = model.model.decoder.layers
         model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev)
@@ -116,7 +131,7 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
 
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros(
-        (len(calib_loader), model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
+        (len(calib_loader), model.seqlen, model.config.hidden_size), dtype=dtype, device="cpu"
     )
     cache = {'i': 0, 'layer_kwargs': []}
     class Catcher(nn.Module):
@@ -124,75 +139,91 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
             super().__init__()
             self.module = module
         def forward(self, inp, **kwargs):
+            kwargs["use_cache"] = False
             inps[cache['i']] = inp.cpu()
             cache['layer_kwargs'].append(_move_nested_to_cpu(kwargs))
             cache['i'] += 1
             raise ValueError
     layers[0] = Catcher(layers[0])
-    for batch in calib_loader:
-        try:
-            batch = {k: v.to(dev) for k, v in batch.items()}
-            model(**batch)
-        except ValueError:
-            pass
-    layers[0] = layers[0].module
-    layers[0] = layers[0].cpu()
-    if "opt" in model_name:
-        model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
-        model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.cpu()
-        model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
-    else:  
-        model.model.embed_tokens = model.model.embed_tokens.cpu()
-        model.model.norm = model.model.norm.cpu()
-    torch.cuda.empty_cache()
-    outs = torch.zeros_like(inps)
-    profiling_mat = {}
-    for i in tqdm(range(len(layers))):
-        layer_profile = {}
-        layer = layers[i].to(dev)
-        subset = find_layers(layer)        
-        def hook(module, input, output):
-            inp = input[0].detach().float()
-            if inp.dim() == 2:  # for opt
-                inp = inp.unsqueeze(0)
-            adds = torch.matmul(inp.transpose(1,2), inp)
-            adds_sum = torch.sum(adds, dim=0)
-            module.scaling_diag_matrix += adds_sum
-            del inp, adds, adds_sum, output
-            torch.cuda.empty_cache()
-        handles = []
-        for name in subset:
-            subset[name].scaling_diag_matrix = 0
-            handles.append(subset[name].register_forward_hook(hook))
-        for j in range(inps.shape[0]):
-            layer_kwargs = _move_nested_to_device(cache['layer_kwargs'][j], dev)
-            outs[j] = layer(inps[j].unsqueeze(0), **layer_kwargs)[0]
-        for h in handles:
-            h.remove()
-        layer = layer.cpu()
-        for name in subset:
-            subset[name].scaling_diag_matrix = subset[name].scaling_diag_matrix.cpu()
-        torch.cuda.empty_cache()
-        for name in subset:
-            raw_scaling_diag_matrix = subset[name].scaling_diag_matrix.double().to(dev)
+    try:
+        for batch in calib_loader:
             try:
-                scaling_diag_matrix = torch.linalg.cholesky(raw_scaling_diag_matrix)
-            except Exception as e:
-                print("Warning: eigen scaling_diag_matrix is not positive!")
-                eigenvalues = torch.linalg.eigvalsh(raw_scaling_diag_matrix)
-                raw_scaling_diag_matrix += (- eigenvalues[0] + 1e-6) * torch.eye(raw_scaling_diag_matrix.shape[0]).to(dev)
-                scaling_diag_matrix = torch.linalg.cholesky(raw_scaling_diag_matrix)
-                eigenvalues = None
-                del eigenvalues
-            layer_profile[name] = scaling_diag_matrix.cpu()
-            scaling_diag_matrix = raw_scaling_diag_matrix = subset[name].raw_scaling_diag_matrix = None
-            del scaling_diag_matrix, raw_scaling_diag_matrix, subset[name].raw_scaling_diag_matrix
-            torch.cuda.empty_cache()
-        layers[i] = layer.cpu()
-        profiling_mat[i] = layer_profile
-        inps = outs
+                batch = {k: v.to(dev) for k, v in batch.items()}
+                model(**batch, use_cache=False)
+            except ValueError:
+                pass
+            finally:
+                batch = None
+                torch.cuda.empty_cache()
+        layers[0] = layers[0].module
+        layers[0] = layers[0].cpu()
+        if "opt" in model_name:
+            model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
+            model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.cpu()
+            model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
+        else:  
+            model.model.embed_tokens = model.model.embed_tokens.cpu()
+            model.model.norm = model.model.norm.cpu()
         torch.cuda.empty_cache()
-    return profiling_mat
+        outs = torch.zeros_like(inps)
+        profiling_mat = {}
+        for i in tqdm(range(len(layers))):
+            layer_profile = {}
+            layer = layers[i].to(dev)
+            subset = find_layers(layer)        
+            def hook(module, input, output):
+                inp = input[0].detach().float()
+                if inp.dim() == 2:  # for opt
+                    inp = inp.unsqueeze(0)
+                adds = torch.matmul(inp.transpose(1,2), inp)
+                adds_sum = torch.sum(adds, dim=0).cpu()
+                module.scaling_diag_matrix += adds_sum
+                del inp, adds, adds_sum, output
+                torch.cuda.empty_cache()
+            handles = []
+            for name in subset:
+                subset[name].scaling_diag_matrix = torch.zeros(
+                    (subset[name].weight.shape[1], subset[name].weight.shape[1]),
+                    dtype=torch.float32,
+                    device="cpu",
+                )
+                handles.append(subset[name].register_forward_hook(hook))
+            for start in range(0, inps.shape[0], profile_batch_size):
+                end = min(start + profile_batch_size, inps.shape[0])
+                layer_kwargs = _move_nested_to_device(_stack_nested(cache['layer_kwargs'][start:end]), dev)
+                layer_kwargs["use_cache"] = False
+                layer_output = layer(inps[start:end].to(dev), **layer_kwargs)
+                outs[start:end] = layer_output[0].cpu()
+                layer_output = None
+                layer_kwargs = None
+            for h in handles:
+                h.remove()
+            handles = None
+            layer = layer.cpu()
+            torch.cuda.empty_cache()
+            for name in subset:
+                raw_scaling_diag_matrix = subset[name].scaling_diag_matrix.double().to(dev)
+                try:
+                    scaling_diag_matrix = torch.linalg.cholesky(raw_scaling_diag_matrix)
+                except Exception as e:
+                    print("Warning: eigen scaling_diag_matrix is not positive!")
+                    eigenvalues = torch.linalg.eigvalsh(raw_scaling_diag_matrix)
+                    raw_scaling_diag_matrix += (- eigenvalues[0] + 1e-6) * torch.eye(raw_scaling_diag_matrix.shape[0]).to(dev)
+                    scaling_diag_matrix = torch.linalg.cholesky(raw_scaling_diag_matrix)
+                    eigenvalues = None
+                    del eigenvalues
+                layer_profile[name] = scaling_diag_matrix.cpu()
+                subset[name].scaling_diag_matrix = None
+                scaling_diag_matrix = raw_scaling_diag_matrix = None
+                del scaling_diag_matrix, raw_scaling_diag_matrix
+                torch.cuda.empty_cache()
+            layers[i] = layer.cpu()
+            profiling_mat[i] = layer_profile
+            inps = outs
+            torch.cuda.empty_cache()
+        return profiling_mat
+    finally:
+        model.config.use_cache = use_cache
      
  
 @torch.no_grad()
@@ -527,6 +558,12 @@ if __name__ == '__main__':
     parser.add_argument('--seed',type=int, default=0, help='Seed for sampling the calibration data')
     parser.add_argument('--DEV', type=str, default="cuda", help='device')
     parser.add_argument('--model_seq_len', type=int, default=2048, help='the default sequence length of the LLM')
+    parser.add_argument(
+        '--profile_batch_size',
+        type=int,
+        default=8,
+        help='Mini-batch size used inside low-resource whitening profiling. Larger is faster but uses more GPU memory.',
+    )
     parser.add_argument('--eval_batch_size', type=int, default=4, help='inference bactch size')
     parser.add_argument('--gen_seq_len', type=int, default=1024, help='generated sequence len for efficiency evaluation')
     parser.add_argument('--step', type=int, default=4, help='the step to run the compression')
@@ -546,7 +583,9 @@ if __name__ == '__main__':
         model = model.eval()
         if args.profiling_mat_path is None:
             cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
-            profiling_mat = profle_svdllm_low_resource(args.model, model, cali_white_data, args.DEV)
+            profiling_mat = profle_svdllm_low_resource(
+                args.model, model, cali_white_data, args.DEV, profile_batch_size=args.profile_batch_size
+            )
             # if args.save_path is not None:
             #     torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
@@ -561,7 +600,9 @@ if __name__ == '__main__':
         model = model.float()  # need to set to float
         if args.profiling_mat_path is None:
             cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
-            profiling_mat = profle_svdllm_low_resource(args.model, model, cali_white_data, args.DEV)
+            profiling_mat = profle_svdllm_low_resource(
+                args.model, model, cali_white_data, args.DEV, profile_batch_size=args.profile_batch_size
+            )
             if args.save_path is not None:
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
