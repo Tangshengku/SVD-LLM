@@ -134,7 +134,7 @@ python evo_svdllm.py \
 Important defaults:
 - `--fitness_fn kl` compares the compressed model against dense teacher logits on calibration text. `ppl` and `hyb` are also supported.
 - `--mutation_granularity group` now applies rank-transfer mutations within both the attention and MLP pools during the same mutation step.
-- `--source_datasets` builds separate whitening/SVD profiles from multiple corpora. Each searchable weight keeps one active source choice, and the evolutionary search now includes a mutation operator that flips a weight between those source-specific decompositions.
+- `--source_datasets` builds separate whitening/SVD profiles from each listed corpus and, when multiple datasets are provided, also builds an additional mixed profile using all of them together. The initial parent genome starts from that mixed source for every weight, and source mutation flips weights among the individual and mixed decompositions.
 - `--rank_step`, `--boundary_window`, and `--tail_count` control the discrete rank levels and the singular-value search neighborhood.
 - `--dataset` also accepts `evol-codealpaca` or `theblackcat102/evol-codealpaca-v1` for instruction/code-style calibration text.
 - `--dataset` also accepts `tulu-math` or `allenai/tulu-3-sft-personas-math` for math-style instruction calibration text.

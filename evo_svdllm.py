@@ -94,6 +94,14 @@ def parse_source_datasets(spec: str) -> List[str]:
     return datasets
 
 
+def build_source_profile_plan(source_datasets: Sequence[str]) -> List[Tuple[str, str]]:
+    plan = [(dataset_name, dataset_name) for dataset_name in source_datasets]
+    if len(source_datasets) > 1:
+        mixed_dataset = "mix:" + ",".join(source_datasets)
+        plan.append(("mixed", mixed_dataset))
+    return plan
+
+
 @torch.no_grad()
 def build_search_spaces(
     model_name: str,
@@ -315,10 +323,13 @@ def initialize_ranks(
 
 
 def build_topk_genome(spaces: Sequence[WeightSearchSpace], ranks: Sequence[int]) -> Dict[str, List[List[int]]]:
+    default_source_idx = 0
+    if spaces and "mixed" in spaces[0].source_names:
+        default_source_idx = spaces[0].source_names.index("mixed")
     return {
         "ranks": list(ranks),
         "selected": [space.topk_selection(rank) for space, rank in zip(spaces, ranks)],
-        "sources": [0 for _ in spaces],
+        "sources": [default_source_idx for _ in spaces],
     }
 
 
@@ -761,7 +772,7 @@ def parse_args():
         "--source_datasets",
         type=str,
         default="wikitext2,evol-codealpaca,tulu-math",
-        help="Comma-separated datasets used to build source-specific whitening profiles for per-weight source mutation.",
+        help="Comma-separated datasets used to build source-specific whitening profiles. When multiple datasets are given, an additional mixed source is built automatically and used for parent initialization.",
     )
     parser.add_argument("--whitening_nsamples", type=int, default=256, help="Calibration samples for whitening.")
     parser.add_argument(
@@ -799,6 +810,7 @@ def parse_args():
 def main():
     args = parse_args()
     source_datasets = parse_source_datasets(args.source_datasets)
+    source_profile_plan = build_source_profile_plan(source_datasets)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     run_start = time.time()
@@ -806,7 +818,8 @@ def main():
     log(
         f"Launching evolutionary SVD search | model={args.model} | ratio={args.ratio} | "
         f"dataset={args.dataset} | fitness={args.fitness_fn} | generations={args.generations} | "
-        f"offspring={args.offspring} | sources={source_datasets} | device={args.DEV}"
+        f"offspring={args.offspring} | sources={source_datasets} | "
+        f"profile_plan={[name for name, _ in source_profile_plan]} | device={args.DEV}"
     )
 
     log("Loading dense model and tokenizer")
@@ -819,13 +832,13 @@ def main():
 
     if args.profiling_mat_path is None:
         profiling_mats = {}
-        for source_idx, source_name in enumerate(source_datasets):
+        for source_idx, (source_name, calibration_dataset) in enumerate(source_profile_plan):
             log(
                 f"Collecting whitening stats for source={source_name} "
-                f"with {args.whitening_nsamples} calibration samples"
+                f"from dataset={calibration_dataset} with {args.whitening_nsamples} calibration samples"
             )
             whitening_data = get_calib_train_data(
-                source_name,
+                calibration_dataset,
                 tokenizer,
                 args.whitening_nsamples,
                 seqlen=args.model_seq_len,
@@ -836,13 +849,13 @@ def main():
             )
         log("Whitening/profile collection finished")
     else:
-        if len(source_datasets) != 1:
+        if len(source_profile_plan) != 1:
             raise ValueError(
                 "--profiling_mat_path currently supports only a single source dataset. "
                 "Leave it unset to compute multiple source-specific profiles."
             )
         log(f"Loading profiling matrices from {args.profiling_mat_path}")
-        profiling_mats = {source_datasets[0]: torch.load(args.profiling_mat_path, map_location="cpu")}
+        profiling_mats = {source_profile_plan[0][0]: torch.load(args.profiling_mat_path, map_location="cpu")}
         log("Loaded profiling matrices from disk")
 
     # The low-resource profiling path moves major submodules back to CPU.
@@ -880,7 +893,7 @@ def main():
         f"Initial genome prepared | init_strategy={args.init_strategy} | "
         f"kept_params={total_cost(spaces, parent['ranks'])} | "
         f"active_weights={sum(rank > 0 for rank in parent['ranks'])} | "
-        f"default_source={source_datasets[0]}"
+        f"default_source={spaces[0].source_names[parent['sources'][0]] if spaces else 'n/a'}"
     )
 
     log(f"Preparing {args.search_nsamples} search batches from {args.dataset}")
