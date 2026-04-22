@@ -13,11 +13,24 @@ dev = torch.device("cuda")
 
 def get_model_from_huggingface(model_id):
     from transformers import AutoModelForCausalLM, LlamaTokenizer, AutoTokenizer, LlamaForCausalLM
-    if "opt" in model_id or "mistral" in model_id:
+    model_id_lower = model_id.lower()
+    if "opt" in model_id_lower or "mistral" in model_id_lower or "qwen" in model_id_lower:
         tokenizer = AutoTokenizer.from_pretrained(model_id, device_map="cpu", trust_remote_code=True, use_fast=False)
     else:
         tokenizer = LlamaTokenizer.from_pretrained(model_id, device_map="cpu", trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(model_id, device_map="cpu", torch_dtype=torch.float16, trust_remote_code=True, cache_dir=None)
+    load_kwargs = dict(
+        device_map="cpu",
+        torch_dtype=torch.float16,
+        trust_remote_code=True,
+        cache_dir=None,
+    )
+    if "opt" not in model_id_lower:
+        load_kwargs["attn_implementation"] = "flash_attention_2"
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+    except TypeError:
+        load_kwargs.pop("attn_implementation", None)
+        model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
     model.seqlen = 2048
     return model, tokenizer
 

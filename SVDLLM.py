@@ -10,6 +10,7 @@ import torch.nn as nn
 from utils.data_utils import *
 from component.svd_llama import SVD_LlamaAttention, SVD_LlamaMLP
 from component.svd_mistral import SVD_MistralAttention, SVD_MistralMLP
+from component.svd_qwen3 import SVD_Qwen3Attention, SVD_Qwen3MLP
 from component.svd_opt import SVDOPTDecoderLayer
 from utils.model_utils import *
 from evaluater import * 
@@ -59,7 +60,8 @@ def _stack_nested(values):
 
 @torch.no_grad()
 def profle_svdllm(name, model, calib_loader, dev):
-    if "llama" in name or "mistral" in name or "vicuna" in name:
+    name = name.lower()
+    if "llama" in name or "mistral" in name or "vicuna" in name or "qwen" in name:
         layers = model.model.layers
     elif "opt" in name:
         layers = model.model.decoder.layers
@@ -116,6 +118,7 @@ def profle_svdllm(name, model, calib_loader, dev):
 
 @torch.no_grad()
 def profle_svdllm_low_resource(model_name, model, calib_loader, dev, profile_batch_size=8):
+    model_name = model_name.lower()
     use_cache = model.config.use_cache
     model.config.use_cache = False
     if "opt" in model_name:
@@ -138,6 +141,11 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev, profile_bat
         def __init__(self, module):
             super().__init__()
             self.module = module
+        def __getattr__(self, name):
+            try:
+                return super().__getattr__(name)
+            except AttributeError:
+                return getattr(self.module, name)
         def forward(self, inp, **kwargs):
             kwargs["use_cache"] = False
             inps[cache['i']] = inp.cpu()
@@ -228,6 +236,7 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev, profile_bat
  
 @torch.no_grad()
 def whitening(model_name, model, profiling_mat, ratio, dev, init_scheme="uniform"):
+    model_name = model_name.lower()
     model.eval()
     if 'opt' in model_name:
         layers = model.model.decoder.layers
@@ -249,6 +258,14 @@ def whitening(model_name, model, profiling_mat, ratio, dev, init_scheme="uniform
                 layer_idx=getattr(layer.self_attn, "layer_idx", None),
             )
             svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio, init_scheme=init_scheme)
+        elif "qwen" in model_name:
+            svd_attn = SVD_Qwen3Attention(
+                config=model.config,
+                ratio=ratio,
+                init_scheme=init_scheme,
+                layer_idx=getattr(layer.self_attn, "layer_idx", None),
+            )
+            svd_mlp = SVD_Qwen3MLP(config=model.config, ratio=ratio, init_scheme=init_scheme)
         elif 'opt' in model_name:
             svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio, init_scheme=init_scheme)
         #### Replace Attn, MLP ####
@@ -335,6 +352,7 @@ def whitening(model_name, model, profiling_mat, ratio, dev, init_scheme="uniform
 
 @torch.no_grad()
 def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, dev, direct_update=False, init_scheme="uniform"):
+    model_name = model_name.lower()
     print("Start SVD decomposition then update...")
     use_cache = model.config.use_cache
     model.config.use_cache = False
@@ -359,6 +377,11 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
         def __init__(self, module):
             super().__init__()
             self.module = module
+        def __getattr__(self, name):
+            try:
+                return super().__getattr__(name)
+            except AttributeError:
+                return getattr(self.module, name)
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
             cache['layer_kwargs'].append(kwargs)
@@ -391,6 +414,14 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
                 layer_idx=getattr(layer.self_attn, "layer_idx", None),
             )
             svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio, init_scheme=init_scheme)
+        elif "qwen" in model_name:
+            svd_attn = SVD_Qwen3Attention(
+                config=model.config,
+                ratio=ratio,
+                init_scheme=init_scheme,
+                layer_idx=getattr(layer.self_attn, "layer_idx", None),
+            )
+            svd_mlp = SVD_Qwen3MLP(config=model.config, ratio=ratio, init_scheme=init_scheme)
         elif 'opt' in model_name:
             svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio, init_scheme=init_scheme)
         for name in subset:
