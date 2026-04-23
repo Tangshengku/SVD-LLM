@@ -138,6 +138,7 @@ Important defaults:
 - `--rerank_topk_on_policy K` runs the main search with a cheap base metric (`--rerank_base_fitness`, default `kl`) and computes on-policy KL only for the top-`K` candidates each generation.
 - `--mutation_granularity group` now applies rank-transfer mutations within both the attention and MLP pools during the same mutation step.
 - `--source_datasets` builds separate whitening/SVD profiles from each listed corpus and, when multiple datasets are provided, also builds an additional mixed profile using all of them together. The initial parent genome starts from that mixed source for every weight, and source mutation flips weights among the individual and mixed decompositions.
+- If `--source_datasets` is given as a single `mix:...` spec, the search uses only that mixed source for profiling and initialization, so source mutation is effectively disabled.
 - `--rank_step`, `--boundary_window`, and `--tail_count` control the discrete rank levels and the singular-value search neighborhood.
 - `--dataset` also accepts `evol-codealpaca` or `theblackcat102/evol-codealpaca-v1` for instruction/code-style calibration text.
 - `--dataset` also accepts `tulu-math` or `allenai/tulu-3-sft-personas-math` for math-style instruction calibration text.

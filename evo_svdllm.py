@@ -102,6 +102,9 @@ def clone_bias(module: nn.Linear) -> Optional[torch.Tensor]:
 
 
 def parse_source_datasets(spec: str) -> List[str]:
+    spec = spec.strip()
+    if spec.startswith("mix:"):
+        return [spec]
     datasets = [item.strip() for item in spec.split(",") if item.strip()]
     if not datasets:
         raise ValueError("At least one source dataset must be provided.")
@@ -109,6 +112,8 @@ def parse_source_datasets(spec: str) -> List[str]:
 
 
 def build_source_profile_plan(source_datasets: Sequence[str]) -> List[Tuple[str, str]]:
+    if len(source_datasets) == 1 and source_datasets[0].startswith("mix:"):
+        return [("mixed", source_datasets[0])]
     plan = [(dataset_name, dataset_name) for dataset_name in source_datasets]
     if len(source_datasets) > 1:
         mixed_dataset = "mix:" + ",".join(source_datasets)
@@ -462,7 +467,7 @@ def mutate_source_choice(genome: Dict[str, List[List[int]]], spaces: Sequence[We
     candidates = [source_idx for source_idx in range(len(spaces[idx].source_names)) if source_idx != current_source]
     if not candidates:
         return False
-    genome["sources"][idx] = random.choice(candidates)shi ma
+    genome["sources"][idx] = random.choice(candidates)
     genome["selected"][idx] = normalize_selection(
         spaces[idx], genome["sources"][idx], genome["ranks"][idx], genome["selected"][idx]
     )
@@ -907,7 +912,7 @@ def parse_args():
         "--source_datasets",
         type=str,
         default="wikitext2,evol-codealpaca,tulu-math",
-        help="Comma-separated datasets used to build source-specific whitening profiles. When multiple datasets are given, an additional mixed source is built automatically and used for parent initialization.",
+        help="Comma-separated datasets used to build source-specific whitening profiles. When multiple datasets are given, an additional mixed source is built automatically and used for parent initialization. Passing a single mix:... spec uses only the mixed source and disables source mutation.",
     )
     parser.add_argument("--whitening_nsamples", type=int, default=256, help="Calibration samples for whitening.")
     parser.add_argument(
