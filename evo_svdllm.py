@@ -81,6 +81,16 @@ def set_submodule(root: nn.Module, path: str, module: nn.Module) -> None:
     setattr(parent, attr_name, module)
 
 
+def capture_dense_modules(model, spaces: Sequence[WeightSearchSpace]) -> List[nn.Module]:
+    return [model.get_submodule(space.name) for space in spaces]
+
+
+@torch.no_grad()
+def apply_dense_modules(model, spaces: Sequence[WeightSearchSpace], dense_modules: Sequence[nn.Module]) -> None:
+    for space, dense_module in zip(spaces, dense_modules):
+        set_submodule(model, space.name, dense_module)
+
+
 def clone_bias(module: nn.Linear) -> Optional[torch.Tensor]:
     if module.bias is None:
         return None
@@ -698,6 +708,65 @@ def compute_kl(
 
 
 @torch.no_grad()
+def compute_on_policy_kl(
+    model,
+    spaces: Sequence[WeightSearchSpace],
+    genome: Dict[str, List[List[int]]],
+    dense_modules: Sequence[nn.Module],
+    prompts: Sequence[torch.Tensor],
+    device: str,
+    rollout_len: int,
+    eval_batch_size: int = 1,
+    temperature: float = 1.0,
+) -> float:
+    if rollout_len <= 0:
+        raise ValueError("on-policy rollout length must be positive")
+    if not prompts:
+        raise ValueError("on-policy prompts must not be empty")
+
+    model.eval()
+    total_loss = 0.0
+    total_steps = 0
+    prompt_chunks = _iter_minibatches(prompts, eval_batch_size)
+
+    for prompt_chunk in tqdm(prompt_chunks, desc="computing on-policy kl"):
+        generated = prompt_chunk.to(device)
+        rollout_contexts = []
+        student_logits_per_step = []
+
+        for _ in range(rollout_len):
+            rollout_contexts.append(generated.cpu())
+            next_logits = model(generated, use_cache=False).logits[:, -1, :].float()
+            if not torch.isfinite(next_logits).all():
+                raise RuntimeError("Non-finite student logits detected during on-policy KL rollout")
+            student_logits_per_step.append(next_logits.cpu())
+            sample_probs = torch.softmax(next_logits / temperature, dim=-1)
+            next_token = torch.multinomial(sample_probs, num_samples=1)
+            generated = torch.cat((generated, next_token), dim=1)
+
+        apply_dense_modules(model, spaces, dense_modules)
+        try:
+            for context, student_logits in zip(rollout_contexts, student_logits_per_step):
+                teacher_logits = model(context.to(device), use_cache=False).logits[:, -1, :].float()
+                teacher_log_prob = torch.log_softmax(teacher_logits, dim=-1)
+                student_log_prob = torch.log_softmax(student_logits.to(device), dim=-1)
+                loss = torch.nn.functional.kl_div(
+                    student_log_prob,
+                    teacher_log_prob,
+                    reduction="sum",
+                    log_target=True,
+                )
+                if not torch.isfinite(loss):
+                    raise RuntimeError("Non-finite on-policy KL loss detected")
+                total_loss += loss.item()
+                total_steps += context.shape[0]
+        finally:
+            apply_genome(model, spaces, genome)
+
+    return total_loss / total_steps
+
+
+@torch.no_grad()
 def compute_fitness(
     model,
     batches: Sequence[torch.Tensor],
@@ -706,12 +775,31 @@ def compute_fitness(
     teacher_logits: Optional[Sequence[torch.Tensor]] = None,
     alpha: float = 0.5,
     eval_batch_size: int = 1,
+    spaces: Optional[Sequence[WeightSearchSpace]] = None,
+    genome: Optional[Dict[str, List[List[int]]]] = None,
+    dense_modules: Optional[Sequence[nn.Module]] = None,
+    on_policy_rollout_len: int = 32,
+    on_policy_temperature: float = 1.0,
 ) -> float:
     """Evaluate fitness of the model in its current state (genome already applied)."""
     if fitness_fn == "ppl":
         return math.exp(compute_nll(model, batches, device, eval_batch_size))
     if fitness_fn == "kl":
         return compute_kl(model, batches, teacher_logits, device, eval_batch_size)
+    if fitness_fn == "on_policy_kl":
+        if spaces is None or genome is None or dense_modules is None:
+            raise ValueError("on_policy_kl requires spaces, genome, and dense_modules")
+        return compute_on_policy_kl(
+            model,
+            spaces,
+            genome,
+            dense_modules,
+            batches,
+            device,
+            rollout_len=on_policy_rollout_len,
+            eval_batch_size=eval_batch_size,
+            temperature=on_policy_temperature,
+        )
     nll = compute_nll(model, batches, device, eval_batch_size)
     kl = compute_kl(model, batches, teacher_logits, device, eval_batch_size)
     return alpha * kl + (1.0 - alpha) * nll
@@ -728,14 +816,43 @@ def evaluate_genome(
     teacher_logits: Optional[Sequence[torch.Tensor]] = None,
     alpha: float = 0.5,
     eval_batch_size: int = 1,
+    dense_modules: Optional[Sequence[nn.Module]] = None,
+    on_policy_rollout_len: int = 32,
+    on_policy_temperature: float = 1.0,
 ) -> float:
     apply_genome(model, spaces, genome)
-    return compute_fitness(model, batches, device, fitness_fn, teacher_logits, alpha, eval_batch_size)
+    return compute_fitness(
+        model,
+        batches,
+        device,
+        fitness_fn,
+        teacher_logits,
+        alpha,
+        eval_batch_size,
+        spaces=spaces,
+        genome=genome,
+        dense_modules=dense_modules,
+        on_policy_rollout_len=on_policy_rollout_len,
+        on_policy_temperature=on_policy_temperature,
+    )
 
 
 def get_search_batches(dataset: str, tokenizer, nsamples: int, seqlen: int, seed: int) -> List[torch.Tensor]:
     loader, _ = get_loaders(dataset, nsamples=nsamples, seed=seed, tokenizer=tokenizer, seqlen=seqlen)
     return [inp for inp, _ in loader]
+
+
+def build_on_policy_prompts(batches: Sequence[torch.Tensor], prompt_len: int) -> List[torch.Tensor]:
+    if prompt_len <= 0:
+        raise ValueError("on-policy prompt length must be positive")
+    prompts = []
+    for batch in batches:
+        if batch.shape[1] <= prompt_len:
+            raise ValueError(
+                f"on-policy prompt length {prompt_len} must be smaller than the search batch sequence length {batch.shape[1]}"
+            )
+        prompts.append(batch[:, :prompt_len].contiguous())
+    return prompts
 
 
 def genome_to_serializable(spaces: Sequence[WeightSearchSpace], genome: Dict[str, List[List[int]]]) -> Dict[str, object]:
@@ -786,8 +903,31 @@ def parse_args():
     parser.add_argument("--profiling_mat_path", type=str, default=None, help="Load precomputed whitening matrices.")
     parser.add_argument("--save_path", type=str, default=None, help="Directory for configs or model checkpoints.")
     parser.add_argument("--save_model", action="store_true", help="Save the final compressed model checkpoint.")
-    parser.add_argument("--fitness_fn", choices=["ppl", "kl", "hyb"], default="kl", help="Search fitness.")
+    parser.add_argument(
+        "--fitness_fn",
+        choices=["ppl", "kl", "hyb", "on_policy_kl"],
+        default="kl",
+        help="Search fitness.",
+    )
     parser.add_argument("--hybrid_alpha", type=float, default=0.5, help="Weight of KL in hybrid fitness.")
+    parser.add_argument(
+        "--on_policy_prompt_len",
+        type=int,
+        default=128,
+        help="Prompt length used to start on-policy KL rollouts.",
+    )
+    parser.add_argument(
+        "--on_policy_rollout_len",
+        type=int,
+        default=128,
+        help="Rollout length used for on-policy KL fitness.",
+    )
+    parser.add_argument(
+        "--on_policy_temperature",
+        type=float,
+        default=1.0,
+        help="Sampling temperature used for on-policy KL rollouts.",
+    )
     parser.add_argument("--generations", type=int, default=50, help="Number of search generations.")
     parser.add_argument("--offspring", type=int, default=8, help="Number of offspring per generation.")
     parser.add_argument("--max_mutations", type=int, default=3, help="Maximum mutations per offspring.")
@@ -876,6 +1016,7 @@ def main():
     )
     if not spaces:
         raise RuntimeError("No admissible linear weights found for evolutionary SVD search.")
+    dense_modules = capture_dense_modules(model, spaces)
 
     total_dense_params = sum(space.dense_params for space in spaces)
     budget = int((1.0 - args.ratio) * total_dense_params)
@@ -900,6 +1041,13 @@ def main():
     search_batches = get_search_batches(args.dataset, tokenizer, args.search_nsamples, args.model_seq_len, args.seed)
     total_search_tokens = sum(batch.numel() for batch in search_batches)
     log(f"Search batches ready | batches={len(search_batches)} | tokens={total_search_tokens}")
+    fitness_batches = search_batches
+    if args.fitness_fn == "on_policy_kl":
+        fitness_batches = build_on_policy_prompts(search_batches, args.on_policy_prompt_len)
+        log(
+            f"On-policy KL prompts ready | prompts={len(fitness_batches)} | "
+            f"prompt_len={args.on_policy_prompt_len} | rollout_len={args.on_policy_rollout_len}"
+        )
     teacher_logits = None
     if args.fitness_fn in ["kl", "hyb"]:
         teacher_logits = precompute_teacher_logits(model, search_batches, args.DEV)
@@ -911,12 +1059,15 @@ def main():
         model,
         spaces,
         parent,
-        search_batches,
+        fitness_batches,
         args.DEV,
         args.fitness_fn,
         teacher_logits,
         args.hybrid_alpha,
         args.eval_batch_size,
+        dense_modules=dense_modules,
+        on_policy_rollout_len=args.on_policy_rollout_len,
+        on_policy_temperature=args.on_policy_temperature,
     )
     best_genome = {
         "ranks": list(parent["ranks"]),
@@ -947,12 +1098,17 @@ def main():
                 rollback = apply_genome_diff(model, spaces, parent, candidate)
             score = compute_fitness(
                 model,
-                search_batches,
+                fitness_batches,
                 args.DEV,
                 args.fitness_fn,
                 teacher_logits,
                 args.hybrid_alpha,
                 args.eval_batch_size,
+                spaces=spaces,
+                genome=candidate,
+                dense_modules=dense_modules,
+                on_policy_rollout_len=args.on_policy_rollout_len,
+                on_policy_temperature=args.on_policy_temperature,
             )
             if rollback is not None:
                 rollback_modules(model, rollback)
