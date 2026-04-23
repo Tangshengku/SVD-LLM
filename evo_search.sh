@@ -7,11 +7,12 @@ python evo_svdllm.py \
     --model mistralai/Mistral-7B-v0.1 \
     --ratio 0.4 \
     --dataset mix:wikitext2,evol-codealpaca,tulu-math \
+    --source_datasets wikitext2,evol-codealpaca,tulu-math \
     --whitening_nsamples 256 \
     --search_nsamples 32 \
     --model_seq_len 2048 \
-    --fitness_fn kl \
-    --generations 400 \
+    --fitness_fn ppl \
+    --generations 50 \
     --offspring 16 \
     --rank_step 128 \
     --boundary_window 32 \
@@ -19,8 +20,8 @@ python evo_svdllm.py \
     --mutation_granularity group \
     --eval_batch_size 16 \
     --init_strategy uniform \
-    --max_mutations 10 \
-    --save_path /nfs/scistore19/alistgrp/stang/SVD-LLM/evo_output_mistral_rank_step128_kl_400generation_bw32_mixture_search \
+    --max_mutations 5 \
+    --save_path /nfs/scistore19/alistgrp/stang/SVD-LLM/evo_output_mistral_rank_step128_kl_400generation_bw32_mixture_search_ppl \
     --save_model
 
 # python evo_svdllm.py \
