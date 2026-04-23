@@ -462,7 +462,7 @@ def mutate_source_choice(genome: Dict[str, List[List[int]]], spaces: Sequence[We
     candidates = [source_idx for source_idx in range(len(spaces[idx].source_names)) if source_idx != current_source]
     if not candidates:
         return False
-    genome["sources"][idx] = random.choice(candidates)
+    genome["sources"][idx] = random.choice(candidates)shi ma
     genome["selected"][idx] = normalize_selection(
         spaces[idx], genome["sources"][idx], genome["ranks"][idx], genome["selected"][idx]
     )
@@ -754,7 +754,6 @@ def compute_on_policy_kl(
             sample_probs = torch.softmax(next_logits / temperature, dim=-1)
             next_token = torch.multinomial(sample_probs, num_samples=1)
             generated = torch.cat((generated, next_token), dim=1)
-
         apply_dense_modules(model, spaces, dense_modules)
         try:
             for context, student_logits in zip(rollout_contexts, student_logits_per_step):

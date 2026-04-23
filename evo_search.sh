@@ -10,8 +10,14 @@ python evo_svdllm.py \
     --source_datasets wikitext2,evol-codealpaca,tulu-math \
     --whitening_nsamples 256 \
     --search_nsamples 32 \
+    --fitness_fn kl \
+    --rerank_base_fitness kl \
+    --rerank_topk_on_policy 4 \
     --model_seq_len 2048 \
-    --fitness_fn ppl \
+    --on_policy_prompt_len 128 \
+    --on_policy_rollout_len 64 \
+    --on_policy_eval_every 8 \
+    --on_policy_temperature 1.0 \
     --generations 50 \
     --offspring 16 \
     --rank_step 128 \
@@ -21,7 +27,7 @@ python evo_svdllm.py \
     --eval_batch_size 16 \
     --init_strategy uniform \
     --max_mutations 5 \
-    --save_path /nfs/scistore19/alistgrp/stang/SVD-LLM/evo_output_mistral_rank_step128_kl_400generation_bw32_mixture_search_ppl \
+    --save_path /nfs/scistore19/alistgrp/stang/SVD-LLM/evo_output_mistral_rank_step128_kl_50generation_bw32_mixture_search_onpolicy_kl \
     --save_model
 
 # python evo_svdllm.py \
