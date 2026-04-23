@@ -766,13 +766,13 @@ def compute_on_policy_kl(
                 teacher_log_prob = torch.log_softmax(teacher_logits, dim=-1)
                 student_log_prob = torch.log_softmax(student_logits.to(device), dim=-1)
                 loss = torch.nn.functional.kl_div(
-                    student_log_prob,
                     teacher_log_prob,
+                    student_log_prob,
                     reduction="sum",
                     log_target=True,
                 )
                 if not torch.isfinite(loss):
-                    raise RuntimeError("Non-finite on-policy KL loss detected")
+                    raise RuntimeError("Non-finite reverse on-policy KL loss detected")
                 total_loss += loss.item()
                 total_steps += context.shape[0]
         finally:
