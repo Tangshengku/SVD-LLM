@@ -134,6 +134,8 @@ python evo_svdllm.py \
 Important defaults:
 - `--fitness_fn kl` compares the compressed model against dense teacher logits on calibration text. `ppl`, `hyb`, and `on_policy_kl` are also supported.
 - `--fitness_fn on_policy_kl` samples offspring rollouts from prompt prefixes and evaluates teacher-student KL on those offspring-generated contexts. `--on_policy_prompt_len`, `--on_policy_rollout_len`, and `--on_policy_temperature` control that evaluation.
+- `--on_policy_eval_every k` makes on-policy KL query the dense teacher only every `k` rollout steps instead of every step.
+- `--rerank_topk_on_policy K` runs the main search with a cheap base metric (`--rerank_base_fitness`, default `kl`) and computes on-policy KL only for the top-`K` candidates each generation.
 - `--mutation_granularity group` now applies rank-transfer mutations within both the attention and MLP pools during the same mutation step.
 - `--source_datasets` builds separate whitening/SVD profiles from each listed corpus and, when multiple datasets are provided, also builds an additional mixed profile using all of them together. The initial parent genome starts from that mixed source for every weight, and source mutation flips weights among the individual and mixed decompositions.
 - `--rank_step`, `--boundary_window`, and `--tail_count` control the discrete rank levels and the singular-value search neighborhood.

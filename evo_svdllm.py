@@ -91,6 +91,10 @@ def apply_dense_modules(model, spaces: Sequence[WeightSearchSpace], dense_module
         set_submodule(model, space.name, dense_module)
 
 
+def capture_current_modules(model, spaces: Sequence[WeightSearchSpace]) -> List[nn.Module]:
+    return [model.get_submodule(space.name) for space in spaces]
+
+
 def clone_bias(module: nn.Linear) -> Optional[torch.Tensor]:
     if module.bias is None:
         return None
@@ -718,28 +722,35 @@ def compute_on_policy_kl(
     rollout_len: int,
     eval_batch_size: int = 1,
     temperature: float = 1.0,
+    eval_every: int = 1,
 ) -> float:
     if rollout_len <= 0:
         raise ValueError("on-policy rollout length must be positive")
     if not prompts:
         raise ValueError("on-policy prompts must not be empty")
+    if eval_every <= 0:
+        raise ValueError("on-policy evaluation stride must be positive")
 
     model.eval()
     total_loss = 0.0
     total_steps = 0
     prompt_chunks = _iter_minibatches(prompts, eval_batch_size)
+    candidate_modules = capture_current_modules(model, spaces)
 
     for prompt_chunk in tqdm(prompt_chunks, desc="computing on-policy kl"):
         generated = prompt_chunk.to(device)
         rollout_contexts = []
         student_logits_per_step = []
 
-        for _ in range(rollout_len):
-            rollout_contexts.append(generated.cpu())
+        for step_idx in range(rollout_len):
+            should_eval = ((step_idx + 1) % eval_every == 0) or (step_idx == rollout_len - 1)
+            if should_eval:
+                rollout_contexts.append(generated.cpu())
             next_logits = model(generated, use_cache=False).logits[:, -1, :].float()
             if not torch.isfinite(next_logits).all():
                 raise RuntimeError("Non-finite student logits detected during on-policy KL rollout")
-            student_logits_per_step.append(next_logits.cpu())
+            if should_eval:
+                student_logits_per_step.append(next_logits.cpu())
             sample_probs = torch.softmax(next_logits / temperature, dim=-1)
             next_token = torch.multinomial(sample_probs, num_samples=1)
             generated = torch.cat((generated, next_token), dim=1)
@@ -761,7 +772,7 @@ def compute_on_policy_kl(
                 total_loss += loss.item()
                 total_steps += context.shape[0]
         finally:
-            apply_genome(model, spaces, genome)
+            apply_dense_modules(model, spaces, candidate_modules)
 
     return total_loss / total_steps
 
@@ -780,6 +791,7 @@ def compute_fitness(
     dense_modules: Optional[Sequence[nn.Module]] = None,
     on_policy_rollout_len: int = 32,
     on_policy_temperature: float = 1.0,
+    on_policy_eval_every: int = 1,
 ) -> float:
     """Evaluate fitness of the model in its current state (genome already applied)."""
     if fitness_fn == "ppl":
@@ -799,6 +811,7 @@ def compute_fitness(
             rollout_len=on_policy_rollout_len,
             eval_batch_size=eval_batch_size,
             temperature=on_policy_temperature,
+            eval_every=on_policy_eval_every,
         )
     nll = compute_nll(model, batches, device, eval_batch_size)
     kl = compute_kl(model, batches, teacher_logits, device, eval_batch_size)
@@ -819,6 +832,7 @@ def evaluate_genome(
     dense_modules: Optional[Sequence[nn.Module]] = None,
     on_policy_rollout_len: int = 32,
     on_policy_temperature: float = 1.0,
+    on_policy_eval_every: int = 1,
 ) -> float:
     apply_genome(model, spaces, genome)
     return compute_fitness(
@@ -834,6 +848,7 @@ def evaluate_genome(
         dense_modules=dense_modules,
         on_policy_rollout_len=on_policy_rollout_len,
         on_policy_temperature=on_policy_temperature,
+        on_policy_eval_every=on_policy_eval_every,
     )
 
 
@@ -853,6 +868,10 @@ def build_on_policy_prompts(batches: Sequence[torch.Tensor], prompt_len: int) ->
             )
         prompts.append(batch[:, :prompt_len].contiguous())
     return prompts
+
+
+def fitness_requires_teacher_logits(fitness_fn: str) -> bool:
+    return fitness_fn in {"kl", "hyb"}
 
 
 def genome_to_serializable(spaces: Sequence[WeightSearchSpace], genome: Dict[str, List[List[int]]]) -> Dict[str, object]:
@@ -928,6 +947,24 @@ def parse_args():
         default=1.0,
         help="Sampling temperature used for on-policy KL rollouts.",
     )
+    parser.add_argument(
+        "--on_policy_eval_every",
+        type=int,
+        default=1,
+        help="Evaluate teacher KL only every k rollout steps during on-policy KL.",
+    )
+    parser.add_argument(
+        "--rerank_topk_on_policy",
+        type=int,
+        default=0,
+        help="If > 0, score all candidates with --rerank_base_fitness and rerank only the top-k candidates with on-policy KL.",
+    )
+    parser.add_argument(
+        "--rerank_base_fitness",
+        choices=["ppl", "kl", "hyb"],
+        default="kl",
+        help="Base fitness used before top-k on-policy KL reranking.",
+    )
     parser.add_argument("--generations", type=int, default=50, help="Number of search generations.")
     parser.add_argument("--offspring", type=int, default=8, help="Number of offspring per generation.")
     parser.add_argument("--max_mutations", type=int, default=3, help="Maximum mutations per offspring.")
@@ -949,11 +986,18 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.rerank_topk_on_policy < 0:
+        raise ValueError("--rerank_topk_on_policy must be non-negative")
+    if args.rerank_topk_on_policy > 0 and args.fitness_fn == "on_policy_kl":
+        raise ValueError("Use --rerank_topk_on_policy with --fitness_fn set to a base metric such as kl.")
     source_datasets = parse_source_datasets(args.source_datasets)
     source_profile_plan = build_source_profile_plan(source_datasets)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     run_start = time.time()
+    rerank_enabled = args.rerank_topk_on_policy > 0
+    bulk_fitness_fn = args.rerank_base_fitness if rerank_enabled else args.fitness_fn
+    selection_fitness_name = "on_policy_kl" if rerank_enabled else args.fitness_fn
 
     log(
         f"Launching evolutionary SVD search | model={args.model} | ratio={args.ratio} | "
@@ -1041,34 +1085,55 @@ def main():
     search_batches = get_search_batches(args.dataset, tokenizer, args.search_nsamples, args.model_seq_len, args.seed)
     total_search_tokens = sum(batch.numel() for batch in search_batches)
     log(f"Search batches ready | batches={len(search_batches)} | tokens={total_search_tokens}")
-    fitness_batches = search_batches
-    if args.fitness_fn == "on_policy_kl":
-        fitness_batches = build_on_policy_prompts(search_batches, args.on_policy_prompt_len)
+    on_policy_batches = None
+    if args.fitness_fn == "on_policy_kl" or rerank_enabled:
+        on_policy_batches = build_on_policy_prompts(search_batches, args.on_policy_prompt_len)
         log(
-            f"On-policy KL prompts ready | prompts={len(fitness_batches)} | "
-            f"prompt_len={args.on_policy_prompt_len} | rollout_len={args.on_policy_rollout_len}"
+            f"On-policy KL prompts ready | prompts={len(on_policy_batches)} | "
+            f"prompt_len={args.on_policy_prompt_len} | rollout_len={args.on_policy_rollout_len} | "
+            f"eval_every={args.on_policy_eval_every}"
         )
+    bulk_fitness_batches = on_policy_batches if bulk_fitness_fn == "on_policy_kl" else search_batches
     teacher_logits = None
-    if args.fitness_fn in ["kl", "hyb"]:
+    if fitness_requires_teacher_logits(bulk_fitness_fn):
         teacher_logits = precompute_teacher_logits(model, search_batches, args.DEV)
     else:
         log("Teacher logits skipped because fitness does not require them")
 
     log("Evaluating initial parent genome")
-    parent_score = evaluate_genome(
+    parent_base_score = evaluate_genome(
         model,
         spaces,
         parent,
-        fitness_batches,
+        bulk_fitness_batches,
         args.DEV,
-        args.fitness_fn,
+        bulk_fitness_fn,
         teacher_logits,
         args.hybrid_alpha,
         args.eval_batch_size,
         dense_modules=dense_modules,
         on_policy_rollout_len=args.on_policy_rollout_len,
         on_policy_temperature=args.on_policy_temperature,
+        on_policy_eval_every=args.on_policy_eval_every,
     )
+    if rerank_enabled:
+        parent_score = compute_fitness(
+            model,
+            on_policy_batches,
+            args.DEV,
+            "on_policy_kl",
+            teacher_logits=None,
+            alpha=args.hybrid_alpha,
+            eval_batch_size=args.eval_batch_size,
+            spaces=spaces,
+            genome=parent,
+            dense_modules=dense_modules,
+            on_policy_rollout_len=args.on_policy_rollout_len,
+            on_policy_temperature=args.on_policy_temperature,
+            on_policy_eval_every=args.on_policy_eval_every,
+        )
+    else:
+        parent_score = parent_base_score
     best_genome = {
         "ranks": list(parent["ranks"]),
         "selected": [list(item) for item in parent["selected"]],
@@ -1076,7 +1141,13 @@ def main():
     }
     best_score = parent_score
 
-    log(f"Initial fitness={parent_score:.6f}")
+    if rerank_enabled:
+        log(
+            f"Initial fitness={parent_score:.6f} | base_{bulk_fitness_fn}={parent_base_score:.6f} | "
+            f"selection_metric={selection_fitness_name}"
+        )
+    else:
+        log(f"Initial fitness={parent_score:.6f}")
     log(f"Initial kept params={total_cost(spaces, parent['ranks'])}/{budget}")
 
     for generation in range(args.generations):
@@ -1098,9 +1169,9 @@ def main():
                 rollback = apply_genome_diff(model, spaces, parent, candidate)
             score = compute_fitness(
                 model,
-                fitness_batches,
+                bulk_fitness_batches,
                 args.DEV,
-                args.fitness_fn,
+                bulk_fitness_fn,
                 teacher_logits,
                 args.hybrid_alpha,
                 args.eval_batch_size,
@@ -1109,6 +1180,7 @@ def main():
                 dense_modules=dense_modules,
                 on_policy_rollout_len=args.on_policy_rollout_len,
                 on_policy_temperature=args.on_policy_temperature,
+                on_policy_eval_every=args.on_policy_eval_every,
             )
             if rollback is not None:
                 rollback_modules(model, rollback)
@@ -1116,17 +1188,50 @@ def main():
             if candidate_idx == 0 or candidate_idx == len(candidates) - 1 or len(candidates) <= 4:
                 log(
                     f"Generation {generation + 1}: evaluated candidate "
-                    f"{candidate_idx + 1}/{len(candidates)} | fitness={score:.6f}"
+                    f"{candidate_idx + 1}/{len(candidates)} | {bulk_fitness_fn}={score:.6f}"
                 )
 
-        best_idx = min(range(len(candidates)), key=lambda idx: fitnesses[idx])
+        if rerank_enabled:
+            shortlist_k = min(args.rerank_topk_on_policy, len(candidates))
+            shortlist = sorted(range(len(candidates)), key=lambda idx: fitnesses[idx])[:shortlist_k]
+            on_policy_scores = {}
+            for candidate_idx in shortlist:
+                candidate = candidates[candidate_idx]
+                if candidate_idx == 0:
+                    rollback = None
+                else:
+                    rollback = apply_genome_diff(model, spaces, parent, candidate)
+                on_policy_score = compute_fitness(
+                    model,
+                    on_policy_batches,
+                    args.DEV,
+                    "on_policy_kl",
+                    teacher_logits=None,
+                    alpha=args.hybrid_alpha,
+                    eval_batch_size=args.eval_batch_size,
+                    spaces=spaces,
+                    genome=candidate,
+                    dense_modules=dense_modules,
+                    on_policy_rollout_len=args.on_policy_rollout_len,
+                    on_policy_temperature=args.on_policy_temperature,
+                    on_policy_eval_every=args.on_policy_eval_every,
+                )
+                if rollback is not None:
+                    rollback_modules(model, rollback)
+                on_policy_scores[candidate_idx] = on_policy_score
+            best_idx = min(shortlist, key=lambda idx: on_policy_scores[idx])
+            parent_base_score = fitnesses[best_idx]
+            parent_score = on_policy_scores[best_idx]
+        else:
+            best_idx = min(range(len(candidates)), key=lambda idx: fitnesses[idx])
+            parent_base_score = fitnesses[best_idx]
+            parent_score = fitnesses[best_idx]
         previous_parent = parent
         parent = {
             "ranks": list(candidates[best_idx]["ranks"]),
             "selected": [list(item) for item in candidates[best_idx]["selected"]],
             "sources": list(candidates[best_idx]["sources"]),
         }
-        parent_score = fitnesses[best_idx]
 
         if best_idx != 0:
             apply_genome_diff(model, spaces, previous_parent, parent)
@@ -1145,6 +1250,7 @@ def main():
         log(
             f"Generation {generation + 1}/{args.generations} finished | "
             f"parent_fitness={parent_score:.6f} | best_fitness={best_score:.6f} | "
+            f"base_{bulk_fitness_fn}={parent_base_score:.6f} | "
             f"kept_params={total_cost(spaces, parent['ranks'])}/{budget} | "
             f"status={improvement_status} | elapsed={time.time() - generation_start:.1f}s"
         )
