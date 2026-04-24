@@ -324,15 +324,26 @@ def whitening(model_name, model, profiling_mat, ratio, dev, init_scheme="uniform
                 if "q_proj" in name:
                     svd_attn.q_u_proj.weight.data = svd_u
                     svd_attn.q_v_proj.weight.data = svd_v
+                    if "qwen" in model_name and layer.self_attn.q_proj.bias is not None:
+                        svd_attn.q_u_proj.bias.data.copy_(layer.self_attn.q_proj.bias.data)
                 elif "k_proj" in name:
                     svd_attn.k_u_proj.weight.data = svd_u
                     svd_attn.k_v_proj.weight.data = svd_v
+                    if "qwen" in model_name and layer.self_attn.k_proj.bias is not None:
+                        svd_attn.k_u_proj.bias.data.copy_(layer.self_attn.k_proj.bias.data)
                 elif "v_proj" in name:
                     svd_attn.v_u_proj.weight.data = svd_u
                     svd_attn.v_v_proj.weight.data = svd_v
+                    if "qwen" in model_name and layer.self_attn.v_proj.bias is not None:
+                        svd_attn.v_u_proj.bias.data.copy_(layer.self_attn.v_proj.bias.data)
                 elif "o_proj" in name:
                     svd_attn.o_u_proj.weight.data = svd_u
                     svd_attn.o_v_proj.weight.data = svd_v
+                    if "qwen" in model_name and layer.self_attn.o_proj.bias is not None:
+                        svd_attn.o_u_proj.bias.data.copy_(layer.self_attn.o_proj.bias.data)
+                    if "qwen" in model_name:
+                        svd_attn.q_norm.weight.data.copy_(layer.self_attn.q_norm.weight.data)
+                        svd_attn.k_norm.weight.data.copy_(layer.self_attn.k_norm.weight.data)
                     layer.self_attn =  svd_attn
                 elif "gate_proj" in name:
                     svd_mlp.gate_u_proj.weight.data = svd_u
@@ -477,15 +488,26 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
                 if "q_proj" in name:
                     svd_attn.q_u_proj.weight.data = svd_u
                     svd_attn.q_v_proj.weight.data = svd_v
+                    if "qwen" in model_name and layer.self_attn.q_proj.bias is not None:
+                        svd_attn.q_u_proj.bias.data.copy_(layer.self_attn.q_proj.bias.data)
                 elif "k_proj" in name:
                     svd_attn.k_u_proj.weight.data = svd_u
                     svd_attn.k_v_proj.weight.data = svd_v
+                    if "qwen" in model_name and layer.self_attn.k_proj.bias is not None:
+                        svd_attn.k_u_proj.bias.data.copy_(layer.self_attn.k_proj.bias.data)
                 elif "v_proj" in name:
                     svd_attn.v_u_proj.weight.data = svd_u
                     svd_attn.v_v_proj.weight.data = svd_v
+                    if "qwen" in model_name and layer.self_attn.v_proj.bias is not None:
+                        svd_attn.v_u_proj.bias.data.copy_(layer.self_attn.v_proj.bias.data)
                 elif "o_proj" in name:
                     svd_attn.o_u_proj.weight.data = svd_u
                     svd_attn.o_v_proj.weight.data = svd_v
+                    if "qwen" in model_name and layer.self_attn.o_proj.bias is not None:
+                        svd_attn.o_u_proj.bias.data.copy_(layer.self_attn.o_proj.bias.data)
+                    if "qwen" in model_name:
+                        svd_attn.q_norm.weight.data.copy_(layer.self_attn.q_norm.weight.data)
+                        svd_attn.k_norm.weight.data.copy_(layer.self_attn.k_norm.weight.data)
                     layer.self_attn =  svd_attn
                 elif "gate_proj" in name:
                     svd_mlp.gate_u_proj.weight.data = svd_u
