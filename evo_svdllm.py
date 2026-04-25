@@ -969,6 +969,12 @@ def parse_args():
         default="kl",
         help="Base fitness used before top-k on-policy KL reranking.",
     )
+    parser.add_argument(
+        "--rerank_selection_fitness",
+        choices=["on_policy_kl", "on_policy_plus_kl"],
+        default="on_policy_kl",
+        help="Final selection metric on the top-k shortlist: either pure on-policy KL or on-policy KL plus teacher-forced KL.",
+    )
     parser.add_argument("--generations", type=int, default=50, help="Number of search generations.")
     parser.add_argument("--offspring", type=int, default=8, help="Number of offspring per generation.")
     parser.add_argument("--max_mutations", type=int, default=3, help="Maximum mutations per offspring.")
@@ -1001,7 +1007,7 @@ def main():
     run_start = time.time()
     rerank_enabled = args.rerank_topk_on_policy > 0
     bulk_fitness_fn = args.rerank_base_fitness if rerank_enabled else args.fitness_fn
-    selection_fitness_name = "on_policy_kl" if rerank_enabled else args.fitness_fn
+    selection_fitness_name = args.rerank_selection_fitness if rerank_enabled else args.fitness_fn
 
     log(
         f"Launching evolutionary SVD search | model={args.model} | ratio={args.ratio} | "
@@ -1099,7 +1105,9 @@ def main():
         )
     bulk_fitness_batches = on_policy_batches if bulk_fitness_fn == "on_policy_kl" else search_batches
     teacher_logits = None
-    if fitness_requires_teacher_logits(bulk_fitness_fn):
+    if fitness_requires_teacher_logits(bulk_fitness_fn) or (
+        rerank_enabled and args.rerank_selection_fitness == "on_policy_plus_kl"
+    ):
         teacher_logits = precompute_teacher_logits(model, search_batches, args.DEV)
     else:
         log("Teacher logits skipped because fitness does not require them")
@@ -1121,7 +1129,7 @@ def main():
         on_policy_eval_every=args.on_policy_eval_every,
     )
     if rerank_enabled:
-        parent_score = compute_fitness(
+        parent_on_policy_score = compute_fitness(
             model,
             on_policy_batches,
             args.DEV,
@@ -1136,7 +1144,29 @@ def main():
             on_policy_temperature=args.on_policy_temperature,
             on_policy_eval_every=args.on_policy_eval_every,
         )
+        if args.rerank_selection_fitness == "on_policy_plus_kl":
+            parent_kl_score = compute_fitness(
+                model,
+                search_batches,
+                args.DEV,
+                "kl",
+                teacher_logits,
+                args.hybrid_alpha,
+                args.eval_batch_size,
+                spaces=spaces,
+                genome=parent,
+                dense_modules=dense_modules,
+                on_policy_rollout_len=args.on_policy_rollout_len,
+                on_policy_temperature=args.on_policy_temperature,
+                on_policy_eval_every=args.on_policy_eval_every,
+            )
+            parent_score = parent_on_policy_score + parent_kl_score
+        else:
+            parent_kl_score = None
+            parent_score = parent_on_policy_score
     else:
+        parent_on_policy_score = None
+        parent_kl_score = None
         parent_score = parent_base_score
     best_genome = {
         "ranks": list(parent["ranks"]),
@@ -1146,10 +1176,17 @@ def main():
     best_score = parent_score
 
     if rerank_enabled:
-        log(
-            f"Initial fitness={parent_score:.6f} | base_{bulk_fitness_fn}={parent_base_score:.6f} | "
-            f"selection_metric={selection_fitness_name}"
-        )
+        if parent_kl_score is not None:
+            log(
+                f"Initial fitness={parent_score:.6f} | base_{bulk_fitness_fn}={parent_base_score:.6f} | "
+                f"on_policy_kl={parent_on_policy_score:.6f} | kl={parent_kl_score:.6f} | "
+                f"selection_metric={selection_fitness_name}"
+            )
+        else:
+            log(
+                f"Initial fitness={parent_score:.6f} | base_{bulk_fitness_fn}={parent_base_score:.6f} | "
+                f"selection_metric={selection_fitness_name}"
+            )
     else:
         log(f"Initial fitness={parent_score:.6f}")
     log(f"Initial kept params={total_cost(spaces, parent['ranks'])}/{budget}")
@@ -1198,7 +1235,7 @@ def main():
         if rerank_enabled:
             shortlist_k = min(args.rerank_topk_on_policy, len(candidates))
             shortlist = sorted(range(len(candidates)), key=lambda idx: fitnesses[idx])[:shortlist_k]
-            on_policy_scores = {}
+            shortlist_scores = {}
             for candidate_idx in shortlist:
                 candidate = candidates[candidate_idx]
                 if candidate_idx == 0:
@@ -1220,12 +1257,36 @@ def main():
                     on_policy_temperature=args.on_policy_temperature,
                     on_policy_eval_every=args.on_policy_eval_every,
                 )
+                if args.rerank_selection_fitness == "on_policy_plus_kl":
+                    kl_score = compute_fitness(
+                        model,
+                        search_batches,
+                        args.DEV,
+                        "kl",
+                        teacher_logits,
+                        args.hybrid_alpha,
+                        args.eval_batch_size,
+                        spaces=spaces,
+                        genome=candidate,
+                        dense_modules=dense_modules,
+                        on_policy_rollout_len=args.on_policy_rollout_len,
+                        on_policy_temperature=args.on_policy_temperature,
+                        on_policy_eval_every=args.on_policy_eval_every,
+                    )
+                    final_score = on_policy_score + kl_score
+                else:
+                    kl_score = None
+                    final_score = on_policy_score
                 if rollback is not None:
                     rollback_modules(model, rollback)
-                on_policy_scores[candidate_idx] = on_policy_score
-            best_idx = min(shortlist, key=lambda idx: on_policy_scores[idx])
+                shortlist_scores[candidate_idx] = {
+                    "final": final_score,
+                    "on_policy_kl": on_policy_score,
+                    "kl": kl_score,
+                }
+            best_idx = min(shortlist, key=lambda idx: shortlist_scores[idx]["final"])
             parent_base_score = fitnesses[best_idx]
-            parent_score = on_policy_scores[best_idx]
+            parent_score = shortlist_scores[best_idx]["final"]
         else:
             best_idx = min(range(len(candidates)), key=lambda idx: fitnesses[idx])
             parent_base_score = fitnesses[best_idx]
@@ -1251,13 +1312,24 @@ def main():
         else:
             improvement_status = "no_global_improvement"
 
-        log(
-            f"Generation {generation + 1}/{args.generations} finished | "
-            f"parent_fitness={parent_score:.6f} | best_fitness={best_score:.6f} | "
-            f"base_{bulk_fitness_fn}={parent_base_score:.6f} | "
-            f"kept_params={total_cost(spaces, parent['ranks'])}/{budget} | "
-            f"status={improvement_status} | elapsed={time.time() - generation_start:.1f}s"
-        )
+        if rerank_enabled and args.rerank_selection_fitness == "on_policy_plus_kl":
+            log(
+                f"Generation {generation + 1}/{args.generations} finished | "
+                f"parent_fitness={parent_score:.6f} | best_fitness={best_score:.6f} | "
+                f"base_{bulk_fitness_fn}={parent_base_score:.6f} | "
+                f"selection_on_policy_kl={shortlist_scores[best_idx]['on_policy_kl']:.6f} | "
+                f"selection_kl={shortlist_scores[best_idx]['kl']:.6f} | "
+                f"kept_params={total_cost(spaces, parent['ranks'])}/{budget} | "
+                f"status={improvement_status} | elapsed={time.time() - generation_start:.1f}s"
+            )
+        else:
+            log(
+                f"Generation {generation + 1}/{args.generations} finished | "
+                f"parent_fitness={parent_score:.6f} | best_fitness={best_score:.6f} | "
+                f"base_{bulk_fitness_fn}={parent_base_score:.6f} | "
+                f"kept_params={total_cost(spaces, parent['ranks'])}/{budget} | "
+                f"status={improvement_status} | elapsed={time.time() - generation_start:.1f}s"
+            )
 
     log("Applying best genome to the model")
     apply_genome(model, spaces, best_genome)
