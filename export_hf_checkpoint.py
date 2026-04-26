@@ -8,6 +8,7 @@ from component.low_rank_linear import LowRankLinear, ZeroLinear
 from component.svd_llama import SVD_LlamaAttention, SVD_LlamaMLP
 from component.svd_mistral import SVD_MistralAttention, SVD_MistralMLP
 from component.svd_opt import SVDOPTAttention, SVDOPTDecoderLayer
+from component.svd_qwen3 import SVD_Qwen3Attention, SVD_Qwen3MLP
 
 
 class ModuleScaffold(nn.Module):
@@ -87,6 +88,18 @@ def convert_svd_mistral_attention(module: SVD_MistralAttention) -> nn.Module:
     return dense
 
 
+def convert_svd_qwen3_attention(module: SVD_Qwen3Attention) -> nn.Module:
+    dense = ModuleScaffold()
+    dense.layer_idx = getattr(module, "layer_idx", None)
+    dense.q_proj = convert_factorized_pair(module.q_u_proj, module.q_v_proj, module.num_heads * module.head_dim, module.hidden_size)
+    dense.k_proj = convert_factorized_pair(module.k_u_proj, module.k_v_proj, module.num_key_value_heads * module.head_dim, module.hidden_size)
+    dense.v_proj = convert_factorized_pair(module.v_u_proj, module.v_v_proj, module.num_key_value_heads * module.head_dim, module.hidden_size)
+    dense.o_proj = convert_factorized_pair(module.o_u_proj, module.o_v_proj, module.hidden_size, module.num_heads * module.head_dim)
+    dense.q_norm = module.q_norm
+    dense.k_norm = module.k_norm
+    return dense
+
+
 def convert_svd_mlp(module: nn.Module, hidden_size: int, intermediate_size: int) -> nn.Module:
     dense = ModuleScaffold()
     dense.gate_proj = convert_factorized_pair(module.gate_u_proj, module.gate_v_proj, intermediate_size, hidden_size)
@@ -146,10 +159,16 @@ def convert_modules(model: nn.Module) -> tuple[int, int]:
         elif isinstance(module, SVD_MistralAttention):
             replacements.append((name, convert_svd_mistral_attention(module)))
             svdllm_replacements += 1
+        elif isinstance(module, SVD_Qwen3Attention):
+            replacements.append((name, convert_svd_qwen3_attention(module)))
+            svdllm_replacements += 1
         elif isinstance(module, SVD_LlamaMLP):
             replacements.append((name, convert_svd_mlp(module, module.hidden_size, module.intermediate_size)))
             svdllm_replacements += 1
         elif isinstance(module, SVD_MistralMLP):
+            replacements.append((name, convert_svd_mlp(module, module.hidden_size, module.intermediate_size)))
+            svdllm_replacements += 1
+        elif isinstance(module, SVD_Qwen3MLP):
             replacements.append((name, convert_svd_mlp(module, module.hidden_size, module.intermediate_size)))
             svdllm_replacements += 1
         elif isinstance(module, SVDOPTDecoderLayer):
