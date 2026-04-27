@@ -975,6 +975,12 @@ def parse_args():
         default="on_policy_kl",
         help="Final selection metric on the top-k shortlist: either pure on-policy KL or on-policy KL plus teacher-forced KL.",
     )
+    parser.add_argument(
+        "--rerank_on_policy_weight",
+        type=float,
+        default=1.0,
+        help="Scalar weight applied to on-policy KL inside --rerank_selection_fitness=on_policy_plus_kl.",
+    )
     parser.add_argument("--generations", type=int, default=50, help="Number of search generations.")
     parser.add_argument("--offspring", type=int, default=8, help="Number of offspring per generation.")
     parser.add_argument("--max_mutations", type=int, default=3, help="Maximum mutations per offspring.")
@@ -998,6 +1004,8 @@ def main():
     args = parse_args()
     if args.rerank_topk_on_policy < 0:
         raise ValueError("--rerank_topk_on_policy must be non-negative")
+    if args.rerank_on_policy_weight < 0:
+        raise ValueError("--rerank_on_policy_weight must be non-negative")
     if args.rerank_topk_on_policy > 0 and args.fitness_fn == "on_policy_kl":
         raise ValueError("Use --rerank_topk_on_policy with --fitness_fn set to a base metric such as kl.")
     source_datasets = parse_source_datasets(args.source_datasets)
@@ -1160,7 +1168,7 @@ def main():
                 on_policy_temperature=args.on_policy_temperature,
                 on_policy_eval_every=args.on_policy_eval_every,
             )
-            parent_score = parent_on_policy_score + parent_kl_score
+            parent_score = args.rerank_on_policy_weight * parent_on_policy_score + parent_kl_score
         else:
             parent_kl_score = None
             parent_score = parent_on_policy_score
@@ -1179,7 +1187,9 @@ def main():
         if parent_kl_score is not None:
             log(
                 f"Initial fitness={parent_score:.6f} | base_{bulk_fitness_fn}={parent_base_score:.6f} | "
-                f"on_policy_kl={parent_on_policy_score:.6f} | kl={parent_kl_score:.6f} | "
+                f"selection_on_policy_kl={parent_on_policy_score:.6f} | "
+                f"selection_on_policy_weight={args.rerank_on_policy_weight:.6f} | "
+                f"selection_kl={parent_kl_score:.6f} | "
                 f"selection_metric={selection_fitness_name}"
             )
         else:
@@ -1273,7 +1283,7 @@ def main():
                         on_policy_temperature=args.on_policy_temperature,
                         on_policy_eval_every=args.on_policy_eval_every,
                     )
-                    final_score = on_policy_score + kl_score
+                    final_score = args.rerank_on_policy_weight * on_policy_score + kl_score
                 else:
                     kl_score = None
                     final_score = on_policy_score
@@ -1318,6 +1328,7 @@ def main():
                 f"parent_fitness={parent_score:.6f} | best_fitness={best_score:.6f} | "
                 f"base_{bulk_fitness_fn}={parent_base_score:.6f} | "
                 f"selection_on_policy_kl={shortlist_scores[best_idx]['on_policy_kl']:.6f} | "
+                f"selection_on_policy_weight={args.rerank_on_policy_weight:.6f} | "
                 f"selection_kl={shortlist_scores[best_idx]['kl']:.6f} | "
                 f"kept_params={total_cost(spaces, parent['ranks'])}/{budget} | "
                 f"status={improvement_status} | elapsed={time.time() - generation_start:.1f}s"
