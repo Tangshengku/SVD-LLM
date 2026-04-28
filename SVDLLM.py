@@ -97,17 +97,31 @@ def _sample_top_p(logits, temperature=1.0, top_p=1.0):
 
 
 def _cholesky_with_jitter(matrix, device, dtype=torch.float64):
-    eye = torch.eye(matrix.shape[0], device=device, dtype=dtype)
     work = matrix.to(device=device, dtype=dtype)
+    work = torch.nan_to_num(work, nan=0.0, posinf=0.0, neginf=0.0)
+    work = 0.5 * (work + work.transpose(0, 1))
+    eye = torch.eye(work.shape[0], device=device, dtype=dtype)
+    scale = work.diagonal().abs().mean().item()
+    scale = max(scale, 1.0)
     jitter = 0.0
-    for _ in range(5):
+    for _ in range(8):
         try:
             return torch.linalg.cholesky(work + jitter * eye)
         except Exception:
-            jitter = 1e-6 if jitter == 0.0 else jitter * 10
-    eigenvalues = torch.linalg.eigvalsh(work)
-    work = work + (-eigenvalues[0].item() + 1e-6) * eye
-    return torch.linalg.cholesky(work)
+            jitter = scale * 1e-6 if jitter == 0.0 else jitter * 10
+    try:
+        eigenvalues, eigenvectors = torch.linalg.eigh(work)
+    except Exception:
+        cpu_work = work.cpu()
+        try:
+            eigenvalues, eigenvectors = torch.linalg.eigh(cpu_work)
+            eigenvalues = eigenvalues.to(device)
+            eigenvectors = eigenvectors.to(device)
+        except Exception:
+            diag = torch.clamp(work.diagonal(), min=scale * 1e-6)
+            return torch.diag(torch.sqrt(diag))
+    eigenvalues = torch.clamp(eigenvalues, min=scale * 1e-6)
+    return eigenvectors.matmul(torch.diag(torch.sqrt(eigenvalues)))
 
 
 def _capture_module_snapshot(model, module_paths):
@@ -202,12 +216,17 @@ class _OnPolicyCovCollector:
             output_module = model.get_submodule(output_path)
             key = (layer_idx, name)
             self.stats[key] = {
-                "cov": torch.zeros(
+                "cov_x": torch.zeros(
                     (input_module.in_features, input_module.in_features),
                     dtype=torch.float32,
                     device="cpu",
                 ),
-                "weight_sum": 0.0,
+                "cov_g": torch.zeros(
+                    (output_module.out_features, output_module.out_features),
+                    dtype=torch.float32,
+                    device="cpu",
+                ),
+                "count": 0,
                 "last_input": None,
                 "last_grad": None,
             }
@@ -242,15 +261,12 @@ class _OnPolicyCovCollector:
             grads = grads[:, start:end, :]
             if inputs.numel() == 0 or grads.numel() == 0:
                 continue
-            alpha = grads.pow(2).mean(dim=-1)
-            alpha = torch.clamp(alpha, min=self.alpha_min, max=self.alpha_max)
-            alpha_hat = alpha / (alpha.mean(dim=1, keepdim=True) + self.delta)
             flat_inputs = inputs.reshape(-1, inputs.shape[-1])
-            flat_alpha = alpha_hat.reshape(-1, 1)
-            cov_add = flat_inputs.transpose(0, 1).matmul(flat_inputs * flat_alpha)
-            stat["cov"] += cov_add.cpu()
-            stat["weight_sum"] += alpha_hat.sum().item()
-            del inputs, grads, alpha, alpha_hat, flat_inputs, flat_alpha, cov_add
+            flat_grads = grads.reshape(-1, grads.shape[-1])
+            stat["cov_x"] += flat_inputs.transpose(0, 1).matmul(flat_inputs).cpu()
+            stat["cov_g"] += flat_grads.transpose(0, 1).matmul(flat_grads).cpu()
+            stat["count"] += flat_inputs.shape[0]
+            del inputs, grads, flat_inputs, flat_grads
 
     def close(self):
         for handle in self.handles:
@@ -286,32 +302,44 @@ def _compute_reverse_kd_loss(student_logits, teacher_logits, prompt_len, kd_temp
     )
 
 
-def _build_mixed_profile(off_profile, on_stats, rho, lambda0, dev):
-    mixed_profile = {}
-    total_layers = 0
+def _build_gradient_whitening_profile(on_stats, lambda0, dev, whitening_mode="both"):
+    if whitening_mode not in {"both", "grad_only"}:
+        raise ValueError("whitening_mode must be one of: both, grad_only")
+    profile = {}
     active_layers = 0
-    for layer_idx, layer_profile in off_profile.items():
-        mixed_layer = {}
-        for name, chol in layer_profile.items():
-            total_layers += 1
-            chol = chol.float().to(dev)
-            off_cov = chol @ chol.transpose(0, 1)
-            stat = on_stats[(layer_idx, name)]
-            if stat["weight_sum"] > 0:
-                active_layers += 1
-                on_cov = stat["cov"].to(dev) / stat["weight_sum"]
-            else:
-                on_cov = off_cov.clone()
-            lambda_l = lambda0 * off_cov.trace().item() / max(off_cov.shape[0], 1)
-            mixed_cov = (1.0 - rho) * off_cov + rho * on_cov
-            mixed_cov = mixed_cov + lambda_l * torch.eye(off_cov.shape[0], dtype=torch.float32, device=dev)
-            mixed_layer[name] = _cholesky_with_jitter(mixed_cov, dev, dtype=torch.float64).cpu()
-        mixed_profile[layer_idx] = mixed_layer
+    total_layers = 0
+    for (layer_idx, name), stat in on_stats.items():
+        total_layers += 1
+        layer_profile = profile.setdefault(layer_idx, {})
+        if stat["count"] <= 0:
+            layer_profile[name] = {
+                "x": torch.eye(stat["cov_x"].shape[0], dtype=torch.float32),
+                "g": torch.eye(stat["cov_g"].shape[0], dtype=torch.float32),
+            }
+            continue
+        active_layers += 1
+        cov_g = stat["cov_g"].to(dev) / stat["count"]
+        eps_g = lambda0 * cov_g.trace().item() / max(cov_g.shape[0], 1)
+        cov_g = cov_g + eps_g * torch.eye(cov_g.shape[0], dtype=torch.float32, device=dev)
+        if whitening_mode == "grad_only":
+            x_factor = torch.eye(stat["cov_x"].shape[0], dtype=torch.float32)
+        else:
+            cov_x = stat["cov_x"].to(dev) / stat["count"]
+            eps_x = lambda0 * cov_x.trace().item() / max(cov_x.shape[0], 1)
+            cov_x = cov_x + eps_x * torch.eye(cov_x.shape[0], dtype=torch.float32, device=dev)
+            x_factor = _cholesky_with_jitter(cov_x, dev, dtype=torch.float64).cpu()
+            del cov_x
+        layer_profile[name] = {
+            "x": x_factor,
+            "g": _cholesky_with_jitter(cov_g, dev, dtype=torch.float64).cpu(),
+        }
+        del cov_g
+        torch.cuda.empty_cache()
     log(
-        f"Built mixed whitening profile | active_layers={active_layers}/{total_layers} | "
-        f"rho={rho} | lambda0={lambda0}"
+        f"Built gradient whitening profile | active_layers={active_layers}/{total_layers} | "
+        f"lambda0={lambda0} | whitening_mode={whitening_mode}"
     )
-    return mixed_profile
+    return profile
 
 
 @torch.no_grad()
@@ -358,6 +386,7 @@ def on_policy_reverse_kd_guided_whitening(
     eval_batch_size=1,
     seed=0,
     init_scheme="uniform",
+    gradient_whitening_mode="both",
 ):
     if rounds <= 0:
         raise ValueError("rounds must be positive")
@@ -458,23 +487,22 @@ def on_policy_reverse_kd_guided_whitening(
             collector.close()
             _apply_module_snapshot(model, student_snapshot, device=dev, offload_replaced_to_cpu=False)
 
-        active_stats = sum(1 for stat in collector.stats.values() if stat["weight_sum"] > 0)
-        total_weight = sum(stat["weight_sum"] for stat in collector.stats.values())
+        active_stats = sum(1 for stat in collector.stats.values() if stat["count"] > 0)
+        total_tokens = sum(stat["count"] for stat in collector.stats.values())
         mean_loss = running_loss / max(len(prompt_batches), 1)
         log(
             f"Round {round_idx + 1}: collected on-policy stats | active_projections={active_stats}/{len(collector.stats)} | "
-            f"total_weight={total_weight:.4f} | mean_reverse_kd_loss={mean_loss:.6f}"
+            f"total_tokens={total_tokens} | mean_reverse_kd_loss={mean_loss:.6f}"
         )
-        mixed_profile = _build_mixed_profile(
-            offline_profile,
+        gradient_profile = _build_gradient_whitening_profile(
             collector.stats,
-            rho=rho,
             lambda0=lambda0,
             dev=dev,
+            whitening_mode=gradient_whitening_mode,
         )
         _apply_module_snapshot(model, dense_snapshot, device=dev, offload_replaced_to_cpu=True)
-        log(f"Round {round_idx + 1}: recompressing from dense teacher weights with mixed whitening profile")
-        whitening(model_name, model, mixed_profile, ratio, dev, init_scheme=init_scheme)
+        log(f"Round {round_idx + 1}: recompressing from dense teacher weights with bi-sided gradient whitening profile")
+        gradient_whitening(model_name, model, gradient_profile, ratio, dev, init_scheme=init_scheme)
         model.to(dev)
         log(f"Round {round_idx + 1}: recompression complete")
 
@@ -659,6 +687,72 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev, profile_bat
         model.config.use_cache = use_cache
      
  
+def _assign_low_rank_weights(model_name, layer, name, svd_u, svd_v, svd_attn=None, svd_mlp=None, svd_decoder=None):
+    if 'opt' in model_name:
+        if "q_proj" in name:
+            svd_decoder.self_attn.q_u_proj.weight.data = svd_u
+            svd_decoder.self_attn.q_v_proj.weight.data = svd_v
+            svd_decoder.self_attn.q_u_proj.bias.data = layer.self_attn.q_proj.bias.data
+        elif "k_proj" in name:
+            svd_decoder.self_attn.k_u_proj.weight.data = svd_u
+            svd_decoder.self_attn.k_v_proj.weight.data = svd_v
+            svd_decoder.self_attn.k_u_proj.bias.data = layer.self_attn.k_proj.bias.data
+        elif "v_proj" in name:
+            svd_decoder.self_attn.v_u_proj.weight.data = svd_u
+            svd_decoder.self_attn.v_v_proj.weight.data = svd_v
+            svd_decoder.self_attn.v_u_proj.bias.data = layer.self_attn.v_proj.bias.data
+        elif "out_proj" in name:
+            svd_decoder.self_attn.out_u_proj.weight.data = svd_u
+            svd_decoder.self_attn.out_v_proj.weight.data = svd_v
+            svd_decoder.self_attn.out_u_proj.bias.data = layer.self_attn.out_proj.bias.data
+        elif "fc1" in name:
+            svd_decoder.fc1_u_proj.weight.data = svd_u
+            svd_decoder.fc1_v_proj.weight.data = svd_v
+            svd_decoder.fc1_u_proj.bias.data = layer.fc1.bias.data
+        elif "fc2" in name:
+            svd_decoder.fc2_u_proj.weight.data = svd_u
+            svd_decoder.fc2_v_proj.weight.data = svd_v
+            svd_decoder.fc2_u_proj.bias.data = layer.fc2.bias.data
+            svd_decoder.self_attn_layer_norm = layer.self_attn_layer_norm
+            svd_decoder.final_layer_norm = layer.final_layer_norm
+        return
+
+    if "q_proj" in name:
+        svd_attn.q_u_proj.weight.data = svd_u
+        svd_attn.q_v_proj.weight.data = svd_v
+        if "qwen" in model_name and layer.self_attn.q_proj.bias is not None:
+            svd_attn.q_u_proj.bias.data.copy_(layer.self_attn.q_proj.bias.data)
+    elif "k_proj" in name:
+        svd_attn.k_u_proj.weight.data = svd_u
+        svd_attn.k_v_proj.weight.data = svd_v
+        if "qwen" in model_name and layer.self_attn.k_proj.bias is not None:
+            svd_attn.k_u_proj.bias.data.copy_(layer.self_attn.k_proj.bias.data)
+    elif "v_proj" in name:
+        svd_attn.v_u_proj.weight.data = svd_u
+        svd_attn.v_v_proj.weight.data = svd_v
+        if "qwen" in model_name and layer.self_attn.v_proj.bias is not None:
+            svd_attn.v_u_proj.bias.data.copy_(layer.self_attn.v_proj.bias.data)
+    elif "o_proj" in name:
+        svd_attn.o_u_proj.weight.data = svd_u
+        svd_attn.o_v_proj.weight.data = svd_v
+        if "qwen" in model_name and layer.self_attn.o_proj.bias is not None:
+            svd_attn.o_u_proj.bias.data.copy_(layer.self_attn.o_proj.bias.data)
+        if "qwen" in model_name:
+            svd_attn.q_norm.weight.data.copy_(layer.self_attn.q_norm.weight.data)
+            svd_attn.k_norm.weight.data.copy_(layer.self_attn.k_norm.weight.data)
+        layer.self_attn = svd_attn
+    elif "gate_proj" in name:
+        svd_mlp.gate_u_proj.weight.data = svd_u
+        svd_mlp.gate_v_proj.weight.data = svd_v
+    elif "down_proj" in name:
+        svd_mlp.down_u_proj.weight.data = svd_u
+        svd_mlp.down_v_proj.weight.data = svd_v
+    elif "up_proj" in name:
+        svd_mlp.up_u_proj.weight.data = svd_u
+        svd_mlp.up_v_proj.weight.data = svd_v
+        layer.mlp = svd_mlp
+
+
 @torch.no_grad()
 def whitening(model_name, model, profiling_mat, ratio, dev, init_scheme="uniform"):
     model_name = model_name.lower()
@@ -782,6 +876,79 @@ def whitening(model_name, model, profiling_mat, ratio, dev, init_scheme="uniform
                     layer.mlp = svd_mlp
             W = W_scale = scaling_matrix_inv = scaling_diag_matrix = U = S = VT  = truc_s = truc_u = truc_v = sqrtSigma = None
             del  W, W_scale, scaling_matrix_inv, scaling_diag_matrix, U, S, VT, truc_s, truc_u, truc_v, sqrtSigma
+        del layer
+        torch.cuda.empty_cache()
+
+
+@torch.no_grad()
+def gradient_whitening(model_name, model, gradient_profile, ratio, dev, init_scheme="uniform"):
+    model_name = model_name.lower()
+    model.eval()
+    if 'opt' in model_name:
+        layers = model.model.decoder.layers
+    else:
+        layers = model.model.layers
+    print("Start bi-sided gradient-whitened SVD decomposition...")
+    for i in tqdm(range(len(layers))):
+        layer = layers[i]
+        subset = find_layers(layer)
+        if "llama" in model_name or "vicuna" in model_name:
+            svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio, init_scheme=init_scheme)
+            svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio, init_scheme=init_scheme)
+        elif "mistral" in model_name:
+            svd_attn = SVD_MistralAttention(
+                config=model.config,
+                ratio=ratio,
+                init_scheme=init_scheme,
+                layer_idx=getattr(layer.self_attn, "layer_idx", None),
+            )
+            svd_mlp = SVD_MistralMLP(config=model.config, ratio=ratio, init_scheme=init_scheme)
+        elif "qwen" in model_name:
+            svd_attn = SVD_Qwen3Attention(
+                config=model.config,
+                ratio=ratio,
+                init_scheme=init_scheme,
+                layer_idx=getattr(layer.self_attn, "layer_idx", None),
+            )
+            svd_mlp = SVD_Qwen3MLP(config=model.config, ratio=ratio, init_scheme=init_scheme)
+        elif 'opt' in model_name:
+            svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio, init_scheme=init_scheme)
+
+        for name in subset:
+            dtype = subset[name].weight.data.dtype
+            W = subset[name].weight.data.float().to(dev)
+            factors = gradient_profile[i][name]
+            input_factor = factors["x"].float().to(dev)
+            grad_factor = factors["g"].float().to(dev)
+            W_scale = grad_factor.transpose(0, 1).matmul(W).matmul(input_factor)
+            U, S, VT = torch.linalg.svd(W_scale, full_matrices=False)
+            num_s_after_trunc = int(W.shape[0] * W.shape[1] * ratio / (W.shape[0] + W.shape[1]))
+            truc_s = S[:num_s_after_trunc]
+            sqrt_s = torch.sqrt(truc_s)
+            left = U[:, :num_s_after_trunc] * sqrt_s.unsqueeze(0)
+            right = sqrt_s.unsqueeze(1) * VT[:num_s_after_trunc, :]
+            svd_u = torch.linalg.solve(
+                grad_factor.transpose(0, 1),
+                left,
+            ).cpu().to(dtype)
+            svd_v = torch.linalg.solve(
+                input_factor.transpose(0, 1),
+                right.transpose(0, 1),
+            ).transpose(0, 1).cpu().to(dtype)
+            _assign_low_rank_weights(
+                model_name,
+                layer,
+                name,
+                svd_u,
+                svd_v,
+                svd_attn=svd_attn if 'opt' not in model_name else None,
+                svd_mlp=svd_mlp if 'opt' not in model_name else None,
+                svd_decoder=svd_decoder if 'opt' in model_name else None,
+            )
+            del W, input_factor, grad_factor, W_scale, U, S, VT, truc_s, sqrt_s, left, right, svd_u, svd_v
+            torch.cuda.empty_cache()
+        if 'opt' in model_name:
+            layers[i] = svd_decoder
         del layer
         torch.cuda.empty_cache()
 
@@ -1061,6 +1228,13 @@ if __name__ == '__main__':
     parser.add_argument('--alpha_delta', type=float, default=1e-6, help='Normalization epsilon for token importance in step 6.')
     parser.add_argument('--lambda0', type=float, default=1e-6, help='Diagonal stabilization scale for mixed covariances in step 6.')
     parser.add_argument(
+        '--gradient_whitening_mode',
+        type=str,
+        default='both',
+        choices=['both', 'grad_only'],
+        help='Step 6 whitening metric: both uses input and output-gradient covariances; grad_only uses output-gradient covariance with identity input metric.',
+    )
+    parser.add_argument(
         '--init_scheme',
         type=str,
         default='uniform',
@@ -1121,7 +1295,8 @@ if __name__ == '__main__':
         )
         log(
             f"On-policy KD prompts: dataset={args.on_policy_dataset} | prompt_nsamples={args.on_policy_prompt_nsamples} | "
-            f"prompt_len={args.on_policy_prompt_len} | rollout_len={args.on_policy_rollout_len}"
+            f"prompt_len={args.on_policy_prompt_len} | rollout_len={args.on_policy_rollout_len} | "
+            f"gradient_whitening_mode={args.gradient_whitening_mode}"
         )
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
         model = model.eval()
@@ -1164,6 +1339,7 @@ if __name__ == '__main__':
             eval_batch_size=args.eval_batch_size,
             seed=args.seed,
             init_scheme=args.init_scheme,
+            gradient_whitening_mode=args.gradient_whitening_mode,
         )
         if args.save_path is not None:
             output_path = (
