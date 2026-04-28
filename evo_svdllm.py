@@ -1006,8 +1006,12 @@ def main():
         raise ValueError("--rerank_topk_on_policy must be non-negative")
     if args.rerank_on_policy_weight < 0:
         raise ValueError("--rerank_on_policy_weight must be non-negative")
-    if args.rerank_topk_on_policy > 0 and args.fitness_fn == "on_policy_kl":
-        raise ValueError("Use --rerank_topk_on_policy with --fitness_fn set to a base metric such as kl.")
+    if args.fitness_fn == "on_policy_kl" and args.rerank_topk_on_policy > 0:
+        log(
+            "Direct on-policy KL mode selected via --fitness_fn on_policy_kl; "
+            "disabling top-k rerank and scoring all candidates with on-policy KL."
+        )
+        args.rerank_topk_on_policy = 0
     source_datasets = parse_source_datasets(args.source_datasets)
     source_profile_plan = build_source_profile_plan(source_datasets)
     random.seed(args.seed)
