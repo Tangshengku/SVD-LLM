@@ -2,6 +2,7 @@
 import os
 import sys
 import argparse
+import math
 import torch.jit
 from tqdm import tqdm
 import torch
@@ -55,6 +56,430 @@ def _stack_nested(values):
     if isinstance(first, dict):
         return {key: _stack_nested([item[key] for item in values]) for key in first}
     return first
+
+
+def set_submodule(root: nn.Module, path: str, module: nn.Module) -> None:
+    if "." in path:
+        parent_path, attr_name = path.rsplit(".", 1)
+        parent = root.get_submodule(parent_path)
+    else:
+        parent = root
+        attr_name = path
+    setattr(parent, attr_name, module)
+
+
+def _iter_tensor_batches(samples, batch_size):
+    for start in range(0, len(samples), batch_size):
+        yield torch.cat(list(samples[start : start + batch_size]), dim=0)
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+def _sample_top_p(logits, temperature=1.0, top_p=1.0):
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    scaled = logits / temperature
+    if top_p >= 1.0:
+        probs = torch.softmax(scaled, dim=-1)
+        return torch.multinomial(probs, num_samples=1)
+    sorted_logits, sorted_indices = torch.sort(scaled, descending=True, dim=-1)
+    sorted_probs = torch.softmax(sorted_logits, dim=-1)
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+    sorted_mask = cumulative_probs > top_p
+    sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
+    sorted_mask[..., 0] = False
+    filtered_sorted_logits = sorted_logits.masked_fill(sorted_mask, float("-inf"))
+    filtered_probs = torch.softmax(filtered_sorted_logits, dim=-1)
+    sampled_sorted = torch.multinomial(filtered_probs, num_samples=1)
+    return torch.gather(sorted_indices, -1, sampled_sorted)
+
+
+def _cholesky_with_jitter(matrix, device, dtype=torch.float64):
+    eye = torch.eye(matrix.shape[0], device=device, dtype=dtype)
+    work = matrix.to(device=device, dtype=dtype)
+    jitter = 0.0
+    for _ in range(5):
+        try:
+            return torch.linalg.cholesky(work + jitter * eye)
+        except Exception:
+            jitter = 1e-6 if jitter == 0.0 else jitter * 10
+    eigenvalues = torch.linalg.eigvalsh(work)
+    work = work + (-eigenvalues[0].item() + 1e-6) * eye
+    return torch.linalg.cholesky(work)
+
+
+def _capture_module_snapshot(model, module_paths):
+    return [(path, model.get_submodule(path)) for path in module_paths]
+
+
+def _apply_module_snapshot(model, snapshot, device=None, offload_replaced_to_cpu=False):
+    for path, module in snapshot:
+        if offload_replaced_to_cpu:
+            try:
+                current = model.get_submodule(path)
+                if current is not module:
+                    current.cpu()
+            except AttributeError:
+                pass
+        if device is not None:
+            module = module.to(device)
+        set_submodule(model, path, module)
+
+
+def _build_replaced_module_paths(model_name, model):
+    model_name = model_name.lower()
+    if "opt" in model_name:
+        return [f"model.decoder.layers.{idx}" for idx in range(len(model.model.decoder.layers))]
+    return [
+        f"model.layers.{idx}.self_attn" for idx in range(len(model.model.layers))
+    ] + [
+        f"model.layers.{idx}.mlp" for idx in range(len(model.model.layers))
+    ]
+
+
+def _build_low_rank_hook_specs(model_name, model):
+    model_name = model_name.lower()
+    specs = []
+
+    def add_spec_if_present(layer_idx, logical_name, input_path, output_path):
+        try:
+            model.get_submodule(input_path)
+            model.get_submodule(output_path)
+        except AttributeError:
+            return
+        specs.append((layer_idx, logical_name, input_path, output_path))
+
+    if "opt" in model_name:
+        for idx in range(len(model.model.decoder.layers)):
+            base = f"model.decoder.layers.{idx}"
+            add_spec_if_present(idx, "self_attn.q_proj", f"{base}.self_attn.q_v_proj", f"{base}.self_attn.q_u_proj")
+            add_spec_if_present(idx, "self_attn.k_proj", f"{base}.self_attn.k_v_proj", f"{base}.self_attn.k_u_proj")
+            add_spec_if_present(idx, "self_attn.v_proj", f"{base}.self_attn.v_v_proj", f"{base}.self_attn.v_u_proj")
+            add_spec_if_present(idx, "self_attn.out_proj", f"{base}.self_attn.out_v_proj", f"{base}.self_attn.out_u_proj")
+            add_spec_if_present(idx, "fc1", f"{base}.fc1_v_proj", f"{base}.fc1_u_proj")
+            add_spec_if_present(idx, "fc2", f"{base}.fc2_v_proj", f"{base}.fc2_u_proj")
+            add_spec_if_present(idx, "self_attn.q_proj", f"{base}.self_attn.q_proj", f"{base}.self_attn.q_proj")
+            add_spec_if_present(idx, "self_attn.k_proj", f"{base}.self_attn.k_proj", f"{base}.self_attn.k_proj")
+            add_spec_if_present(idx, "self_attn.v_proj", f"{base}.self_attn.v_proj", f"{base}.self_attn.v_proj")
+            add_spec_if_present(idx, "self_attn.out_proj", f"{base}.self_attn.out_proj", f"{base}.self_attn.out_proj")
+            add_spec_if_present(idx, "fc1", f"{base}.fc1", f"{base}.fc1")
+            add_spec_if_present(idx, "fc2", f"{base}.fc2", f"{base}.fc2")
+        return specs
+
+    for idx in range(len(model.model.layers)):
+        base = f"model.layers.{idx}"
+        add_spec_if_present(idx, "self_attn.q_proj", f"{base}.self_attn.q_v_proj", f"{base}.self_attn.q_u_proj")
+        add_spec_if_present(idx, "self_attn.k_proj", f"{base}.self_attn.k_v_proj", f"{base}.self_attn.k_u_proj")
+        add_spec_if_present(idx, "self_attn.v_proj", f"{base}.self_attn.v_v_proj", f"{base}.self_attn.v_u_proj")
+        add_spec_if_present(idx, "self_attn.o_proj", f"{base}.self_attn.o_v_proj", f"{base}.self_attn.o_u_proj")
+        add_spec_if_present(idx, "mlp.gate_proj", f"{base}.mlp.gate_v_proj", f"{base}.mlp.gate_u_proj")
+        add_spec_if_present(idx, "mlp.down_proj", f"{base}.mlp.down_v_proj", f"{base}.mlp.down_u_proj")
+        add_spec_if_present(idx, "mlp.up_proj", f"{base}.mlp.up_v_proj", f"{base}.mlp.up_u_proj")
+        add_spec_if_present(idx, "self_attn.q_proj", f"{base}.self_attn.q_proj", f"{base}.self_attn.q_proj")
+        add_spec_if_present(idx, "self_attn.k_proj", f"{base}.self_attn.k_proj", f"{base}.self_attn.k_proj")
+        add_spec_if_present(idx, "self_attn.v_proj", f"{base}.self_attn.v_proj", f"{base}.self_attn.v_proj")
+        add_spec_if_present(idx, "self_attn.o_proj", f"{base}.self_attn.o_proj", f"{base}.self_attn.o_proj")
+        add_spec_if_present(idx, "mlp.gate_proj", f"{base}.mlp.gate_proj", f"{base}.mlp.gate_proj")
+        add_spec_if_present(idx, "mlp.down_proj", f"{base}.mlp.down_proj", f"{base}.mlp.down_proj")
+        add_spec_if_present(idx, "mlp.up_proj", f"{base}.mlp.up_proj", f"{base}.mlp.up_proj")
+    return specs
+
+
+class _OnPolicyCovCollector:
+    def __init__(self, model, hook_specs, alpha_min, alpha_max, delta, device):
+        self.model = model
+        self.alpha_min = alpha_min
+        self.alpha_max = alpha_max
+        self.delta = delta
+        self.enabled = False
+        self.device = device
+        self.stats = {}
+        self.handles = []
+        for layer_idx, name, input_path, output_path in hook_specs:
+            input_module = model.get_submodule(input_path)
+            output_module = model.get_submodule(output_path)
+            key = (layer_idx, name)
+            self.stats[key] = {
+                "cov": torch.zeros(
+                    (input_module.in_features, input_module.in_features),
+                    dtype=torch.float32,
+                    device="cpu",
+                ),
+                "weight_sum": 0.0,
+                "last_input": None,
+                "last_grad": None,
+            }
+            self.handles.append(input_module.register_forward_pre_hook(self._make_input_hook(key)))
+            self.handles.append(output_module.register_full_backward_hook(self._make_grad_hook(key)))
+
+    def _make_input_hook(self, key):
+        def hook(module, inputs):
+            if self.enabled:
+                self.stats[key]["last_input"] = inputs[0].detach().float()
+        return hook
+
+    def _make_grad_hook(self, key):
+        def hook(module, grad_input, grad_output):
+            if not self.enabled:
+                return
+            grad = grad_output[0]
+            if grad is not None:
+                self.stats[key]["last_grad"] = grad.detach().float()
+        return hook
+
+    def consume_batch(self, generated_slice):
+        start, end = generated_slice
+        for stat in self.stats.values():
+            inputs = stat["last_input"]
+            grads = stat["last_grad"]
+            stat["last_input"] = None
+            stat["last_grad"] = None
+            if inputs is None or grads is None:
+                continue
+            inputs = inputs[:, start:end, :]
+            grads = grads[:, start:end, :]
+            if inputs.numel() == 0 or grads.numel() == 0:
+                continue
+            alpha = grads.pow(2).mean(dim=-1)
+            alpha = torch.clamp(alpha, min=self.alpha_min, max=self.alpha_max)
+            alpha_hat = alpha / (alpha.mean(dim=1, keepdim=True) + self.delta)
+            flat_inputs = inputs.reshape(-1, inputs.shape[-1])
+            flat_alpha = alpha_hat.reshape(-1, 1)
+            cov_add = flat_inputs.transpose(0, 1).matmul(flat_inputs * flat_alpha)
+            stat["cov"] += cov_add.cpu()
+            stat["weight_sum"] += alpha_hat.sum().item()
+            del inputs, grads, alpha, alpha_hat, flat_inputs, flat_alpha, cov_add
+
+    def close(self):
+        for handle in self.handles:
+            handle.remove()
+        self.handles = []
+
+
+def _sample_on_policy_sequences(model, prompts, rollout_len, generation_temperature, generation_top_p):
+    generated = prompts
+    for _ in range(rollout_len):
+        logits = model(generated, use_cache=False).logits[:, -1, :].float()
+        next_token = _sample_top_p(
+            logits,
+            temperature=generation_temperature,
+            top_p=generation_top_p,
+        )
+        generated = torch.cat((generated, next_token), dim=1)
+    return generated
+
+
+def _compute_reverse_kd_loss(student_logits, teacher_logits, prompt_len, kd_temperature):
+    if prompt_len <= 0:
+        raise ValueError("prompt_len must be positive")
+    student_slice = student_logits[:, prompt_len - 1 : -1, :].float()
+    teacher_slice = teacher_logits[:, prompt_len - 1 : -1, :].float()
+    student_log_prob = torch.log_softmax(student_slice / kd_temperature, dim=-1)
+    teacher_log_prob = torch.log_softmax(teacher_slice / kd_temperature, dim=-1)
+    return (kd_temperature ** 2) * torch.nn.functional.kl_div(
+        teacher_log_prob,
+        student_log_prob,
+        reduction="batchmean",
+        log_target=True,
+    )
+
+
+def _build_mixed_profile(off_profile, on_stats, rho, lambda0, dev):
+    mixed_profile = {}
+    total_layers = 0
+    active_layers = 0
+    for layer_idx, layer_profile in off_profile.items():
+        mixed_layer = {}
+        for name, chol in layer_profile.items():
+            total_layers += 1
+            chol = chol.float().to(dev)
+            off_cov = chol @ chol.transpose(0, 1)
+            stat = on_stats[(layer_idx, name)]
+            if stat["weight_sum"] > 0:
+                active_layers += 1
+                on_cov = stat["cov"].to(dev) / stat["weight_sum"]
+            else:
+                on_cov = off_cov.clone()
+            lambda_l = lambda0 * off_cov.trace().item() / max(off_cov.shape[0], 1)
+            mixed_cov = (1.0 - rho) * off_cov + rho * on_cov
+            mixed_cov = mixed_cov + lambda_l * torch.eye(off_cov.shape[0], dtype=torch.float32, device=dev)
+            mixed_layer[name] = _cholesky_with_jitter(mixed_cov, dev, dtype=torch.float64).cpu()
+        mixed_profile[layer_idx] = mixed_layer
+    log(
+        f"Built mixed whitening profile | active_layers={active_layers}/{total_layers} | "
+        f"rho={rho} | lambda0={lambda0}"
+    )
+    return mixed_profile
+
+
+@torch.no_grad()
+def build_prompt_batches(dataset_name, tokenizer, nsamples, prompt_len, seqlen, seed, batch_size):
+    if prompt_len <= 0 or prompt_len >= seqlen:
+        raise ValueError("prompt_len must be in [1, seqlen-1]")
+    log(
+        f"Loading on-policy prompt dataset | dataset={dataset_name} | nsamples={nsamples} | "
+        f"prompt_len={prompt_len} | seed={seed}"
+    )
+    prompt_samples = [
+        prompt.contiguous()
+        for prompt in get_prompt_loaders(
+            dataset_name,
+            nsamples=nsamples,
+            seed=seed,
+            tokenizer=tokenizer,
+            prompt_len=prompt_len,
+        )
+    ]
+    return list(_iter_tensor_batches(prompt_samples, batch_size))
+
+
+def on_policy_reverse_kd_guided_whitening(
+    model_name,
+    model,
+    tokenizer,
+    ratio,
+    dev,
+    offline_profile,
+    prompt_dataset,
+    prompt_nsamples,
+    prompt_len,
+    rollout_len,
+    kd_temperature=2.0,
+    generation_temperature=0.7,
+    generation_top_p=0.9,
+    rho=0.3,
+    alpha_min=0.1,
+    alpha_max=10.0,
+    alpha_delta=1e-6,
+    lambda0=1e-6,
+    rounds=1,
+    eval_batch_size=1,
+    seed=0,
+    init_scheme="uniform",
+):
+    if rounds <= 0:
+        raise ValueError("rounds must be positive")
+    if rollout_len <= 0:
+        raise ValueError("rollout_len must be positive")
+
+    model_name = model_name.lower()
+    model.eval()
+    model.config.use_cache = False
+    log(
+        f"Starting on-policy reverse-KD guided whitening | offline_profile_layers={len(offline_profile)} | "
+        f"prompt_dataset={prompt_dataset} | prompt_nsamples={prompt_nsamples} | prompt_len={prompt_len} | "
+        f"rollout_len={rollout_len} | rounds={rounds} | kd_temperature={kd_temperature} | "
+        f"generation_temperature={generation_temperature} | generation_top_p={generation_top_p}"
+    )
+    dense_paths = _build_replaced_module_paths(model_name, model)
+    dense_snapshot = _capture_module_snapshot(model, dense_paths)
+
+    log("Applying initial offline whitening profile to build the first student")
+    whitening(model_name, model, offline_profile, ratio, dev, init_scheme=init_scheme)
+    hook_specs = _build_low_rank_hook_specs(model_name, model)
+    log(f"Registered on-policy KD hook specs for {len(hook_specs)} low-rank projections")
+    log(f"Moving active student model to {dev} for on-policy collection")
+    model.to(dev)
+
+    for round_idx in range(rounds):
+        log(f"Start on-policy reverse-KD guided whitening round {round_idx + 1}/{rounds}")
+        student_snapshot = _capture_module_snapshot(model, dense_paths)
+        collector = _OnPolicyCovCollector(
+            model,
+            hook_specs,
+            alpha_min=alpha_min,
+            alpha_max=alpha_max,
+            delta=alpha_delta,
+            device=dev,
+        )
+        prompt_batches = build_prompt_batches(
+            prompt_dataset,
+            tokenizer,
+            nsamples=prompt_nsamples,
+            prompt_len=prompt_len,
+            seqlen=model.seqlen,
+            seed=seed + round_idx,
+            batch_size=eval_batch_size,
+        )
+        log(
+            f"Round {round_idx + 1}: prompt batches ready | batches={len(prompt_batches)} | "
+            f"batch_size={eval_batch_size}"
+        )
+
+        try:
+            running_loss = 0.0
+            for batch_idx, prompts in enumerate(tqdm(prompt_batches, desc="collecting on-policy reverse-kd covariances")):
+                prompts = prompts.to(dev)
+                model.zero_grad(set_to_none=True)
+                if batch_idx == 0:
+                    log(
+                        f"Round {round_idx + 1}: sampling on-policy rollouts on {dev} | "
+                        f"batch_size={prompts.shape[0]} | prompt_len={prompts.shape[1]} | rollout_len={rollout_len}"
+                    )
+                with torch.no_grad():
+                    sequences = _sample_on_policy_sequences(
+                        model,
+                        prompts,
+                        rollout_len=rollout_len,
+                        generation_temperature=generation_temperature,
+                        generation_top_p=generation_top_p,
+                    )
+                if batch_idx == 0:
+                    log(
+                        f"Round {round_idx + 1}: first rollout batch ready | "
+                        f"sequence_len={sequences.shape[1]}"
+                    )
+                collector.enabled = True
+                student_logits = model(sequences, use_cache=False).logits
+                _apply_module_snapshot(model, dense_snapshot, device=dev, offload_replaced_to_cpu=False)
+                with torch.no_grad():
+                    teacher_logits = model(sequences, use_cache=False).logits
+                _apply_module_snapshot(model, student_snapshot, device=dev, offload_replaced_to_cpu=False)
+                loss = _compute_reverse_kd_loss(
+                    student_logits,
+                    teacher_logits,
+                    prompt_len=prompt_len,
+                    kd_temperature=kd_temperature,
+                )
+                running_loss += loss.item()
+                loss.backward()
+                collector.consume_batch((prompt_len - 1, prompt_len - 1 + rollout_len))
+                collector.enabled = False
+                model.zero_grad(set_to_none=True)
+                if batch_idx == 0 or batch_idx == len(prompt_batches) - 1:
+                    log(
+                        f"Round {round_idx + 1}: processed prompt batch {batch_idx + 1}/{len(prompt_batches)} | "
+                        f"reverse_kd_loss={loss.item():.6f} | sequence_len={sequences.shape[1]}"
+                    )
+        finally:
+            collector.enabled = False
+            collector.close()
+            _apply_module_snapshot(model, student_snapshot, device=dev, offload_replaced_to_cpu=False)
+
+        active_stats = sum(1 for stat in collector.stats.values() if stat["weight_sum"] > 0)
+        total_weight = sum(stat["weight_sum"] for stat in collector.stats.values())
+        mean_loss = running_loss / max(len(prompt_batches), 1)
+        log(
+            f"Round {round_idx + 1}: collected on-policy stats | active_projections={active_stats}/{len(collector.stats)} | "
+            f"total_weight={total_weight:.4f} | mean_reverse_kd_loss={mean_loss:.6f}"
+        )
+        mixed_profile = _build_mixed_profile(
+            offline_profile,
+            collector.stats,
+            rho=rho,
+            lambda0=lambda0,
+            dev=dev,
+        )
+        _apply_module_snapshot(model, dense_snapshot, device=dev, offload_replaced_to_cpu=True)
+        log(f"Round {round_idx + 1}: recompressing from dense teacher weights with mixed whitening profile")
+        whitening(model_name, model, mixed_profile, ratio, dev, init_scheme=init_scheme)
+        model.to(dev)
+        log(f"Round {round_idx + 1}: recompression complete")
+
+    log("Finished on-policy reverse-KD guided whitening")
+    return model
 
 
 
@@ -270,8 +695,8 @@ def whitening(model_name, model, profiling_mat, ratio, dev, init_scheme="uniform
             svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio, init_scheme=init_scheme)
         #### Replace Attn, MLP ####
         for name in subset:
+            dtype = subset[name].weight.data.dtype
             W = subset[name].weight.data.float().to(dev)
-            dtype = W.dtype
             scaling_diag_matrix = profiling_mat[i][name].to(dev)
             try:
                 scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix)
@@ -621,6 +1046,20 @@ if __name__ == '__main__':
     parser.add_argument('--gen_seq_len', type=int, default=1024, help='generated sequence len for efficiency evaluation')
     parser.add_argument('--step', type=int, default=4, help='the step to run the compression')
     parser.add_argument('--lora', type=str, default=None, help='the lora updated weight path to run the accuracy evaluation')
+    parser.add_argument('--offline_dataset', type=str, default='c4', help='Offline covariance dataset for step 6.')
+    parser.add_argument('--on_policy_dataset', type=str, default='mix:evol-codealpaca,tulu-math', help='Prompt dataset used for on-policy reverse KD in step 6.')
+    parser.add_argument('--on_policy_prompt_len', type=int, default=128, help='Prompt length for on-policy reverse KD in step 6.')
+    parser.add_argument('--on_policy_rollout_len', type=int, default=64, help='Generated continuation length for on-policy reverse KD in step 6.')
+    parser.add_argument('--on_policy_prompt_nsamples', type=int, default=16, help='Number of prompt samples used for on-policy reverse KD in step 6.')
+    parser.add_argument('--on_policy_rounds', type=int, default=1, help='Number of reverse-KD-guided whitening rounds in step 6.')
+    parser.add_argument('--kd_temperature', type=float, default=2.0, help='Distillation temperature tau for reverse KD in step 6.')
+    parser.add_argument('--generation_temperature', type=float, default=0.7, help='Sampling temperature for student rollouts in step 6.')
+    parser.add_argument('--generation_top_p', type=float, default=0.9, help='Top-p sampling threshold for student rollouts in step 6.')
+    parser.add_argument('--cov_rho', type=float, default=0.3, help='Mixing weight rho for on-policy covariance in step 6.')
+    parser.add_argument('--alpha_min', type=float, default=0.1, help='Minimum token importance clamp for step 6.')
+    parser.add_argument('--alpha_max', type=float, default=10.0, help='Maximum token importance clamp for step 6.')
+    parser.add_argument('--alpha_delta', type=float, default=1e-6, help='Normalization epsilon for token importance in step 6.')
+    parser.add_argument('--lambda0', type=float, default=1e-6, help='Diagonal stabilization scale for mixed covariances in step 6.')
     parser.add_argument(
         '--init_scheme',
         type=str,
@@ -671,6 +1110,70 @@ if __name__ == '__main__':
         whitening_local_update(model_name=args.model, model=model, dataloader=dataloader, profiling_mat=None, ratio=args.ratio, dev=args.DEV, direct_update=True, init_scheme=args.init_scheme)
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_update_only_' + str(args.ratio) + '.pt')   # fp32
+    elif args.step == 6:
+        log(
+            f"Step 6 selected: on-policy reverse-KD guided whitening | model={args.model} | "
+            f"kept_ratio={1 - args.ratio:.4f} | compression_ratio={args.ratio:.4f} | device={args.DEV}"
+        )
+        log(
+            f"Offline calibration: dataset={args.offline_dataset} | nsamples={args.whitening_nsamples} | "
+            f"seq_len={args.model_seq_len}"
+        )
+        log(
+            f"On-policy KD prompts: dataset={args.on_policy_dataset} | prompt_nsamples={args.on_policy_prompt_nsamples} | "
+            f"prompt_len={args.on_policy_prompt_len} | rollout_len={args.on_policy_rollout_len}"
+        )
+        model, tokenizer = get_model_from_huggingface(model_id=args.model)
+        model = model.eval()
+        if args.profiling_mat_path is None:
+            log("No offline profiling matrix provided; collecting offline covariance profile now")
+            c4_white_data = get_calib_train_data(
+                args.offline_dataset,
+                tokenizer,
+                args.whitening_nsamples,
+                seqlen=args.model_seq_len,
+                seed=args.seed,
+            )
+            offline_profile = profle_svdllm_low_resource(
+                args.model, model, c4_white_data, args.DEV, profile_batch_size=args.profile_batch_size
+            )
+            log("Offline covariance profile collection complete")
+        else:
+            log(f"Loading offline profiling matrix from {args.profiling_mat_path}")
+            offline_profile = torch.load(args.profiling_mat_path)
+        on_policy_reverse_kd_guided_whitening(
+            model_name=args.model,
+            model=model,
+            tokenizer=tokenizer,
+            ratio=args.ratio,
+            dev=args.DEV,
+            offline_profile=offline_profile,
+            prompt_dataset=args.on_policy_dataset,
+            prompt_nsamples=args.on_policy_prompt_nsamples,
+            prompt_len=args.on_policy_prompt_len,
+            rollout_len=args.on_policy_rollout_len,
+            kd_temperature=args.kd_temperature,
+            generation_temperature=args.generation_temperature,
+            generation_top_p=args.generation_top_p,
+            rho=args.cov_rho,
+            alpha_min=args.alpha_min,
+            alpha_max=args.alpha_max,
+            alpha_delta=args.alpha_delta,
+            lambda0=args.lambda0,
+            rounds=args.on_policy_rounds,
+            eval_batch_size=args.eval_batch_size,
+            seed=args.seed,
+            init_scheme=args.init_scheme,
+        )
+        if args.save_path is not None:
+            output_path = (
+                args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_on_policy_reverse_kd_' + str(args.ratio) + '.pt'
+            )
+            log(f"Saving step 6 checkpoint to {output_path}")
+            torch.save(
+                {'model': model, 'tokenizer': tokenizer},
+                output_path
+            )
     elif args.step >= 4:
         print(f"evaluating {args.model_path}...")
         if args.model_path == "original":

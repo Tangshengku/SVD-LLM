@@ -10,6 +10,10 @@ parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(current_path)
 
 
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
 EVOL_CODEALPACA_DATASET = "theblackcat102/evol-codealpaca-v1"
 TULU_MATH_DATASET = "allenai/tulu-3-sft-personas-math"
 
@@ -171,6 +175,31 @@ def _sample_loader_from_texts(texts, nsamples, seed, seqlen, tokenizer):
     return trainloader
 
 
+def _sample_prompt_loader_from_texts(texts, nsamples, seed, prompt_len, tokenizer):
+    random.seed(seed)
+    prompt_loader = []
+    max_attempts = max(nsamples * 20, 100)
+    for _ in range(max_attempts):
+        if len(prompt_loader) >= nsamples:
+            break
+        text = texts[random.randint(0, len(texts) - 1)]
+        trainenc = tokenizer(text, return_tensors="pt")
+        if trainenc.input_ids.shape[1] < prompt_len:
+            continue
+        if trainenc.input_ids.shape[1] == prompt_len:
+            prompt_loader.append(trainenc.input_ids)
+            continue
+        i = random.randint(0, trainenc.input_ids.shape[1] - prompt_len - 1)
+        j = i + prompt_len
+        prompt_loader.append(trainenc.input_ids[:, i:j])
+    if len(prompt_loader) < nsamples:
+        raise ValueError(
+            f"Only built {len(prompt_loader)}/{nsamples} prompts with prompt_len={prompt_len}; "
+            "try lowering prompt_len or using a dataset with longer records."
+        )
+    return prompt_loader
+
+
 def _build_mixture_calibration_data(name, tokenizer, nsamples, seqlen, seed, batch_size, dataset_cache_dir=None):
     dataset_names = _split_mixture_dataset(name)
     counts = _allocate_mixture_counts(nsamples, len(dataset_names))
@@ -210,6 +239,43 @@ def _build_mixture_loader(name, nsamples, seed, seqlen, tokenizer, dataset_cache
             )
         )
     return trainloader
+
+
+def get_prompt_loaders(name, nsamples=128, seed=0, prompt_len=128, tokenizer=None, dataset_cache_dir=None):
+    if prompt_len <= 0:
+        raise ValueError("prompt_len must be positive")
+    if _is_mixture_dataset(name):
+        dataset_names = _split_mixture_dataset(name)
+        counts = _allocate_mixture_counts(nsamples, len(dataset_names))
+        prompt_loader = []
+        for idx, (dataset_name, count) in enumerate(zip(dataset_names, counts)):
+            if count <= 0:
+                continue
+            log(
+                f"Loading prompt source {idx + 1}/{len(dataset_names)} | "
+                f"dataset={dataset_name} | nsamples={count}"
+            )
+            prompt_loader.extend(
+                _sample_prompt_loader_from_texts(
+                    texts=_load_training_texts(dataset_name, dataset_cache_dir),
+                    nsamples=count,
+                    seed=seed + idx,
+                    prompt_len=prompt_len,
+                    tokenizer=tokenizer,
+                )
+            )
+            log(
+                f"Prompt source ready {idx + 1}/{len(dataset_names)} | "
+                f"dataset={dataset_name} | total_prompts={len(prompt_loader)}"
+            )
+        return prompt_loader
+    return _sample_prompt_loader_from_texts(
+        texts=_load_training_texts(name, dataset_cache_dir),
+        nsamples=nsamples,
+        seed=seed,
+        prompt_len=prompt_len,
+        tokenizer=tokenizer,
+    )
 
 def get_calib_train_data(name, tokenizer, nsamples, seqlen=2048, seed=3, batch_size=1, dataset_cache_dir=None):
     import random
@@ -386,6 +452,8 @@ def get_c4_new(nsamples, seed, seqlen, tokenizer):
 
     return trainloader, valenc
 def get_loaders(name, nsamples=128, seed=0, seqlen=2048, tokenizer=None):
+    if _is_mixture_dataset(name):
+        return _build_mixture_loader(name, nsamples, seed, seqlen, tokenizer), None
     if 'wikitext2' in name:
         return get_wikitext2(nsamples, seed, seqlen, tokenizer)
     if 'ptb' in name:
@@ -396,8 +464,6 @@ def get_loaders(name, nsamples=128, seed=0, seqlen=2048, tokenizer=None):
         if 'new' in name:
             return get_c4_new(nsamples, seed, seqlen, tokenizer)
         return get_c4(nsamples, seed, seqlen, tokenizer)
-    if _is_mixture_dataset(name):
-        return _build_mixture_loader(name, nsamples, seed, seqlen, tokenizer), None
     if _is_evol_codealpaca(name):
         return _sample_from_joined_training_texts(name, nsamples, seed, seqlen, tokenizer), None
     if _is_tulu_math(name):
