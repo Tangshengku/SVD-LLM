@@ -274,7 +274,7 @@ class _OnPolicyCovCollector:
         self.handles = []
 
 
-def _sample_on_policy_sequences(model, prompts, rollout_len, generation_temperature, generation_top_p):
+def _sample_on_policy_sequences_no_cache(model, prompts, rollout_len, generation_temperature, generation_top_p):
     generated = prompts
     for _ in range(rollout_len):
         logits = model(generated, use_cache=False).logits[:, -1, :].float()
@@ -285,6 +285,44 @@ def _sample_on_policy_sequences(model, prompts, rollout_len, generation_temperat
         )
         generated = torch.cat((generated, next_token), dim=1)
     return generated
+
+
+def _sample_on_policy_sequences(model, prompts, rollout_len, generation_temperature, generation_top_p, use_kv_cache=True):
+    if not use_kv_cache:
+        return _sample_on_policy_sequences_no_cache(
+            model,
+            prompts,
+            rollout_len=rollout_len,
+            generation_temperature=generation_temperature,
+            generation_top_p=generation_top_p,
+        )
+    generated = prompts
+    try:
+        outputs = model(prompts, use_cache=True)
+        past_key_values = outputs.past_key_values
+        logits = outputs.logits[:, -1, :].float()
+        for step_idx in range(rollout_len):
+            next_token = _sample_top_p(
+                logits,
+                temperature=generation_temperature,
+                top_p=generation_top_p,
+            )
+            generated = torch.cat((generated, next_token), dim=1)
+            if step_idx == rollout_len - 1:
+                break
+            outputs = model(next_token, past_key_values=past_key_values, use_cache=True)
+            past_key_values = outputs.past_key_values
+            logits = outputs.logits[:, -1, :].float()
+        return generated
+    except Exception as err:
+        log(f"KV-cache rollout failed ({type(err).__name__}: {err}); falling back to no-cache rollout")
+        return _sample_on_policy_sequences_no_cache(
+            model,
+            prompts,
+            rollout_len=rollout_len,
+            generation_temperature=generation_temperature,
+            generation_top_p=generation_top_p,
+        )
 
 
 def _compute_reverse_kd_loss(student_logits, teacher_logits, prompt_len, kd_temperature):
@@ -388,6 +426,7 @@ def on_policy_reverse_kd_guided_whitening(
     seed=0,
     init_scheme="uniform",
     gradient_whitening_mode="both",
+    use_on_policy_kv_cache=True,
 ):
     if rounds <= 0:
         raise ValueError("rounds must be positive")
@@ -451,7 +490,8 @@ def on_policy_reverse_kd_guided_whitening(
                 if batch_idx == 0:
                     log(
                         f"Round {round_idx + 1}: sampling on-policy rollouts on {dev} | "
-                        f"batch_size={prompts.shape[0]} | prompt_len={prompts.shape[1]} | rollout_len={rollout_len}"
+                        f"batch_size={prompts.shape[0]} | prompt_len={prompts.shape[1]} | "
+                        f"rollout_len={rollout_len} | kv_cache={use_on_policy_kv_cache}"
                     )
                 with torch.no_grad():
                     sequences = _sample_on_policy_sequences(
@@ -460,6 +500,7 @@ def on_policy_reverse_kd_guided_whitening(
                         rollout_len=rollout_len,
                         generation_temperature=generation_temperature,
                         generation_top_p=generation_top_p,
+                        use_kv_cache=use_on_policy_kv_cache,
                     )
                 if batch_idx == 0:
                     log(
@@ -1234,6 +1275,11 @@ if __name__ == '__main__':
     parser.add_argument('--kd_temperature', type=float, default=2.0, help='Distillation temperature tau for reverse KD in step 6.')
     parser.add_argument('--generation_temperature', type=float, default=0.7, help='Sampling temperature for student rollouts in step 6.')
     parser.add_argument('--generation_top_p', type=float, default=0.9, help='Top-p sampling threshold for student rollouts in step 6.')
+    parser.add_argument(
+        '--disable_on_policy_kv_cache',
+        action='store_true',
+        help='Disable KV-cache rollout generation in step 6 and use full-prefix recomputation.',
+    )
     parser.add_argument('--cov_rho', type=float, default=0.3, help='Mixing weight rho for on-policy covariance in step 6.')
     parser.add_argument('--alpha_min', type=float, default=0.1, help='Minimum token importance clamp for step 6.')
     parser.add_argument('--alpha_max', type=float, default=10.0, help='Maximum token importance clamp for step 6.')
@@ -1317,7 +1363,8 @@ if __name__ == '__main__':
         log(
             f"On-policy KD prompts: dataset={args.on_policy_dataset} | prompt_nsamples={args.on_policy_prompt_nsamples} | "
             f"prompt_len={args.on_policy_prompt_len} | rollout_len={args.on_policy_rollout_len} | "
-            f"gradient_whitening_mode={args.gradient_whitening_mode}"
+            f"gradient_whitening_mode={args.gradient_whitening_mode} | "
+            f"kv_cache={not args.disable_on_policy_kv_cache}"
         )
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
         model = model.eval()
@@ -1362,6 +1409,7 @@ if __name__ == '__main__':
             seed=args.seed,
             init_scheme=args.init_scheme,
             gradient_whitening_mode=args.gradient_whitening_mode,
+            use_on_policy_kv_cache=not args.disable_on_policy_kv_cache,
         )
         if args.save_path is not None:
             output_path = (
