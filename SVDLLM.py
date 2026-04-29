@@ -368,6 +368,7 @@ def on_policy_reverse_kd_guided_whitening(
     model,
     tokenizer,
     ratio,
+    warm_start_ratio,
     dev,
     offline_profile,
     prompt_dataset,
@@ -405,8 +406,13 @@ def on_policy_reverse_kd_guided_whitening(
     dense_paths = _build_replaced_module_paths(model_name, model)
     dense_snapshot = _capture_module_snapshot(model, dense_paths)
 
-    log("Applying initial offline whitening profile to build the first student")
-    whitening(model_name, model, offline_profile, ratio, dev, init_scheme=init_scheme)
+    if warm_start_ratio is None:
+        warm_start_ratio = ratio
+    log(
+        f"Applying initial offline whitening profile to build the first student | "
+        f"warm_start_internal_ratio={warm_start_ratio:.4f} | final_internal_ratio={ratio:.4f}"
+    )
+    whitening(model_name, model, offline_profile, warm_start_ratio, dev, init_scheme=init_scheme)
     hook_specs = _build_low_rank_hook_specs(model_name, model)
     log(f"Registered on-policy KD hook specs for {len(hook_specs)} low-rank projections")
     log(f"Moving active student model to {dev} for on-policy collection")
@@ -1214,6 +1220,12 @@ if __name__ == '__main__':
     parser.add_argument('--step', type=int, default=4, help='the step to run the compression')
     parser.add_argument('--lora', type=str, default=None, help='the lora updated weight path to run the accuracy evaluation')
     parser.add_argument('--offline_dataset', type=str, default='c4', help='Offline covariance dataset for step 6.')
+    parser.add_argument(
+        '--warm_start_ratio',
+        type=float,
+        default=None,
+        help='Optional step 6 warm-start compression ratio, using the same convention as --ratio. If omitted, warm start uses --ratio.',
+    )
     parser.add_argument('--on_policy_dataset', type=str, default='mix:evol-codealpaca,tulu-math', help='Prompt dataset used for on-policy reverse KD in step 6.')
     parser.add_argument('--on_policy_prompt_len', type=int, default=128, help='Prompt length for on-policy reverse KD in step 6.')
     parser.add_argument('--on_policy_rollout_len', type=int, default=64, help='Generated continuation length for on-policy reverse KD in step 6.')
@@ -1243,7 +1255,11 @@ if __name__ == '__main__':
     )
     
     args = parser.parse_args()
+    user_ratio = args.ratio
+    user_warm_start_ratio = args.warm_start_ratio
     args.ratio = 1- args.ratio
+    if args.warm_start_ratio is not None:
+        args.warm_start_ratio = 1 - args.warm_start_ratio
     if args.step == 1:
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
         model = model.eval()
@@ -1285,9 +1301,14 @@ if __name__ == '__main__':
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_update_only_' + str(args.ratio) + '.pt')   # fp32
     elif args.step == 6:
+        warm_start_log = (
+            f"{user_warm_start_ratio:.4f}"
+            if user_warm_start_ratio is not None
+            else f"{user_ratio:.4f} (same as --ratio)"
+        )
         log(
             f"Step 6 selected: on-policy reverse-KD guided whitening | model={args.model} | "
-            f"kept_ratio={1 - args.ratio:.4f} | compression_ratio={args.ratio:.4f} | device={args.DEV}"
+            f"final_ratio_arg={user_ratio:.4f} | warm_start_ratio_arg={warm_start_log} | device={args.DEV}"
         )
         log(
             f"Offline calibration: dataset={args.offline_dataset} | nsamples={args.whitening_nsamples} | "
@@ -1321,6 +1342,7 @@ if __name__ == '__main__':
             model=model,
             tokenizer=tokenizer,
             ratio=args.ratio,
+            warm_start_ratio=args.warm_start_ratio,
             dev=args.DEV,
             offline_profile=offline_profile,
             prompt_dataset=args.on_policy_dataset,
