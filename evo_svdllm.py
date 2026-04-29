@@ -1158,6 +1158,12 @@ def parse_args():
         help="Gradient-whitening mode used by --init_parent_method on_policy_gradient.",
     )
     parser.add_argument(
+        "--init_parent_warm_start_ratio",
+        type=float,
+        default=None,
+        help="Optional compression ratio for the warm-start student used to collect on-policy gradients. Uses the same convention as --ratio. If omitted, uses --ratio.",
+    )
+    parser.add_argument(
         "--init_parent_lambda0",
         type=float,
         default=1e-6,
@@ -1185,6 +1191,8 @@ def main():
         raise ValueError("--rerank_topk_on_policy must be non-negative")
     if args.rerank_on_policy_weight < 0:
         raise ValueError("--rerank_on_policy_weight must be non-negative")
+    if args.init_parent_warm_start_ratio is not None and not (0.0 <= args.init_parent_warm_start_ratio < 1.0):
+        raise ValueError("--init_parent_warm_start_ratio must be in [0, 1)")
     if args.fitness_fn == "on_policy_kl" and args.rerank_topk_on_policy > 0:
         log(
             "Direct on-policy KL mode selected via --fitness_fn on_policy_kl; "
@@ -1300,8 +1308,20 @@ def main():
             f"eval_every={args.on_policy_eval_every}"
         )
     if args.init_parent_method == "on_policy_gradient":
-        log("Applying standard initial parent as warm-start student for on-policy gradient source collection")
-        apply_genome(model, spaces, parent)
+        warm_start_parent = parent
+        warm_start_budget = budget
+        if args.init_parent_warm_start_ratio is not None:
+            warm_start_budget = int((1.0 - args.init_parent_warm_start_ratio) * total_dense_params)
+            warm_start_ranks = initialize_ranks(spaces, warm_start_budget, args.init_strategy)
+            warm_start_parent = build_topk_genome(spaces, warm_start_ranks)
+            repair_budget(warm_start_parent, spaces, warm_start_budget)
+        log(
+            "Applying warm-start parent as student for on-policy gradient source collection | "
+            f"warm_start_ratio={args.init_parent_warm_start_ratio if args.init_parent_warm_start_ratio is not None else args.ratio:.4f} | "
+            f"warm_start_kept_params={total_cost(spaces, warm_start_parent['ranks'])}/{warm_start_budget} | "
+            f"final_kept_params={total_cost(spaces, parent['ranks'])}/{budget}"
+        )
+        apply_genome(model, spaces, warm_start_parent)
         add_on_policy_gradient_parent_source(
             model,
             spaces,

@@ -427,11 +427,14 @@ def on_policy_reverse_kd_guided_whitening(
     init_scheme="uniform",
     gradient_whitening_mode="both",
     use_on_policy_kv_cache=True,
+    on_policy_layer_tail_ratio=1.0,
 ):
     if rounds <= 0:
         raise ValueError("rounds must be positive")
     if rollout_len <= 0:
         raise ValueError("rollout_len must be positive")
+    if not (0.0 <= on_policy_layer_tail_ratio <= 1.0):
+        raise ValueError("on_policy_layer_tail_ratio must be in [0, 1]")
 
     model_name = model_name.lower()
     model.eval()
@@ -452,8 +455,22 @@ def on_policy_reverse_kd_guided_whitening(
         f"warm_start_internal_ratio={warm_start_ratio:.4f} | final_internal_ratio={ratio:.4f}"
     )
     whitening(model_name, model, offline_profile, warm_start_ratio, dev, init_scheme=init_scheme)
-    hook_specs = _build_low_rank_hook_specs(model_name, model)
-    log(f"Registered on-policy KD hook specs for {len(hook_specs)} low-rank projections")
+    if "opt" in model_name:
+        layer_count = len(model.model.decoder.layers)
+    else:
+        layer_count = len(model.model.layers)
+    on_policy_layer_count = math.ceil(layer_count * on_policy_layer_tail_ratio)
+    on_policy_layer_start = layer_count - on_policy_layer_count
+    hook_specs = [
+        spec for spec in _build_low_rank_hook_specs(model_name, model)
+        if spec[0] >= on_policy_layer_start
+    ]
+    log(
+        f"Registered on-policy KD hook specs for {len(hook_specs)} low-rank projections | "
+        f"tail_layer_ratio={on_policy_layer_tail_ratio:.4f} | "
+        f"gradient_layers={on_policy_layer_count}/{layer_count} | "
+        f"first_gradient_layer={on_policy_layer_start if on_policy_layer_count > 0 else 'none'}"
+    )
     log(f"Moving active student model to {dev} for on-policy collection")
     model.to(dev)
 
@@ -548,8 +565,20 @@ def on_policy_reverse_kd_guided_whitening(
             whitening_mode=gradient_whitening_mode,
         )
         _apply_module_snapshot(model, dense_snapshot, device=dev, offload_replaced_to_cpu=True)
-        log(f"Round {round_idx + 1}: recompressing from dense teacher weights with bi-sided gradient whitening profile")
-        gradient_whitening(model_name, model, gradient_profile, ratio, dev, init_scheme=init_scheme)
+        log(
+            f"Round {round_idx + 1}: recompressing from dense teacher weights | "
+            f"gradient tail layers={on_policy_layer_count}/{layer_count}; earlier layers use offline whitening"
+        )
+        gradient_whitening(
+            model_name,
+            model,
+            gradient_profile,
+            ratio,
+            dev,
+            init_scheme=init_scheme,
+            offline_profile=offline_profile,
+            gradient_layer_start=on_policy_layer_start,
+        )
         model.to(dev)
         log(f"Round {round_idx + 1}: recompression complete")
 
@@ -928,14 +957,23 @@ def whitening(model_name, model, profiling_mat, ratio, dev, init_scheme="uniform
 
 
 @torch.no_grad()
-def gradient_whitening(model_name, model, gradient_profile, ratio, dev, init_scheme="uniform"):
+def gradient_whitening(
+    model_name,
+    model,
+    gradient_profile,
+    ratio,
+    dev,
+    init_scheme="uniform",
+    offline_profile=None,
+    gradient_layer_start=0,
+):
     model_name = model_name.lower()
     model.eval()
     if 'opt' in model_name:
         layers = model.model.decoder.layers
     else:
         layers = model.model.layers
-    print("Start bi-sided gradient-whitened SVD decomposition...")
+    print("Start hybrid gradient/offline-whitened SVD decomposition...")
     for i in tqdm(range(len(layers))):
         layer = layers[i]
         subset = find_layers(layer)
@@ -964,24 +1002,46 @@ def gradient_whitening(model_name, model, gradient_profile, ratio, dev, init_sch
         for name in subset:
             dtype = subset[name].weight.data.dtype
             W = subset[name].weight.data.float().to(dev)
-            factors = gradient_profile[i][name]
-            input_factor = factors["x"].float().to(dev)
-            grad_factor = factors["g"].float().to(dev)
-            W_scale = grad_factor.transpose(0, 1).matmul(W).matmul(input_factor)
-            U, S, VT = torch.linalg.svd(W_scale, full_matrices=False)
             num_s_after_trunc = int(W.shape[0] * W.shape[1] * ratio / (W.shape[0] + W.shape[1]))
-            truc_s = S[:num_s_after_trunc]
-            sqrt_s = torch.sqrt(truc_s)
-            left = U[:, :num_s_after_trunc] * sqrt_s.unsqueeze(0)
-            right = sqrt_s.unsqueeze(1) * VT[:num_s_after_trunc, :]
-            svd_u = torch.linalg.solve(
-                grad_factor.transpose(0, 1),
-                left,
-            ).cpu().to(dtype)
-            svd_v = torch.linalg.solve(
-                input_factor.transpose(0, 1),
-                right.transpose(0, 1),
-            ).transpose(0, 1).cpu().to(dtype)
+            if i >= gradient_layer_start:
+                factors = gradient_profile[i][name]
+                input_factor = factors["x"].float().to(dev)
+                grad_factor = factors["g"].float().to(dev)
+                W_scale = grad_factor.transpose(0, 1).matmul(W).matmul(input_factor)
+                U, S, VT = torch.linalg.svd(W_scale, full_matrices=False)
+                truc_s = S[:num_s_after_trunc]
+                sqrt_s = torch.sqrt(truc_s)
+                left = U[:, :num_s_after_trunc] * sqrt_s.unsqueeze(0)
+                right = sqrt_s.unsqueeze(1) * VT[:num_s_after_trunc, :]
+                svd_u = torch.linalg.solve(
+                    grad_factor.transpose(0, 1),
+                    left,
+                ).cpu().to(dtype)
+                svd_v = torch.linalg.solve(
+                    input_factor.transpose(0, 1),
+                    right.transpose(0, 1),
+                ).transpose(0, 1).cpu().to(dtype)
+                del input_factor, grad_factor, left, right
+            else:
+                if offline_profile is None:
+                    raise ValueError("offline_profile is required when gradient_layer_start excludes early layers")
+                scaling_diag_matrix = offline_profile[i][name].to(dev)
+                try:
+                    scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix)
+                except Exception:
+                    scaling_diag_matrix += 1e-6 * torch.eye(scaling_diag_matrix.shape[0]).to(dev)
+                    scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix)
+                scaling_diag_matrix = scaling_diag_matrix.float()
+                scaling_matrix_inv = scaling_matrix_inv.float()
+                W_scale = torch.matmul(W, scaling_diag_matrix)
+                U, S, VT = torch.linalg.svd(W_scale, full_matrices=False)
+                truc_s = S[:num_s_after_trunc]
+                sqrt_s = torch.sqrt(truc_s)
+                svd_u = (U[:, :num_s_after_trunc] * sqrt_s.unsqueeze(0)).cpu().to(dtype)
+                svd_v = (
+                    sqrt_s.unsqueeze(1) * torch.matmul(VT[:num_s_after_trunc, :], scaling_matrix_inv)
+                ).cpu().to(dtype)
+                del scaling_diag_matrix, scaling_matrix_inv
             _assign_low_rank_weights(
                 model_name,
                 layer,
@@ -992,7 +1052,7 @@ def gradient_whitening(model_name, model, gradient_profile, ratio, dev, init_sch
                 svd_mlp=svd_mlp if 'opt' not in model_name else None,
                 svd_decoder=svd_decoder if 'opt' in model_name else None,
             )
-            del W, input_factor, grad_factor, W_scale, U, S, VT, truc_s, sqrt_s, left, right, svd_u, svd_v
+            del W, W_scale, U, S, VT, truc_s, sqrt_s, svd_u, svd_v
             torch.cuda.empty_cache()
         if 'opt' in model_name:
             layers[i] = svd_decoder
@@ -1293,6 +1353,12 @@ if __name__ == '__main__':
         help='Step 6 whitening metric: both uses input and output-gradient covariances; grad_only uses output-gradient covariance with identity input metric.',
     )
     parser.add_argument(
+        '--on_policy_layer_tail_ratio',
+        type=float,
+        default=1.0,
+        help='Fraction of final transformer layers that use on-policy gradient whitening in step 6. Earlier layers use the original offline whitening profile.',
+    )
+    parser.add_argument(
         '--init_scheme',
         type=str,
         default='uniform',
@@ -1306,6 +1372,8 @@ if __name__ == '__main__':
     args.ratio = 1- args.ratio
     if args.warm_start_ratio is not None:
         args.warm_start_ratio = 1 - args.warm_start_ratio
+    if not (0.0 <= args.on_policy_layer_tail_ratio <= 1.0):
+        raise ValueError("--on_policy_layer_tail_ratio must be in [0, 1]")
     if args.step == 1:
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
         model = model.eval()
@@ -1364,7 +1432,8 @@ if __name__ == '__main__':
             f"On-policy KD prompts: dataset={args.on_policy_dataset} | prompt_nsamples={args.on_policy_prompt_nsamples} | "
             f"prompt_len={args.on_policy_prompt_len} | rollout_len={args.on_policy_rollout_len} | "
             f"gradient_whitening_mode={args.gradient_whitening_mode} | "
-            f"kv_cache={not args.disable_on_policy_kv_cache}"
+            f"kv_cache={not args.disable_on_policy_kv_cache} | "
+            f"tail_layer_ratio={args.on_policy_layer_tail_ratio}"
         )
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
         model = model.eval()
@@ -1410,6 +1479,7 @@ if __name__ == '__main__':
             init_scheme=args.init_scheme,
             gradient_whitening_mode=args.gradient_whitening_mode,
             use_on_policy_kv_cache=not args.disable_on_policy_kv_cache,
+            on_policy_layer_tail_ratio=args.on_policy_layer_tail_ratio,
         )
         if args.save_path is not None:
             output_path = (
