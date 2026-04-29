@@ -13,7 +13,14 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from SVDLLM import profle_svdllm_low_resource
+from SVDLLM import (
+    _OnPolicyCovCollector,
+    _build_gradient_whitening_profile,
+    _compute_reverse_kd_loss,
+    _forward_kd_logits,
+    _sample_on_policy_sequences,
+    profle_svdllm_low_resource,
+)
 from component.low_rank_linear import LowRankLinear, ZeroLinear
 from utils.data_utils import get_calib_train_data, get_loaders
 from utils.model_utils import find_layers, get_model_from_huggingface
@@ -352,6 +359,20 @@ def build_topk_genome(spaces: Sequence[WeightSearchSpace], ranks: Sequence[int])
     }
 
 
+def set_genome_source(genome: Dict[str, List[List[int]]], spaces: Sequence[WeightSearchSpace], source_name: str) -> None:
+    for idx, space in enumerate(spaces):
+        if source_name not in space.source_names:
+            raise ValueError(f"Source {source_name} is not available for {space.name}")
+        source_idx = space.source_names.index(source_name)
+        genome["sources"][idx] = source_idx
+        genome["selected"][idx] = normalize_selection(
+            space,
+            source_idx,
+            genome["ranks"][idx],
+            genome["selected"][idx],
+        )
+
+
 def boundary_candidates(space: WeightSearchSpace, rank: int) -> List[int]:
     if rank == 0:
         return []
@@ -584,6 +605,136 @@ def _make_module(space: WeightSearchSpace, source_idx: int, rank: int, selected:
         )
     return module.to(device=space.device, dtype=space.dtype)
 
+
+def _build_evo_hook_specs(spaces: Sequence[WeightSearchSpace]) -> List[Tuple[int, str, str, str]]:
+    return [(idx, space.name, space.name, space.name) for idx, space in enumerate(spaces)]
+
+
+@torch.no_grad()
+def _append_gradient_source_to_spaces(
+    spaces: Sequence[WeightSearchSpace],
+    dense_modules: Sequence[nn.Module],
+    gradient_profile: Dict[int, Dict[str, Dict[str, torch.Tensor]]],
+    source_name: str,
+    device: str,
+) -> None:
+    if not spaces:
+        return
+    if source_name in spaces[0].source_names:
+        raise ValueError(f"Source {source_name} already exists in search spaces")
+    log(f"Appending gradient-whitened source '{source_name}' to {len(spaces)} search spaces")
+    for idx, (space, dense_module) in enumerate(tqdm(zip(spaces, dense_modules), total=len(spaces), desc="Adding gradient source")):
+        weight = dense_module.weight.detach().float().to(device)
+        factors = gradient_profile[idx][space.name]
+        input_factor = factors["x"].float().to(device)
+        grad_factor = factors["g"].float().to(device)
+        transformed = grad_factor.transpose(0, 1).matmul(weight).matmul(input_factor)
+        u, s, vt = torch.linalg.svd(transformed, full_matrices=False)
+        left = torch.linalg.solve(grad_factor.transpose(0, 1), u)
+        right = torch.linalg.solve(input_factor.transpose(0, 1), vt.transpose(0, 1)).transpose(0, 1)
+        space.source_names.append(source_name)
+        space.singular_values_sq_by_source.append((s.cpu() ** 2))
+        space.left_u_by_source.append(left.cpu())
+        space.right_v_by_source.append(right.cpu())
+        del weight, input_factor, grad_factor, transformed, u, s, vt, left, right
+        torch.cuda.empty_cache()
+
+
+def add_on_policy_gradient_parent_source(
+    model,
+    spaces: Sequence[WeightSearchSpace],
+    parent: Dict[str, List[List[int]]],
+    dense_modules: Sequence[nn.Module],
+    prompts: Sequence[torch.Tensor],
+    device: str,
+    rollout_len: int,
+    temperature: float,
+    eval_batch_size: int,
+    lambda0: float,
+    whitening_mode: str,
+    use_kv_cache: bool,
+    slice_kd_lm_head: bool,
+    source_name: str = "on_policy_grad",
+) -> str:
+    if not prompts:
+        raise ValueError("on-policy gradient parent initialization requires non-empty prompts")
+    prompt_len = prompts[0].shape[1]
+    hook_specs = _build_evo_hook_specs(spaces)
+    collector = _OnPolicyCovCollector(
+        model,
+        hook_specs,
+        alpha_min=0.0,
+        alpha_max=float("inf"),
+        delta=1e-6,
+        device=device,
+    )
+    prompt_chunks = _iter_minibatches(prompts, eval_batch_size)
+    parent_modules = capture_current_modules(model, spaces)
+    log(
+        f"Collecting on-policy gradient source for initial parent | prompts={len(prompts)} | "
+        f"batches={len(prompt_chunks)} | prompt_len={prompt_len} | rollout_len={rollout_len} | "
+        f"whitening_mode={whitening_mode}"
+    )
+    try:
+        for batch_idx, prompt_chunk in enumerate(tqdm(prompt_chunks, desc="collecting parent on-policy gradients")):
+            prompts_device = prompt_chunk.to(device)
+            model.zero_grad(set_to_none=True)
+            with torch.no_grad():
+                sequences = _sample_on_policy_sequences(
+                    model,
+                    prompts_device,
+                    rollout_len=rollout_len,
+                    generation_temperature=temperature,
+                    generation_top_p=1.0,
+                    use_kv_cache=use_kv_cache,
+                )
+            collector.enabled = True
+            student_logits = _forward_kd_logits(
+                model,
+                sequences,
+                prompt_len,
+                rollout_len,
+                slice_lm_head=slice_kd_lm_head,
+            )
+            apply_dense_modules(model, spaces, dense_modules)
+            with torch.no_grad():
+                teacher_logits = _forward_kd_logits(
+                    model,
+                    sequences,
+                    prompt_len,
+                    rollout_len,
+                    slice_lm_head=slice_kd_lm_head,
+                )
+            apply_dense_modules(model, spaces, parent_modules)
+            loss = _compute_reverse_kd_loss(
+                student_logits,
+                teacher_logits,
+                kd_temperature=1.0,
+            )
+            loss.backward()
+            collector.consume_batch((prompt_len - 1, prompt_len - 1 + rollout_len))
+            collector.enabled = False
+            model.zero_grad(set_to_none=True)
+            if batch_idx == 0 or batch_idx == len(prompt_chunks) - 1:
+                log(
+                    f"Collected parent gradient batch {batch_idx + 1}/{len(prompt_chunks)} | "
+                    f"reverse_kl={loss.item():.6f} | sequence_len={sequences.shape[1]}"
+                )
+    finally:
+        collector.enabled = False
+        collector.close()
+        apply_dense_modules(model, spaces, parent_modules)
+    gradient_profile = _build_gradient_whitening_profile(
+        collector.stats,
+        lambda0=lambda0,
+        dev=device,
+        whitening_mode=whitening_mode,
+    )
+    _append_gradient_source_to_spaces(spaces, dense_modules, gradient_profile, source_name, device)
+    set_genome_source(parent, spaces, source_name)
+    apply_dense_modules(model, spaces, dense_modules)
+    log(f"Initial parent switched to on-policy gradient source '{source_name}'")
+    return source_name
 
 @torch.no_grad()
 def apply_genome(model, spaces: Sequence[WeightSearchSpace], genome: Dict[str, List[List[int]]]) -> None:
@@ -994,6 +1145,34 @@ def parse_args():
         default="greedy",
         help="Initial rank-allocation strategy for the first genome.",
     )
+    parser.add_argument(
+        "--init_parent_method",
+        choices=["standard", "on_policy_gradient"],
+        default="standard",
+        help="How to choose the initial parent source. on_policy_gradient collects step-6-style gradient whitening stats from the standard warm-start parent and uses that as the initial source.",
+    )
+    parser.add_argument(
+        "--init_parent_gradient_mode",
+        choices=["both", "grad_only"],
+        default="both",
+        help="Gradient-whitening mode used by --init_parent_method on_policy_gradient.",
+    )
+    parser.add_argument(
+        "--init_parent_lambda0",
+        type=float,
+        default=1e-6,
+        help="Diagonal stabilization scale for on-policy gradient parent initialization.",
+    )
+    parser.add_argument(
+        "--disable_init_parent_kv_cache",
+        action="store_true",
+        help="Disable KV-cache rollout generation during on-policy gradient parent initialization.",
+    )
+    parser.add_argument(
+        "--disable_init_parent_lm_head_slicing",
+        action="store_true",
+        help="Disable sliced lm_head logits during on-policy gradient parent initialization.",
+    )
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
     parser.add_argument("--DEV", type=str, default="cuda", help="Search device.")
     parser.add_argument("--eval_batch_size", type=int, default=4, help="Mini-batch size for fitness forward passes.")
@@ -1108,12 +1287,41 @@ def main():
     total_search_tokens = sum(batch.numel() for batch in search_batches)
     log(f"Search batches ready | batches={len(search_batches)} | tokens={total_search_tokens}")
     on_policy_batches = None
-    if args.fitness_fn == "on_policy_kl" or rerank_enabled:
+    needs_on_policy_batches = (
+        args.fitness_fn == "on_policy_kl"
+        or rerank_enabled
+        or args.init_parent_method == "on_policy_gradient"
+    )
+    if needs_on_policy_batches:
         on_policy_batches = build_on_policy_prompts(search_batches, args.on_policy_prompt_len)
         log(
             f"On-policy KL prompts ready | prompts={len(on_policy_batches)} | "
             f"prompt_len={args.on_policy_prompt_len} | rollout_len={args.on_policy_rollout_len} | "
             f"eval_every={args.on_policy_eval_every}"
+        )
+    if args.init_parent_method == "on_policy_gradient":
+        log("Applying standard initial parent as warm-start student for on-policy gradient source collection")
+        apply_genome(model, spaces, parent)
+        add_on_policy_gradient_parent_source(
+            model,
+            spaces,
+            parent,
+            dense_modules,
+            on_policy_batches,
+            args.DEV,
+            rollout_len=args.on_policy_rollout_len,
+            temperature=args.on_policy_temperature,
+            eval_batch_size=args.eval_batch_size,
+            lambda0=args.init_parent_lambda0,
+            whitening_mode=args.init_parent_gradient_mode,
+            use_kv_cache=not args.disable_init_parent_kv_cache,
+            slice_kd_lm_head=not args.disable_init_parent_lm_head_slicing,
+            source_name="on_policy_grad",
+        )
+        log(
+            f"On-policy gradient initial parent prepared | "
+            f"kept_params={total_cost(spaces, parent['ranks'])} | "
+            f"default_source={spaces[0].source_names[parent['sources'][0]] if spaces else 'n/a'}"
         )
     bulk_fitness_batches = on_policy_batches if bulk_fitness_fn == "on_policy_kl" else search_batches
     teacher_logits = None
