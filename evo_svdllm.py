@@ -168,6 +168,15 @@ def space_layer_idx(space: WeightSearchSpace) -> Optional[int]:
     return None
 
 
+def space_local_name(space: WeightSearchSpace) -> str:
+    parts = space.name.split(".")
+    if "layers" in parts:
+        pos = parts.index("layers")
+        if pos + 2 < len(parts):
+            return ".".join(parts[pos + 2 :])
+    return space.name.rsplit(".", 1)[-1]
+
+
 def classify_group(weight_name: str) -> str:
     if any(token in weight_name for token in ["q_proj", "k_proj", "v_proj", "o_proj", "out_proj"]):
         return "attn"
@@ -752,11 +761,30 @@ def _append_gradient_source_to_spaces(
         torch.cuda.empty_cache()
 
 
+def _build_tail_offline_input_profile(
+    spaces: Sequence[WeightSearchSpace],
+    parent: Dict[str, List[List[int]]],
+    profiling_mats: Dict[str, Dict[int, Dict[str, torch.Tensor]]],
+) -> Dict[int, Dict[str, Dict[str, torch.Tensor]]]:
+    profile = {}
+    for local_idx, space in enumerate(spaces):
+        source_name = space.source_names[parent["sources"][local_idx]]
+        layer_idx = space_layer_idx(space)
+        if layer_idx is None:
+            raise ValueError(f"Cannot infer transformer layer index from {space.name}")
+        local_name = space_local_name(space)
+        profile.setdefault(local_idx, {})[space.name] = {
+            "x": profiling_mats[source_name][layer_idx][local_name].float().cpu()
+        }
+    return profile
+
+
 def add_on_policy_gradient_parent_source(
     model,
     spaces: Sequence[WeightSearchSpace],
     parent: Dict[str, List[List[int]]],
     dense_modules: Sequence[nn.Module],
+    profiling_mats: Dict[str, Dict[int, Dict[str, torch.Tensor]]],
     prompts: Sequence[torch.Tensor],
     device: str,
     rollout_len: int,
@@ -767,8 +795,11 @@ def add_on_policy_gradient_parent_source(
     use_kv_cache: bool,
     slice_kd_lm_head: bool,
     layer_tail_ratio: float,
+    input_covariance_source: str,
     source_name: str = "on_policy_grad",
 ) -> str:
+    if input_covariance_source not in {"on_policy", "offline"}:
+        raise ValueError("input_covariance_source must be one of: on_policy, offline")
     if not prompts:
         raise ValueError("on-policy gradient parent initialization requires non-empty prompts")
     tail_indices = select_tail_layer_space_indices(spaces, layer_tail_ratio)
@@ -777,6 +808,11 @@ def add_on_policy_gradient_parent_source(
         return source_name
     tail_spaces = [spaces[idx] for idx in tail_indices]
     tail_dense_modules = [dense_modules[idx] for idx in tail_indices]
+    tail_parent = {
+        "ranks": [parent["ranks"][idx] for idx in tail_indices],
+        "selected": [list(parent["selected"][idx]) for idx in tail_indices],
+        "sources": [parent["sources"][idx] for idx in tail_indices],
+    }
     prompt_len = prompts[0].shape[1]
     hook_specs = _build_evo_hook_specs(tail_spaces)
     collector = _OnPolicyCovCollector(
@@ -793,7 +829,8 @@ def add_on_policy_gradient_parent_source(
         f"Collecting on-policy gradient source for initial parent | prompts={len(prompts)} | "
         f"batches={len(prompt_chunks)} | prompt_len={prompt_len} | rollout_len={rollout_len} | "
         f"whitening_mode={whitening_mode} | tail_layer_ratio={layer_tail_ratio:.4f} | "
-        f"tail_weights={len(tail_spaces)}/{len(spaces)}"
+        f"tail_weights={len(tail_spaces)}/{len(spaces)} | "
+        f"input_covariance_source={input_covariance_source}"
     )
     try:
         for batch_idx, prompt_chunk in enumerate(tqdm(prompt_chunks, desc="collecting parent on-policy gradients")):
@@ -844,11 +881,15 @@ def add_on_policy_gradient_parent_source(
         collector.enabled = False
         collector.close()
         apply_dense_modules(model, spaces, parent_modules)
+    offline_profile = None
+    if input_covariance_source == "offline" and whitening_mode == "both":
+        offline_profile = _build_tail_offline_input_profile(tail_spaces, tail_parent, profiling_mats)
     gradient_profile = _build_gradient_whitening_profile(
         collector.stats,
         lambda0=lambda0,
         dev=device,
         whitening_mode=whitening_mode,
+        offline_profile=offline_profile,
     )
     _append_gradient_source_to_spaces(tail_spaces, tail_dense_modules, gradient_profile, source_name, device)
     for idx in tail_indices:
@@ -1363,6 +1404,12 @@ def parse_args():
         help="Gradient-whitening mode used by --init_parent_method on_policy_gradient.",
     )
     parser.add_argument(
+        "--init_parent_input_covariance_source",
+        choices=["on_policy", "offline"],
+        default="on_policy",
+        help="Input covariance source for --init_parent_method on_policy_gradient when --init_parent_gradient_mode both is used.",
+    )
+    parser.add_argument(
         "--init_parent_warm_start_ratio",
         type=float,
         default=None,
@@ -1564,6 +1611,7 @@ def main():
             spaces,
             parent,
             dense_modules,
+            profiling_mats,
             init_parent_prompts,
             args.DEV,
             rollout_len=args.on_policy_rollout_len,
@@ -1574,6 +1622,7 @@ def main():
             use_kv_cache=not args.disable_init_parent_kv_cache,
             slice_kd_lm_head=not args.disable_init_parent_lm_head_slicing,
             layer_tail_ratio=args.init_parent_on_policy_layer_tail_ratio,
+            input_covariance_source=args.init_parent_input_covariance_source,
             source_name="on_policy_grad",
         )
         log(
