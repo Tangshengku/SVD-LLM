@@ -340,7 +340,7 @@ def _compute_reverse_kd_loss(student_logits, teacher_logits, prompt_len, kd_temp
     )
 
 
-def _build_gradient_whitening_profile(on_stats, lambda0, dev, whitening_mode="both"):
+def _build_gradient_whitening_profile(on_stats, lambda0, dev, whitening_mode="both", offline_profile=None):
     if whitening_mode not in {"both", "grad_only"}:
         raise ValueError("whitening_mode must be one of: both, grad_only")
     profile = {}
@@ -351,7 +351,15 @@ def _build_gradient_whitening_profile(on_stats, lambda0, dev, whitening_mode="bo
         layer_profile = profile.setdefault(layer_idx, {})
         if stat["count"] <= 0:
             layer_profile[name] = {
-                "x": torch.eye(stat["cov_x"].shape[0], dtype=torch.float32),
+                "x": (
+                    torch.eye(stat["cov_x"].shape[0], dtype=torch.float32)
+                    if whitening_mode == "grad_only"
+                    else (
+                        offline_profile[layer_idx][name].float().cpu()
+                        if offline_profile is not None
+                        else torch.eye(stat["cov_x"].shape[0], dtype=torch.float32)
+                    )
+                ),
                 "g": torch.eye(stat["cov_g"].shape[0], dtype=torch.float32),
             }
             continue
@@ -361,6 +369,8 @@ def _build_gradient_whitening_profile(on_stats, lambda0, dev, whitening_mode="bo
         cov_g = cov_g + eps_g * torch.eye(cov_g.shape[0], dtype=torch.float32, device=dev)
         if whitening_mode == "grad_only":
             x_factor = torch.eye(stat["cov_x"].shape[0], dtype=torch.float32)
+        elif offline_profile is not None:
+            x_factor = offline_profile[layer_idx][name].float().cpu()
         else:
             cov_x = stat["cov_x"].to(dev) / stat["count"]
             eps_x = lambda0 * cov_x.trace().item() / max(cov_x.shape[0], 1)
@@ -375,7 +385,9 @@ def _build_gradient_whitening_profile(on_stats, lambda0, dev, whitening_mode="bo
         torch.cuda.empty_cache()
     log(
         f"Built gradient whitening profile | active_layers={active_layers}/{total_layers} | "
-        f"lambda0={lambda0} | whitening_mode={whitening_mode}"
+        f"lambda0={lambda0} | whitening_mode={whitening_mode} | "
+        f"input_covariance={'identity' if whitening_mode == 'grad_only' else ('offline' if offline_profile is not None else 'on_policy')} | "
+        "gradient_covariance=on_policy"
     )
     return profile
 
@@ -563,6 +575,7 @@ def on_policy_reverse_kd_guided_whitening(
             lambda0=lambda0,
             dev=dev,
             whitening_mode=gradient_whitening_mode,
+            offline_profile=offline_profile,
         )
         _apply_module_snapshot(model, dense_snapshot, device=dev, offload_replaced_to_cpu=True)
         log(
