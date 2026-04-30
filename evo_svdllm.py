@@ -1318,6 +1318,12 @@ def parse_args():
         help="Number of prompt samples used only for on-policy gradient parent initialization. If omitted, uses --search_nsamples.",
     )
     parser.add_argument(
+        "--init_parent_on_policy_dataset",
+        type=str,
+        default=None,
+        help="Dataset used only for on-policy gradient parent initialization prompts. If omitted, uses --dataset.",
+    )
+    parser.add_argument(
         "--disable_init_parent_kv_cache",
         action="store_true",
         help="Disable KV-cache rollout generation during on-policy gradient parent initialization.",
@@ -1457,12 +1463,13 @@ def main():
         )
     if args.init_parent_method == "on_policy_gradient":
         init_parent_nsamples = args.init_parent_on_policy_nsamples or args.search_nsamples
+        init_parent_dataset = args.init_parent_on_policy_dataset or args.dataset
         log(
-            f"Preparing {init_parent_nsamples} on-policy gradient parent prompts from {args.dataset} | "
+            f"Preparing {init_parent_nsamples} on-policy gradient parent prompts from {init_parent_dataset} | "
             f"prompt_len={args.on_policy_prompt_len}"
         )
         init_parent_prompts = get_prompt_loaders(
-            args.dataset,
+            init_parent_dataset,
             nsamples=init_parent_nsamples,
             seed=args.seed + 100000,
             prompt_len=args.on_policy_prompt_len,
