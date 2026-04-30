@@ -19,7 +19,15 @@ from SVDLLM import (
     profle_svdllm_low_resource,
 )
 from component.low_rank_linear import LowRankLinear, ZeroLinear
-from utils.data_utils import get_calib_train_data, get_loaders, get_prompt_loaders
+from utils.data_utils import (
+    _allocate_mixture_counts,
+    _is_mixture_dataset,
+    _load_training_texts,
+    _split_mixture_dataset,
+    get_calib_train_data,
+    get_loaders,
+    get_prompt_loaders,
+)
 from utils.model_utils import find_layers, get_model_from_huggingface
 
 
@@ -1134,18 +1142,79 @@ def evaluate_genome(
 def get_search_batches(dataset: str, tokenizer, nsamples: int, seqlen: int, seed: int) -> List[torch.Tensor]:
     if dataset.startswith("mix:") or "evol-codealpaca" in dataset.lower() or "tulu" in dataset.lower():
         log(
-            f"Sampling search batches record-wise | dataset={dataset} | "
+            f"Sampling search batches from streaming text chunks | dataset={dataset} | "
             f"nsamples={nsamples} | seqlen={seqlen}"
         )
-        return get_prompt_loaders(
-            dataset,
-            nsamples=nsamples,
-            seed=seed,
-            prompt_len=seqlen,
-            tokenizer=tokenizer,
-        )
+        return get_streaming_text_batches(dataset, tokenizer, nsamples, seqlen, seed)
     loader, _ = get_loaders(dataset, nsamples=nsamples, seed=seed, tokenizer=tokenizer, seqlen=seqlen)
     return [inp for inp, _ in loader]
+
+
+def get_streaming_text_batches(dataset: str, tokenizer, nsamples: int, seqlen: int, seed: int) -> List[torch.Tensor]:
+    if _is_mixture_dataset(dataset):
+        dataset_names = _split_mixture_dataset(dataset)
+        counts = _allocate_mixture_counts(nsamples, len(dataset_names))
+        batches = []
+        for idx, (dataset_name, count) in enumerate(zip(dataset_names, counts)):
+            if count <= 0:
+                continue
+            log(
+                f"Loading search source {idx + 1}/{len(dataset_names)} | "
+                f"dataset={dataset_name} | nsamples={count}"
+            )
+            batches.extend(
+                _sample_streaming_text_batches(
+                    _load_training_texts(dataset_name),
+                    tokenizer,
+                    count,
+                    seqlen,
+                    seed + idx,
+                )
+            )
+            log(
+                f"Search source ready {idx + 1}/{len(dataset_names)} | "
+                f"dataset={dataset_name} | total_batches={len(batches)}"
+            )
+        return batches
+    return _sample_streaming_text_batches(
+        _load_training_texts(dataset),
+        tokenizer,
+        nsamples,
+        seqlen,
+        seed,
+    )
+
+
+def _sample_streaming_text_batches(texts: Sequence[str], tokenizer, nsamples: int, seqlen: int, seed: int) -> List[torch.Tensor]:
+    rng = random.Random(seed)
+    batches = []
+    max_attempts = max(nsamples * 50, 200)
+    for _ in range(max_attempts):
+        if len(batches) >= nsamples:
+            break
+        start = rng.randint(0, len(texts) - 1)
+        parts = []
+        total_chars = 0
+        for offset in range(min(len(texts), 128)):
+            text = texts[(start + offset) % len(texts)]
+            if text:
+                parts.append(text)
+                total_chars += len(text)
+            if total_chars >= seqlen * 8:
+                break
+        if not parts:
+            continue
+        enc = tokenizer("\n\n".join(parts), return_tensors="pt")
+        if enc.input_ids.shape[1] < seqlen:
+            continue
+        token_start = rng.randint(0, enc.input_ids.shape[1] - seqlen)
+        batches.append(enc.input_ids[:, token_start : token_start + seqlen].contiguous())
+    if len(batches) < nsamples:
+        raise ValueError(
+            f"Only built {len(batches)}/{nsamples} search batches with seqlen={seqlen}; "
+            "try lowering --model_seq_len or using more/longer text."
+        )
+    return batches
 
 
 def build_on_policy_prompts(batches: Sequence[torch.Tensor], prompt_len: int) -> List[torch.Tensor]:
