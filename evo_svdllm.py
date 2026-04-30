@@ -72,6 +72,19 @@ def get_transformer_layers(model_name: str, model) -> Tuple[str, Sequence[nn.Mod
     return "model.layers", model.model.layers
 
 
+def space_layer_idx(space: WeightSearchSpace) -> Optional[int]:
+    parts = space.name.split(".")
+    for marker in ("layers",):
+        if marker in parts:
+            pos = parts.index(marker)
+            if pos + 1 < len(parts):
+                try:
+                    return int(parts[pos + 1])
+                except ValueError:
+                    return None
+    return None
+
+
 def classify_group(weight_name: str) -> str:
     if any(token in weight_name for token in ["q_proj", "k_proj", "v_proj", "o_proj", "out_proj"]):
         return "attn"
@@ -610,6 +623,22 @@ def _build_evo_hook_specs(spaces: Sequence[WeightSearchSpace]) -> List[Tuple[int
     return [(idx, space.name, space.name, space.name) for idx, space in enumerate(spaces)]
 
 
+def select_tail_layer_space_indices(spaces: Sequence[WeightSearchSpace], layer_tail_ratio: float) -> List[int]:
+    if not (0.0 <= layer_tail_ratio <= 1.0):
+        raise ValueError("layer_tail_ratio must be in [0, 1]")
+    layer_indices = sorted({idx for space in spaces for idx in [space_layer_idx(space)] if idx is not None})
+    if not layer_indices:
+        return list(range(len(spaces))) if layer_tail_ratio > 0 else []
+    selected_layer_count = math.ceil(len(layer_indices) * layer_tail_ratio)
+    if selected_layer_count == 0:
+        return []
+    first_layer = layer_indices[-selected_layer_count]
+    return [
+        idx for idx, space in enumerate(spaces)
+        if (space_layer_idx(space) is not None and space_layer_idx(space) >= first_layer)
+    ]
+
+
 @torch.no_grad()
 def _append_gradient_source_to_spaces(
     spaces: Sequence[WeightSearchSpace],
@@ -654,12 +683,19 @@ def add_on_policy_gradient_parent_source(
     whitening_mode: str,
     use_kv_cache: bool,
     slice_kd_lm_head: bool,
+    layer_tail_ratio: float,
     source_name: str = "on_policy_grad",
 ) -> str:
     if not prompts:
         raise ValueError("on-policy gradient parent initialization requires non-empty prompts")
+    tail_indices = select_tail_layer_space_indices(spaces, layer_tail_ratio)
+    if not tail_indices:
+        log("No tail layers selected for on-policy gradient parent initialization; keeping standard parent")
+        return source_name
+    tail_spaces = [spaces[idx] for idx in tail_indices]
+    tail_dense_modules = [dense_modules[idx] for idx in tail_indices]
     prompt_len = prompts[0].shape[1]
-    hook_specs = _build_evo_hook_specs(spaces)
+    hook_specs = _build_evo_hook_specs(tail_spaces)
     collector = _OnPolicyCovCollector(
         model,
         hook_specs,
@@ -673,7 +709,8 @@ def add_on_policy_gradient_parent_source(
     log(
         f"Collecting on-policy gradient source for initial parent | prompts={len(prompts)} | "
         f"batches={len(prompt_chunks)} | prompt_len={prompt_len} | rollout_len={rollout_len} | "
-        f"whitening_mode={whitening_mode}"
+        f"whitening_mode={whitening_mode} | tail_layer_ratio={layer_tail_ratio:.4f} | "
+        f"tail_weights={len(tail_spaces)}/{len(spaces)}"
     )
     try:
         for batch_idx, prompt_chunk in enumerate(tqdm(prompt_chunks, desc="collecting parent on-policy gradients")):
@@ -730,10 +767,22 @@ def add_on_policy_gradient_parent_source(
         dev=device,
         whitening_mode=whitening_mode,
     )
-    _append_gradient_source_to_spaces(spaces, dense_modules, gradient_profile, source_name, device)
-    set_genome_source(parent, spaces, source_name)
+    _append_gradient_source_to_spaces(tail_spaces, tail_dense_modules, gradient_profile, source_name, device)
+    for idx in tail_indices:
+        space = spaces[idx]
+        source_idx = space.source_names.index(source_name)
+        parent["sources"][idx] = source_idx
+        parent["selected"][idx] = normalize_selection(
+            space,
+            source_idx,
+            parent["ranks"][idx],
+            parent["selected"][idx],
+        )
     apply_dense_modules(model, spaces, dense_modules)
-    log(f"Initial parent switched to on-policy gradient source '{source_name}'")
+    log(
+        f"Initial parent switched to on-policy gradient source '{source_name}' "
+        f"for {len(tail_indices)}/{len(spaces)} tail weights"
+    )
     return source_name
 
 @torch.no_grad()
@@ -1170,6 +1219,12 @@ def parse_args():
         help="Diagonal stabilization scale for on-policy gradient parent initialization.",
     )
     parser.add_argument(
+        "--init_parent_on_policy_layer_tail_ratio",
+        type=float,
+        default=1.0,
+        help="Fraction of final transformer layers that receive the on_policy_grad source during on-policy gradient parent initialization. Earlier layers keep the original offline source.",
+    )
+    parser.add_argument(
         "--disable_init_parent_kv_cache",
         action="store_true",
         help="Disable KV-cache rollout generation during on-policy gradient parent initialization.",
@@ -1193,6 +1248,8 @@ def main():
         raise ValueError("--rerank_on_policy_weight must be non-negative")
     if args.init_parent_warm_start_ratio is not None and not (0.0 <= args.init_parent_warm_start_ratio < 1.0):
         raise ValueError("--init_parent_warm_start_ratio must be in [0, 1)")
+    if not (0.0 <= args.init_parent_on_policy_layer_tail_ratio <= 1.0):
+        raise ValueError("--init_parent_on_policy_layer_tail_ratio must be in [0, 1]")
     if args.fitness_fn == "on_policy_kl" and args.rerank_topk_on_policy > 0:
         log(
             "Direct on-policy KL mode selected via --fitness_fn on_policy_kl; "
@@ -1336,6 +1393,7 @@ def main():
             whitening_mode=args.init_parent_gradient_mode,
             use_kv_cache=not args.disable_init_parent_kv_cache,
             slice_kd_lm_head=not args.disable_init_parent_lm_head_slicing,
+            layer_tail_ratio=args.init_parent_on_policy_layer_tail_ratio,
             source_name="on_policy_grad",
         )
         log(
