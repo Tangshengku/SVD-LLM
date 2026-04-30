@@ -16,9 +16,6 @@ from tqdm import tqdm
 from SVDLLM import (
     _OnPolicyCovCollector,
     _build_gradient_whitening_profile,
-    _compute_reverse_kd_loss,
-    _forward_kd_logits,
-    _sample_on_policy_sequences,
     profle_svdllm_low_resource,
 )
 from component.low_rank_linear import LowRankLinear, ZeroLinear
@@ -29,6 +26,84 @@ from utils.model_utils import find_layers, get_model_from_huggingface
 def log(message: str) -> None:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {message}", flush=True)
+
+
+def sample_top_p(logits, temperature=1.0, top_p=1.0):
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    scaled = logits / temperature
+    if top_p >= 1.0:
+        probs = torch.softmax(scaled, dim=-1)
+        return torch.multinomial(probs, num_samples=1)
+    sorted_logits, sorted_indices = torch.sort(scaled, descending=True, dim=-1)
+    sorted_probs = torch.softmax(sorted_logits, dim=-1)
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+    sorted_mask = cumulative_probs > top_p
+    sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
+    sorted_mask[..., 0] = False
+    filtered_sorted_logits = sorted_logits.masked_fill(sorted_mask, float("-inf"))
+    filtered_probs = torch.softmax(filtered_sorted_logits, dim=-1)
+    sampled_sorted = torch.multinomial(filtered_probs, num_samples=1)
+    return torch.gather(sorted_indices, -1, sampled_sorted)
+
+
+def sample_on_policy_sequences_no_cache(model, prompts, rollout_len, temperature, top_p=1.0):
+    generated = prompts
+    for _ in range(rollout_len):
+        logits = model(generated, use_cache=False).logits[:, -1, :].float()
+        next_token = sample_top_p(logits, temperature=temperature, top_p=top_p)
+        generated = torch.cat((generated, next_token), dim=1)
+    return generated
+
+
+def sample_on_policy_sequences(model, prompts, rollout_len, temperature, top_p=1.0, use_kv_cache=True):
+    if not use_kv_cache:
+        return sample_on_policy_sequences_no_cache(model, prompts, rollout_len, temperature, top_p=top_p)
+    generated = prompts
+    try:
+        outputs = model(prompts, use_cache=True)
+        past_key_values = outputs.past_key_values
+        logits = outputs.logits[:, -1, :].float()
+        for step_idx in range(rollout_len):
+            next_token = sample_top_p(logits, temperature=temperature, top_p=top_p)
+            generated = torch.cat((generated, next_token), dim=1)
+            if step_idx == rollout_len - 1:
+                break
+            outputs = model(next_token, past_key_values=past_key_values, use_cache=True)
+            past_key_values = outputs.past_key_values
+            logits = outputs.logits[:, -1, :].float()
+        return generated
+    except Exception as err:
+        log(f"KV-cache rollout failed ({type(err).__name__}: {err}); falling back to no-cache rollout")
+        return sample_on_policy_sequences_no_cache(model, prompts, rollout_len, temperature, top_p=top_p)
+
+
+def forward_kd_logits(model, sequences, prompt_len, rollout_len, slice_lm_head=True):
+    start = prompt_len - 1
+    end = start + rollout_len
+    if start < 0 or end > sequences.shape[1]:
+        raise ValueError("Invalid KD slice for sequence length")
+    if not slice_lm_head:
+        return model(sequences, use_cache=False).logits[:, start:end, :]
+    try:
+        if hasattr(model, "model") and hasattr(model, "lm_head"):
+            outputs = model.model(sequences, use_cache=False)
+            hidden_states = outputs[0] if isinstance(outputs, tuple) else outputs.last_hidden_state
+            return model.lm_head(hidden_states[:, start:end, :])
+    except Exception as err:
+        log(f"Sliced KD logits failed ({type(err).__name__}: {err}); falling back to full logits")
+    return model(sequences, use_cache=False).logits[:, start:end, :]
+
+
+def compute_reverse_kd_loss(student_logits, teacher_logits, kd_temperature):
+    student_log_prob = torch.log_softmax(student_logits.float() / kd_temperature, dim=-1)
+    teacher_log_prob = torch.log_softmax(teacher_logits.float() / kd_temperature, dim=-1)
+    return (kd_temperature ** 2) * torch.nn.functional.kl_div(
+        teacher_log_prob,
+        student_log_prob,
+        reduction="batchmean",
+        log_target=True,
+    )
 
 
 @dataclass
@@ -717,16 +792,16 @@ def add_on_policy_gradient_parent_source(
             prompts_device = prompt_chunk.to(device)
             model.zero_grad(set_to_none=True)
             with torch.no_grad():
-                sequences = _sample_on_policy_sequences(
+                sequences = sample_on_policy_sequences(
                     model,
                     prompts_device,
                     rollout_len=rollout_len,
-                    generation_temperature=temperature,
-                    generation_top_p=1.0,
+                    temperature=temperature,
+                    top_p=1.0,
                     use_kv_cache=use_kv_cache,
                 )
             collector.enabled = True
-            student_logits = _forward_kd_logits(
+            student_logits = forward_kd_logits(
                 model,
                 sequences,
                 prompt_len,
@@ -735,7 +810,7 @@ def add_on_policy_gradient_parent_source(
             )
             apply_dense_modules(model, spaces, dense_modules)
             with torch.no_grad():
-                teacher_logits = _forward_kd_logits(
+                teacher_logits = forward_kd_logits(
                     model,
                     sequences,
                     prompt_len,
@@ -743,7 +818,7 @@ def add_on_policy_gradient_parent_source(
                     slice_lm_head=slice_kd_lm_head,
                 )
             apply_dense_modules(model, spaces, parent_modules)
-            loss = _compute_reverse_kd_loss(
+            loss = compute_reverse_kd_loss(
                 student_logits,
                 teacher_logits,
                 kd_temperature=1.0,
