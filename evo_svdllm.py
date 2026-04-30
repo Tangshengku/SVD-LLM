@@ -1312,6 +1312,12 @@ def parse_args():
         help="Fraction of final transformer layers that receive the on_policy_grad source during on-policy gradient parent initialization. Earlier layers keep the original offline source.",
     )
     parser.add_argument(
+        "--init_parent_on_policy_nsamples",
+        type=int,
+        default=None,
+        help="Number of prompt samples used only for on-policy gradient parent initialization. If omitted, uses --search_nsamples.",
+    )
+    parser.add_argument(
         "--disable_init_parent_kv_cache",
         action="store_true",
         help="Disable KV-cache rollout generation during on-policy gradient parent initialization.",
@@ -1337,6 +1343,8 @@ def main():
         raise ValueError("--init_parent_warm_start_ratio must be in [0, 1)")
     if not (0.0 <= args.init_parent_on_policy_layer_tail_ratio <= 1.0):
         raise ValueError("--init_parent_on_policy_layer_tail_ratio must be in [0, 1]")
+    if args.init_parent_on_policy_nsamples is not None and args.init_parent_on_policy_nsamples <= 0:
+        raise ValueError("--init_parent_on_policy_nsamples must be positive")
     if args.fitness_fn == "on_policy_kl" and args.rerank_topk_on_policy > 0:
         log(
             "Direct on-policy KL mode selected via --fitness_fn on_policy_kl; "
@@ -1439,11 +1447,7 @@ def main():
     total_search_tokens = sum(batch.numel() for batch in search_batches)
     log(f"Search batches ready | batches={len(search_batches)} | tokens={total_search_tokens}")
     on_policy_batches = None
-    needs_on_policy_batches = (
-        args.fitness_fn == "on_policy_kl"
-        or rerank_enabled
-        or args.init_parent_method == "on_policy_gradient"
-    )
+    needs_on_policy_batches = args.fitness_fn == "on_policy_kl" or rerank_enabled
     if needs_on_policy_batches:
         on_policy_batches = build_on_policy_prompts(search_batches, args.on_policy_prompt_len)
         log(
@@ -1452,6 +1456,19 @@ def main():
             f"eval_every={args.on_policy_eval_every}"
         )
     if args.init_parent_method == "on_policy_gradient":
+        init_parent_nsamples = args.init_parent_on_policy_nsamples or args.search_nsamples
+        log(
+            f"Preparing {init_parent_nsamples} on-policy gradient parent prompts from {args.dataset} | "
+            f"prompt_len={args.on_policy_prompt_len}"
+        )
+        init_parent_prompts = get_prompt_loaders(
+            args.dataset,
+            nsamples=init_parent_nsamples,
+            seed=args.seed + 100000,
+            prompt_len=args.on_policy_prompt_len,
+            tokenizer=tokenizer,
+        )
+        log(f"On-policy gradient parent prompts ready | prompts={len(init_parent_prompts)}")
         warm_start_parent = parent
         warm_start_budget = budget
         if args.init_parent_warm_start_ratio is not None:
@@ -1471,7 +1488,7 @@ def main():
             spaces,
             parent,
             dense_modules,
-            on_policy_batches,
+            init_parent_prompts,
             args.DEV,
             rollout_len=args.on_policy_rollout_len,
             temperature=args.on_policy_temperature,
