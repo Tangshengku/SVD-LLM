@@ -19,7 +19,7 @@ from SVDLLM import (
     profle_svdllm_low_resource,
 )
 from component.low_rank_linear import LowRankLinear, ZeroLinear
-from utils.data_utils import get_calib_train_data, get_loaders
+from utils.data_utils import get_calib_train_data, get_loaders, get_prompt_loaders
 from utils.model_utils import find_layers, get_model_from_huggingface
 
 
@@ -1132,6 +1132,18 @@ def evaluate_genome(
 
 
 def get_search_batches(dataset: str, tokenizer, nsamples: int, seqlen: int, seed: int) -> List[torch.Tensor]:
+    if dataset.startswith("mix:") or "evol-codealpaca" in dataset.lower() or "tulu" in dataset.lower():
+        log(
+            f"Sampling search batches record-wise | dataset={dataset} | "
+            f"nsamples={nsamples} | seqlen={seqlen}"
+        )
+        return get_prompt_loaders(
+            dataset,
+            nsamples=nsamples,
+            seed=seed,
+            prompt_len=seqlen,
+            tokenizer=tokenizer,
+        )
     loader, _ = get_loaders(dataset, nsamples=nsamples, seed=seed, tokenizer=tokenizer, seqlen=seqlen)
     return [inp for inp, _ in loader]
 
