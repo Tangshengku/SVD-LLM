@@ -773,9 +773,7 @@ def _build_tail_offline_input_profile(
         if layer_idx is None:
             raise ValueError(f"Cannot infer transformer layer index from {space.name}")
         local_name = space_local_name(space)
-        profile.setdefault(local_idx, {})[space.name] = {
-            "x": profiling_mats[source_name][layer_idx][local_name].float().cpu()
-        }
+        profile.setdefault(local_idx, {})[space.name] = profiling_mats[source_name][layer_idx][local_name].float().cpu()
     return profile
 
 
