@@ -640,16 +640,8 @@ def profle_svdllm(name, model, calib_loader, dev):
         layer_profile = {}
         subset = find_layers(layers[i])
         for name in subset:
-            raw_scaling_diag_matrix = subset[name].raw_scaling_diag_matrix.double().to(dev)
-            try:
-                scaling_diag_matrix = torch.linalg.cholesky(raw_scaling_diag_matrix)
-            except Exception as e:
-                print("Warning: eigen scaling_diag_matrix is not positive!")
-                eigenvalues = torch.linalg.eigvalsh(raw_scaling_diag_matrix)
-                raw_scaling_diag_matrix += (- eigenvalues[0] + 1e-6) * torch.eye(raw_scaling_diag_matrix.shape[0]).to(dev)
-                scaling_diag_matrix = torch.linalg.cholesky(raw_scaling_diag_matrix)
-                eigenvalues = None
-                del eigenvalues
+            raw_scaling_diag_matrix = subset[name].raw_scaling_diag_matrix.to(dev)
+            scaling_diag_matrix = _cholesky_with_jitter(raw_scaling_diag_matrix, dev, dtype=torch.float64)
             layer_profile[name] = scaling_diag_matrix.cpu()
             scaling_diag_matrix = raw_scaling_diag_matrix = subset[name].raw_scaling_diag_matrix = None
             del scaling_diag_matrix, raw_scaling_diag_matrix, subset[name].raw_scaling_diag_matrix
@@ -752,16 +744,8 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev, profile_bat
             layer = layer.cpu()
             torch.cuda.empty_cache()
             for name in subset:
-                raw_scaling_diag_matrix = subset[name].scaling_diag_matrix.double().to(dev)
-                try:
-                    scaling_diag_matrix = torch.linalg.cholesky(raw_scaling_diag_matrix)
-                except Exception as e:
-                    print("Warning: eigen scaling_diag_matrix is not positive!")
-                    eigenvalues = torch.linalg.eigvalsh(raw_scaling_diag_matrix)
-                    raw_scaling_diag_matrix += (- eigenvalues[0] + 1e-6) * torch.eye(raw_scaling_diag_matrix.shape[0]).to(dev)
-                    scaling_diag_matrix = torch.linalg.cholesky(raw_scaling_diag_matrix)
-                    eigenvalues = None
-                    del eigenvalues
+                raw_scaling_diag_matrix = subset[name].scaling_diag_matrix.to(dev)
+                scaling_diag_matrix = _cholesky_with_jitter(raw_scaling_diag_matrix, dev, dtype=torch.float64)
                 layer_profile[name] = scaling_diag_matrix.cpu()
                 subset[name].scaling_diag_matrix = None
                 scaling_diag_matrix = raw_scaling_diag_matrix = None
