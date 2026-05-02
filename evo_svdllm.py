@@ -28,7 +28,7 @@ from utils.data_utils import (
     get_loaders,
     get_prompt_loaders,
 )
-from utils.model_utils import find_layers, get_model_from_huggingface
+from utils.model_utils import get_model_from_huggingface
 
 
 def log(message: str) -> None:
@@ -79,6 +79,72 @@ def model_input_device(model, fallback: str = "cuda") -> torch.device:
 
 def to_model_input(batch: torch.Tensor, model, fallback: str = "cuda") -> torch.Tensor:
     return batch.to(model_input_device(model, fallback))
+
+
+FLOAT8_DTYPES = tuple(
+    dtype
+    for dtype in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e5m2fnuz", None),
+    )
+    if dtype is not None
+)
+
+
+def is_float8_dtype(dtype: torch.dtype) -> bool:
+    return dtype in FLOAT8_DTYPES
+
+
+def search_runtime_dtype(dtype: torch.dtype) -> torch.dtype:
+    return torch.float16 if is_float8_dtype(dtype) else dtype
+
+
+def is_linear_like_module(module: nn.Module) -> bool:
+    weight = getattr(module, "weight", None)
+    return isinstance(weight, torch.Tensor) and weight.ndim == 2
+
+
+def get_linear_like_weight(module: nn.Module, expected_in_features: Optional[int] = None) -> Optional[torch.Tensor]:
+    candidates = []
+    weight = getattr(module, "weight", None)
+    if isinstance(weight, torch.Tensor) and weight.ndim == 2:
+        candidates.append(("weight", weight))
+    for attr_name in ("qweight", "weight_packed", "packed_weight", "compressed_weight"):
+        tensor = getattr(module, attr_name, None)
+        if isinstance(tensor, torch.Tensor) and tensor.ndim == 2:
+            candidates.append((attr_name, tensor))
+    for name, tensor in module.named_parameters(recurse=True):
+        if isinstance(tensor, torch.Tensor) and tensor.ndim == 2:
+            candidates.append((name, tensor))
+    for name, tensor in module.named_buffers(recurse=True):
+        if isinstance(tensor, torch.Tensor) and tensor.ndim == 2:
+            candidates.append((name, tensor))
+    if not candidates:
+        return None
+    if expected_in_features is not None:
+        for _, tensor in candidates:
+            if tensor.shape[1] == expected_in_features:
+                return tensor
+    return candidates[0][1]
+
+
+def find_linear_like_layers(module: nn.Module, name: str = "") -> Dict[str, nn.Module]:
+    if is_linear_like_module(module):
+        return {name: module}
+    res = {}
+    for child_name, child in module.named_children():
+        child_path = name + "." + child_name if name else child_name
+        res.update(find_linear_like_layers(child, child_path))
+    return res
+
+
+def resolve_profiled_module(layer: nn.Module, local_name: str) -> Optional[nn.Module]:
+    try:
+        return layer.get_submodule(local_name)
+    except AttributeError:
+        return None
 
 
 def sample_top_p(logits, temperature=1.0, top_p=1.0):
@@ -245,15 +311,17 @@ def capture_dense_modules(model, spaces: Sequence[WeightSearchSpace]) -> List[nn
 def refresh_space_runtime_metadata(model, spaces: Sequence[WeightSearchSpace]) -> None:
     for space in spaces:
         module = model.get_submodule(space.name)
-        if not isinstance(module, nn.Linear):
-            raise TypeError(f"Cached search space {space.name} no longer points to an nn.Linear module")
-        if module.in_features != space.in_features or module.out_features != space.out_features:
+        weight = get_linear_like_weight(module, expected_in_features=space.in_features)
+        if weight is None:
+            raise TypeError(f"Cached search space {space.name} no longer points to a module with a usable 2D weight")
+        rows, cols = weight.shape
+        if cols != space.in_features or rows != space.out_features:
             raise ValueError(
                 f"Cached shape mismatch for {space.name}: cache=({space.out_features}, {space.in_features}) "
-                f"model=({module.out_features}, {module.in_features})"
+                f"model=({rows}, {cols})"
             )
-        space.dtype = module.weight.dtype
-        space.device = module.weight.device
+        space.dtype = search_runtime_dtype(weight.dtype)
+        space.device = weight.device
         space.bias = clone_bias(module)
 
 
@@ -332,10 +400,11 @@ def capture_current_modules(model, spaces: Sequence[WeightSearchSpace]) -> List[
     return [model.get_submodule(space.name) for space in spaces]
 
 
-def clone_bias(module: nn.Linear) -> Optional[torch.Tensor]:
-    if module.bias is None:
+def clone_bias(module: nn.Module) -> Optional[torch.Tensor]:
+    bias = getattr(module, "bias", None)
+    if bias is None:
         return None
-    return module.bias.detach().cpu().clone()
+    return bias.detach().cpu().clone()
 
 
 def parse_source_datasets(spec: str) -> List[str]:
@@ -377,14 +446,38 @@ def build_search_spaces(
         f"sources={source_names})"
     )
 
+    discovered_linear_like = 0
+    resolved_profile_modules = 0
+    unresolved_profile_modules = 0
+    unusable_profile_weights = 0
     for layer_idx in tqdm(range(len(layers)), desc="Precomputing whitened SVD"):
         layer = layers[layer_idx]
-        subset = find_layers(layer)
-        for local_name, module in subset.items():
-            if not isinstance(module, nn.Linear):
+        discovered_linear_like += len(find_linear_like_layers(layer))
+        profile_keys = sorted(
+            set.intersection(
+                *[
+                    set(profiling_mats[source_name][layer_idx].keys())
+                    for source_name in source_names
+                ]
+            )
+        )
+        for local_name in profile_keys:
+            module = resolve_profiled_module(layer, local_name)
+            if module is None:
+                unresolved_profile_modules += 1
                 continue
-            weight = module.weight.detach().float().to(device)
+            resolved_profile_modules += 1
+            expected_in_features = profiling_mats[source_names[0]][layer_idx][local_name].shape[0]
+            weight_tensor = get_linear_like_weight(module, expected_in_features=expected_in_features)
+            if weight_tensor is None:
+                unusable_profile_weights += 1
+                continue
+            weight = weight_tensor.detach().float().to(device)
             rows, cols = weight.shape
+            if cols != expected_in_features:
+                unusable_profile_weights += 1
+                del weight
+                continue
             dense_params = rows * cols
             full_rank = min(rows, cols)
             max_rank = min(full_rank, dense_params // (rows + cols))
@@ -432,8 +525,8 @@ def build_search_spaces(
                     left_u_by_source=left_u_by_source,
                     right_v_by_source=right_v_by_source,
                     bias=clone_bias(module),
-                    dtype=module.weight.dtype,
-                    device=module.weight.device,
+                    dtype=search_runtime_dtype(weight_tensor.dtype),
+                    device=weight_tensor.device,
                     boundary_window=boundary_window,
                     tail_pool=tail_pool,
                 )
@@ -441,6 +534,14 @@ def build_search_spaces(
 
             del weight
             torch.cuda.empty_cache()
+    if not spaces:
+        log(
+            f"No searchable weights built | discovered_linear_like={discovered_linear_like} | "
+            f"profile_keys={sum(len(profiling_mats[source_names[0]][idx]) for idx in range(len(layers))) if source_names else 0} | "
+            f"resolved_profile_modules={resolved_profile_modules} | "
+            f"unresolved_profile_modules={unresolved_profile_modules} | "
+            f"unusable_profile_weights={unusable_profile_weights}"
+        )
     log(f"Finished SVD precomputation for {len(spaces)} searchable linear weights")
     return spaces
 
