@@ -242,6 +242,86 @@ def capture_dense_modules(model, spaces: Sequence[WeightSearchSpace]) -> List[nn
     return [model.get_submodule(space.name) for space in spaces]
 
 
+def refresh_space_runtime_metadata(model, spaces: Sequence[WeightSearchSpace]) -> None:
+    for space in spaces:
+        module = model.get_submodule(space.name)
+        if not isinstance(module, nn.Linear):
+            raise TypeError(f"Cached search space {space.name} no longer points to an nn.Linear module")
+        if module.in_features != space.in_features or module.out_features != space.out_features:
+            raise ValueError(
+                f"Cached shape mismatch for {space.name}: cache=({space.out_features}, {space.in_features}) "
+                f"model=({module.out_features}, {module.in_features})"
+            )
+        space.dtype = module.weight.dtype
+        space.device = module.weight.device
+        space.bias = clone_bias(module)
+
+
+def clone_genome(genome: Dict[str, List[List[int]]]) -> Dict[str, List[List[int]]]:
+    return {
+        "ranks": list(genome["ranks"]),
+        "selected": [list(item) for item in genome["selected"]],
+        "sources": list(genome["sources"]),
+    }
+
+
+def save_evo_init_cache(
+    path: str,
+    args,
+    spaces: Sequence[WeightSearchSpace],
+    parent: Dict[str, List[List[int]]],
+    total_dense_params: int,
+    budget: int,
+) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    payload = {
+        "version": 1,
+        "model": args.model,
+        "ratio": args.ratio,
+        "model_seq_len": args.model_seq_len,
+        "rank_step": args.rank_step,
+        "boundary_window": args.boundary_window,
+        "tail_count": args.tail_count,
+        "init_strategy": args.init_strategy,
+        "init_parent_method": args.init_parent_method,
+        "init_parent_gradient_mode": args.init_parent_gradient_mode,
+        "init_parent_input_covariance_source": args.init_parent_input_covariance_source,
+        "init_parent_warm_start_ratio": args.init_parent_warm_start_ratio,
+        "init_parent_on_policy_layer_tail_ratio": args.init_parent_on_policy_layer_tail_ratio,
+        "source_datasets": args.source_datasets,
+        "total_dense_params": total_dense_params,
+        "budget": budget,
+        "spaces": list(spaces),
+        "parent": clone_genome(parent),
+    }
+    torch.save(payload, path)
+
+
+def load_evo_init_cache(path: str, model, args) -> Tuple[List[WeightSearchSpace], Dict[str, List[List[int]]]]:
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(path, map_location="cpu")
+    spaces = payload["spaces"]
+    parent = clone_genome(payload["parent"])
+    if len(spaces) != len(parent["ranks"]):
+        raise ValueError(
+            f"Invalid evo init cache: spaces={len(spaces)} but parent ranks={len(parent['ranks'])}"
+        )
+    if "ratio" in payload and abs(float(payload["ratio"]) - float(args.ratio)) > 1e-12:
+        raise ValueError(
+            f"Cached ratio {payload['ratio']} does not match --ratio {args.ratio}; "
+            "use a matching cache or rerun initialization."
+        )
+    if "model_seq_len" in payload and int(payload["model_seq_len"]) != int(args.model_seq_len):
+        log(
+            f"Warning: cached model_seq_len={payload['model_seq_len']} differs from "
+            f"--model_seq_len={args.model_seq_len}; continuing because search batches define eval length."
+        )
+    refresh_space_runtime_metadata(model, spaces)
+    return spaces, parent
+
+
 @torch.no_grad()
 def apply_dense_modules(model, spaces: Sequence[WeightSearchSpace], dense_modules: Sequence[nn.Module]) -> None:
     for space, dense_module in zip(spaces, dense_modules):
@@ -1392,6 +1472,24 @@ def parse_args():
     parser.add_argument("--search_nsamples", type=int, default=16, help="Calibration samples for evolutionary search.")
     parser.add_argument("--model_seq_len", type=int, default=2048, help="Sequence length.")
     parser.add_argument("--profiling_mat_path", type=str, default=None, help="Load precomputed whitening matrices.")
+    parser.add_argument(
+        "--evo_init_cache_path",
+        type=str,
+        default=None,
+        help=(
+            "Load cached evolutionary initialization state containing precomputed search spaces, "
+            "including any on-policy gradient source, and the initial parent genome."
+        ),
+    )
+    parser.add_argument(
+        "--save_evo_init_cache_path",
+        type=str,
+        default=None,
+        help=(
+            "Save evolutionary initialization state after the initial parent is prepared. "
+            "This avoids recomputing offline SVD and on-policy gradient whitening on later runs."
+        ),
+    )
     parser.add_argument("--save_path", type=str, default=None, help="Directory for configs or model checkpoints.")
     parser.add_argument("--save_model", action="store_true", help="Save the final compressed model checkpoint.")
     parser.add_argument(
@@ -1612,86 +1710,103 @@ def main():
     model.config.use_cache = False
     log(f"Loaded model; sequence length set to {args.model_seq_len}")
 
-    if args.profiling_mat_path is None:
-        profiling_mats = {}
-        for source_idx, (source_name, calibration_dataset) in enumerate(source_profile_plan):
-            log(
-                f"Collecting whitening stats for source={source_name} "
-                f"from dataset={calibration_dataset} with {args.whitening_nsamples} calibration samples"
-            )
-            whitening_data = get_calib_train_data(
-                calibration_dataset,
-                tokenizer,
-                args.whitening_nsamples,
-                seqlen=args.model_seq_len,
-                seed=args.seed + source_idx,
-            )
-            profiling_mats[source_name] = profle_svdllm_low_resource(
-                args.model, model, whitening_data, args.DEV, profile_batch_size=args.profile_batch_size
-            )
-        log("Whitening/profile collection finished")
-    else:
-        if len(source_profile_plan) != 1:
-            raise ValueError(
-                "--profiling_mat_path currently supports only a single source dataset. "
-                "Leave it unset to compute multiple source-specific profiles."
-            )
-        log(f"Loading profiling matrices from {args.profiling_mat_path}")
-        profiling_mats = {source_profile_plan[0][0]: torch.load(args.profiling_mat_path, map_location="cpu")}
-        log("Loaded profiling matrices from disk")
-
-    # The low-resource profiling path moves major submodules back to CPU. For
-    # device_map loading, reload to restore the accelerate shard placement.
-    if model_device_map is None:
-        model = model.to(args.DEV)
-        log(f"Dense model moved back to {args.DEV} for search-time evaluation")
-    elif args.profiling_mat_path is None:
-        log("Reloading dense model with device_map for sharded search-time evaluation")
-        del model
-        torch.cuda.empty_cache()
-        model, _ = get_model_from_huggingface(
-            args.model,
-            device_map=model_device_map,
-            max_memory=model_max_memory,
-            attn_implementation=attn_implementation,
+    loaded_evo_init_cache = args.evo_init_cache_path is not None
+    profiling_mats = None
+    if loaded_evo_init_cache:
+        log(f"Loading cached evolutionary initialization from {args.evo_init_cache_path}")
+        spaces, parent = load_evo_init_cache(args.evo_init_cache_path, model, args)
+        if not spaces:
+            raise RuntimeError("Cached evolutionary initialization contains no search spaces.")
+        dense_modules = capture_dense_modules(model, spaces)
+        total_dense_params = sum(space.dense_params for space in spaces)
+        budget = int((1.0 - args.ratio) * total_dense_params)
+        log(
+            f"Loaded cached search state | weights={len(spaces)} | "
+            f"dense_params={total_dense_params} | target_kept_budget={budget} | "
+            f"kept_params={total_cost(spaces, parent['ranks'])} | "
+            f"default_source={spaces[0].source_names[parent['sources'][0]] if spaces else 'n/a'}"
         )
-        model.seqlen = args.model_seq_len
-        if is_sharded_model(model):
-            log(f"Reloaded sharded model with device placement summary: {summarize_device_map(model)}")
-    model.eval()
-    model.config.use_cache = False
+    else:
+        if args.profiling_mat_path is None:
+            profiling_mats = {}
+            for source_idx, (source_name, calibration_dataset) in enumerate(source_profile_plan):
+                log(
+                    f"Collecting whitening stats for source={source_name} "
+                    f"from dataset={calibration_dataset} with {args.whitening_nsamples} calibration samples"
+                )
+                whitening_data = get_calib_train_data(
+                    calibration_dataset,
+                    tokenizer,
+                    args.whitening_nsamples,
+                    seqlen=args.model_seq_len,
+                    seed=args.seed + source_idx,
+                )
+                profiling_mats[source_name] = profle_svdllm_low_resource(
+                    args.model, model, whitening_data, args.DEV, profile_batch_size=args.profile_batch_size
+                )
+            log("Whitening/profile collection finished")
+        else:
+            if len(source_profile_plan) != 1:
+                raise ValueError(
+                    "--profiling_mat_path currently supports only a single source dataset. "
+                    "Leave it unset to compute multiple source-specific profiles."
+                )
+            log(f"Loading profiling matrices from {args.profiling_mat_path}")
+            profiling_mats = {source_profile_plan[0][0]: torch.load(args.profiling_mat_path, map_location="cpu")}
+            log("Loaded profiling matrices from disk")
 
-    spaces = build_search_spaces(
-        args.model,
-        model,
-        profiling_mats,
-        rank_step=args.rank_step,
-        boundary_window=args.boundary_window,
-        tail_count=args.tail_count,
-        device=args.DEV,
-    )
-    if not spaces:
-        raise RuntimeError("No admissible linear weights found for evolutionary SVD search.")
-    dense_modules = capture_dense_modules(model, spaces)
+        # The low-resource profiling path moves major submodules back to CPU. For
+        # device_map loading, reload to restore the accelerate shard placement.
+        if model_device_map is None:
+            model = model.to(args.DEV)
+            log(f"Dense model moved back to {args.DEV} for search-time evaluation")
+        elif args.profiling_mat_path is None:
+            log("Reloading dense model with device_map for sharded search-time evaluation")
+            del model
+            torch.cuda.empty_cache()
+            model, _ = get_model_from_huggingface(
+                args.model,
+                device_map=model_device_map,
+                max_memory=model_max_memory,
+                attn_implementation=attn_implementation,
+            )
+            model.seqlen = args.model_seq_len
+            if is_sharded_model(model):
+                log(f"Reloaded sharded model with device placement summary: {summarize_device_map(model)}")
+        model.eval()
+        model.config.use_cache = False
 
-    total_dense_params = sum(space.dense_params for space in spaces)
-    budget = int((1.0 - args.ratio) * total_dense_params)
-    attn_weights = sum(1 for space in spaces if space.group == "attn")
-    mlp_weights = sum(1 for space in spaces if space.group == "mlp")
-    log(
-        f"Search space ready: {len(spaces)} weights "
-        f"({attn_weights} attention, {mlp_weights} mlp) | "
-        f"dense_params={total_dense_params} | target_kept_budget={budget}"
-    )
-    initial_ranks = initialize_ranks(spaces, budget, args.init_strategy)
-    parent = build_topk_genome(spaces, initial_ranks)
-    repair_budget(parent, spaces, budget)
-    log(
-        f"Initial genome prepared | init_strategy={args.init_strategy} | "
-        f"kept_params={total_cost(spaces, parent['ranks'])} | "
-        f"active_weights={sum(rank > 0 for rank in parent['ranks'])} | "
-        f"default_source={spaces[0].source_names[parent['sources'][0]] if spaces else 'n/a'}"
-    )
+        spaces = build_search_spaces(
+            args.model,
+            model,
+            profiling_mats,
+            rank_step=args.rank_step,
+            boundary_window=args.boundary_window,
+            tail_count=args.tail_count,
+            device=args.DEV,
+        )
+        if not spaces:
+            raise RuntimeError("No admissible linear weights found for evolutionary SVD search.")
+        dense_modules = capture_dense_modules(model, spaces)
+
+        total_dense_params = sum(space.dense_params for space in spaces)
+        budget = int((1.0 - args.ratio) * total_dense_params)
+        attn_weights = sum(1 for space in spaces if space.group == "attn")
+        mlp_weights = sum(1 for space in spaces if space.group == "mlp")
+        log(
+            f"Search space ready: {len(spaces)} weights "
+            f"({attn_weights} attention, {mlp_weights} mlp) | "
+            f"dense_params={total_dense_params} | target_kept_budget={budget}"
+        )
+        initial_ranks = initialize_ranks(spaces, budget, args.init_strategy)
+        parent = build_topk_genome(spaces, initial_ranks)
+        repair_budget(parent, spaces, budget)
+        log(
+            f"Initial genome prepared | init_strategy={args.init_strategy} | "
+            f"kept_params={total_cost(spaces, parent['ranks'])} | "
+            f"active_weights={sum(rank > 0 for rank in parent['ranks'])} | "
+            f"default_source={spaces[0].source_names[parent['sources'][0]] if spaces else 'n/a'}"
+        )
 
     log(f"Preparing {args.search_nsamples} search batches from {args.dataset}")
     search_batches = get_search_batches(args.dataset, tokenizer, args.search_nsamples, args.model_seq_len, args.seed)
@@ -1706,7 +1821,7 @@ def main():
             f"prompt_len={args.on_policy_prompt_len} | rollout_len={args.on_policy_rollout_len} | "
             f"eval_every={args.on_policy_eval_every}"
         )
-    if args.init_parent_method == "on_policy_gradient":
+    if (not loaded_evo_init_cache) and args.init_parent_method == "on_policy_gradient":
         init_parent_nsamples = args.init_parent_on_policy_nsamples or args.search_nsamples
         init_parent_dataset = args.init_parent_on_policy_dataset or args.dataset
         log(
@@ -1759,6 +1874,19 @@ def main():
             f"kept_params={total_cost(spaces, parent['ranks'])} | "
             f"default_source={spaces[0].source_names[parent['sources'][0]] if spaces else 'n/a'}"
         )
+    elif loaded_evo_init_cache and args.init_parent_method == "on_policy_gradient":
+        log("Skipping on-policy gradient parent initialization because --evo_init_cache_path was loaded")
+    if (not loaded_evo_init_cache) and args.save_evo_init_cache_path is not None:
+        log(f"Saving evolutionary initialization cache to {args.save_evo_init_cache_path}")
+        save_evo_init_cache(
+            args.save_evo_init_cache_path,
+            args,
+            spaces,
+            parent,
+            total_dense_params,
+            budget,
+        )
+        log("Saved evolutionary initialization cache")
     bulk_fitness_batches = on_policy_batches if bulk_fitness_fn == "on_policy_kl" else search_batches
     teacher_logits = None
     if fitness_requires_teacher_logits(bulk_fitness_fn) or (
