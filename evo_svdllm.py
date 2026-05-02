@@ -635,9 +635,9 @@ def mutate_offspring(
         "sources": list(parent["sources"]),
     }
     mutation_fns = [
-        # lambda genome: mutate_rank_transfer(genome, spaces, mutation_granularity),
-        # lambda genome: mutate_boundary_swap(genome, spaces),
-        lambda genome: mutate_source_choice(genome, spaces),
+        lambda genome: mutate_rank_transfer(genome, spaces, mutation_granularity),
+        lambda genome: mutate_boundary_swap(genome, spaces),
+        # lambda genome: mutate_source_choice(genome, spaces),
         # lambda genome: mutate_tail_promotion(genome, spaces),
         # lambda genome: mutate_mask_reset(genome, spaces),
     ]

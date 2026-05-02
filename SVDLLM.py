@@ -1379,13 +1379,13 @@ if __name__ == '__main__':
             profiling_mat = profle_svdllm_low_resource(
                 args.model, model, cali_white_data, args.DEV, profile_batch_size=args.profile_batch_size
             )
-            # if args.save_path is not None:
-            #     torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
+            if args.save_path is not None:
+                torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
         whitening(args.model, model, profiling_mat, args.ratio, args.DEV, init_scheme=args.init_scheme)
         if args.save_path is not None:
-            torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_code_math_wiki' + str(args.ratio) + '.pt')   # fp32
+            torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_code_math_wiki_nolast' + str(args.ratio) + '.pt')   # fp32
     elif args.step == 2:
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
         dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
@@ -1447,6 +1447,8 @@ if __name__ == '__main__':
                 args.model, model, c4_white_data, args.DEV, profile_batch_size=args.profile_batch_size
             )
             log("Offline covariance profile collection complete")
+            if args.save_path is not None:
+                torch.save(offline_profile, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
             log(f"Loading offline profiling matrix from {args.profiling_mat_path}")
             offline_profile = torch.load(args.profiling_mat_path)
@@ -1480,7 +1482,7 @@ if __name__ == '__main__':
         )
         if args.save_path is not None:
             output_path = (
-                args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_on_policy_reverse_kd_' + str(args.ratio) + '.pt'
+                args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_on_policy_reverse_kd' + 'comp_ratio' + str(args.ratio) + f'wp_ratio_{args.warm_start_ratio}' + f'lt_ratio_{args.on_policy_layer_tail_ratio}' +  args.offline_dataset + '_' + str(args.whitening_nsamples) + str(args.on_policy_prompt_nsamples) + str(args.gradient_whitening_mode) + '.pt'
             )
             log(f"Saving step 6 checkpoint to {output_path}")
             torch.save(

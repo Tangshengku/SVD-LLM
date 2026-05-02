@@ -14,12 +14,12 @@ dev = torch.device("cuda")
 def get_model_from_huggingface(model_id):
     from transformers import AutoModelForCausalLM, LlamaTokenizer, AutoTokenizer, LlamaForCausalLM
     model_id_lower = model_id.lower()
-    if "opt" in model_id_lower or "mistral" in model_id_lower or "qwen" in model_id_lower:
+    if "opt" in model_id_lower or "mistral" in model_id_lower or "qwen" in model_id_lower or "llama" in model_id_lower:
         tokenizer = AutoTokenizer.from_pretrained(model_id, device_map="cpu", trust_remote_code=True, use_fast=False)
     else:
         tokenizer = LlamaTokenizer.from_pretrained(model_id, device_map="cpu", trust_remote_code=True)
     load_kwargs = dict(
-        device_map="cpu",
+        device_map="auto",
         torch_dtype=torch.float16,
         trust_remote_code=True,
         cache_dir=None,
