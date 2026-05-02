@@ -1471,24 +1471,44 @@ def parse_args():
     )
     parser.add_argument("--search_nsamples", type=int, default=16, help="Calibration samples for evolutionary search.")
     parser.add_argument("--model_seq_len", type=int, default=2048, help="Sequence length.")
-    parser.add_argument("--profiling_mat_path", type=str, default=None, help="Load precomputed whitening matrices.")
+    parser.add_argument(
+        "--offline_profiling_mat_path",
+        type=str,
+        default=None,
+        help="Load original SVDLLM-style offline whitening/profiling matrices before evolutionary search.",
+    )
+    parser.add_argument(
+        "--profiling_mat_path",
+        type=str,
+        default=None,
+        help="Deprecated alias for --offline_profiling_mat_path.",
+    )
+    parser.add_argument(
+        "--evo_profiling_mat_path",
+        type=str,
+        default=None,
+        help=(
+            "Load cached evolutionary profiling state saved after on-policy KD gradient initialization. "
+            "This skips offline profiling, search-space SVD precompute, and on-policy gradient collection."
+        ),
+    )
     parser.add_argument(
         "--evo_init_cache_path",
         type=str,
         default=None,
-        help=(
-            "Load cached evolutionary initialization state containing precomputed search spaces, "
-            "including any on-policy gradient source, and the initial parent genome."
-        ),
+        help="Deprecated alias for --evo_profiling_mat_path.",
+    )
+    parser.add_argument(
+        "--save_evo_profiling_mat_path",
+        type=str,
+        default=None,
+        help="Save evolutionary profiling state after the initial parent is prepared, including any on-policy KD gradient source.",
     )
     parser.add_argument(
         "--save_evo_init_cache_path",
         type=str,
         default=None,
-        help=(
-            "Save evolutionary initialization state after the initial parent is prepared. "
-            "This avoids recomputing offline SVD and on-policy gradient whitening on later runs."
-        ),
+        help="Deprecated alias for --save_evo_profiling_mat_path.",
     )
     parser.add_argument("--save_path", type=str, default=None, help="Directory for configs or model checkpoints.")
     parser.add_argument("--save_model", action="store_true", help="Save the final compressed model checkpoint.")
@@ -1681,6 +1701,20 @@ def main():
     model_device_map = None if args.model_device_map.lower() == "none" else args.model_device_map
     model_max_memory = parse_max_memory(args.model_max_memory)
     attn_implementation = None if args.no_flash_attention_2 else "flash_attention_2"
+    offline_profiling_mat_path = args.offline_profiling_mat_path or args.profiling_mat_path
+    evo_profiling_mat_path = args.evo_profiling_mat_path or args.evo_init_cache_path
+    save_evo_profiling_mat_path = args.save_evo_profiling_mat_path or args.save_evo_init_cache_path
+    if args.offline_profiling_mat_path and args.profiling_mat_path:
+        raise ValueError("Use only one of --offline_profiling_mat_path and deprecated --profiling_mat_path")
+    if args.evo_profiling_mat_path and args.evo_init_cache_path:
+        raise ValueError("Use only one of --evo_profiling_mat_path and deprecated --evo_init_cache_path")
+    if args.save_evo_profiling_mat_path and args.save_evo_init_cache_path:
+        raise ValueError("Use only one of --save_evo_profiling_mat_path and deprecated --save_evo_init_cache_path")
+    if evo_profiling_mat_path and offline_profiling_mat_path:
+        raise ValueError(
+            "--evo_profiling_mat_path already contains the initialized evo search state; "
+            "do not also pass --offline_profiling_mat_path."
+        )
     run_start = time.time()
     rerank_enabled = args.rerank_topk_on_policy > 0
     bulk_fitness_fn = args.rerank_base_fitness if rerank_enabled else args.fitness_fn
@@ -1710,11 +1744,11 @@ def main():
     model.config.use_cache = False
     log(f"Loaded model; sequence length set to {args.model_seq_len}")
 
-    loaded_evo_init_cache = args.evo_init_cache_path is not None
+    loaded_evo_init_cache = evo_profiling_mat_path is not None
     profiling_mats = None
     if loaded_evo_init_cache:
-        log(f"Loading cached evolutionary initialization from {args.evo_init_cache_path}")
-        spaces, parent = load_evo_init_cache(args.evo_init_cache_path, model, args)
+        log(f"Loading post-on-policy evolutionary profiling state from {evo_profiling_mat_path}")
+        spaces, parent = load_evo_init_cache(evo_profiling_mat_path, model, args)
         if not spaces:
             raise RuntimeError("Cached evolutionary initialization contains no search spaces.")
         dense_modules = capture_dense_modules(model, spaces)
@@ -1727,7 +1761,7 @@ def main():
             f"default_source={spaces[0].source_names[parent['sources'][0]] if spaces else 'n/a'}"
         )
     else:
-        if args.profiling_mat_path is None:
+        if offline_profiling_mat_path is None:
             profiling_mats = {}
             for source_idx, (source_name, calibration_dataset) in enumerate(source_profile_plan):
                 log(
@@ -1748,19 +1782,19 @@ def main():
         else:
             if len(source_profile_plan) != 1:
                 raise ValueError(
-                    "--profiling_mat_path currently supports only a single source dataset. "
+                    "--offline_profiling_mat_path currently supports only a single source dataset. "
                     "Leave it unset to compute multiple source-specific profiles."
                 )
-            log(f"Loading profiling matrices from {args.profiling_mat_path}")
-            profiling_mats = {source_profile_plan[0][0]: torch.load(args.profiling_mat_path, map_location="cpu")}
-            log("Loaded profiling matrices from disk")
+            log(f"Loading original offline profiling matrices from {offline_profiling_mat_path}")
+            profiling_mats = {source_profile_plan[0][0]: torch.load(offline_profiling_mat_path, map_location="cpu")}
+            log("Loaded original offline profiling matrices from disk")
 
         # The low-resource profiling path moves major submodules back to CPU. For
         # device_map loading, reload to restore the accelerate shard placement.
         if model_device_map is None:
             model = model.to(args.DEV)
             log(f"Dense model moved back to {args.DEV} for search-time evaluation")
-        elif args.profiling_mat_path is None:
+        elif offline_profiling_mat_path is None:
             log("Reloading dense model with device_map for sharded search-time evaluation")
             del model
             torch.cuda.empty_cache()
@@ -1875,18 +1909,18 @@ def main():
             f"default_source={spaces[0].source_names[parent['sources'][0]] if spaces else 'n/a'}"
         )
     elif loaded_evo_init_cache and args.init_parent_method == "on_policy_gradient":
-        log("Skipping on-policy gradient parent initialization because --evo_init_cache_path was loaded")
-    if (not loaded_evo_init_cache) and args.save_evo_init_cache_path is not None:
-        log(f"Saving evolutionary initialization cache to {args.save_evo_init_cache_path}")
+        log("Skipping on-policy gradient parent initialization because --evo_profiling_mat_path was loaded")
+    if (not loaded_evo_init_cache) and save_evo_profiling_mat_path is not None:
+        log(f"Saving post-on-policy evolutionary profiling state to {save_evo_profiling_mat_path}")
         save_evo_init_cache(
-            args.save_evo_init_cache_path,
+            save_evo_profiling_mat_path,
             args,
             spaces,
             parent,
             total_dense_params,
             budget,
         )
-        log("Saved evolutionary initialization cache")
+        log("Saved post-on-policy evolutionary profiling state")
     bulk_fitness_batches = on_policy_batches if bulk_fitness_fn == "on_policy_kl" else search_batches
     teacher_logits = None
     if fitness_requires_teacher_logits(bulk_fitness_fn) or (
