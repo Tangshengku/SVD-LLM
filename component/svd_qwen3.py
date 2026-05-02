@@ -75,28 +75,36 @@ class SVD_Qwen3Attention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = getattr(config, "head_dim", None) or self.hidden_size // self.num_heads
         self.num_key_value_heads = config.num_key_value_heads
+        self.attention_hidden_size = self.num_heads * self.head_dim
+        self.key_value_hidden_size = self.num_key_value_heads * self.head_dim
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.scaling = self.head_dim ** -0.5
         self.is_causal = True
         self.attention_dropout = getattr(config, "attention_dropout", 0.0)
         self.ratio = ratio
 
-        if (self.head_dim * self.num_heads) != self.hidden_size:
+        if self.num_heads % self.num_key_value_heads != 0:
             raise ValueError(
-                f"hidden_size must be divisible by num_heads (got hidden_size={self.hidden_size}, "
-                f"num_heads={self.num_heads})."
+                f"num_heads must be divisible by num_key_value_heads (got num_heads={self.num_heads}, "
+                f"num_key_value_heads={self.num_key_value_heads})."
             )
 
-        low_rank = int(self.hidden_size * self.ratio / 2)
+        def low_rank(out_features, in_features):
+            return int(out_features * in_features * self.ratio / (out_features + in_features))
+
+        q_rank = low_rank(self.attention_hidden_size, self.hidden_size)
+        k_rank = low_rank(self.key_value_hidden_size, self.hidden_size)
+        v_rank = low_rank(self.key_value_hidden_size, self.hidden_size)
+        o_rank = low_rank(self.hidden_size, self.attention_hidden_size)
         attention_bias = getattr(config, "attention_bias", False)
-        self.q_u_proj = nn.Linear(low_rank, self.num_heads * self.head_dim, bias=attention_bias)
-        self.q_v_proj = nn.Linear(self.hidden_size, low_rank, bias=False)
-        self.k_u_proj = nn.Linear(low_rank, self.num_key_value_heads * self.head_dim, bias=attention_bias)
-        self.k_v_proj = nn.Linear(self.hidden_size, low_rank, bias=False)
-        self.v_u_proj = nn.Linear(low_rank, self.num_key_value_heads * self.head_dim, bias=attention_bias)
-        self.v_v_proj = nn.Linear(self.hidden_size, low_rank, bias=False)
-        self.o_u_proj = nn.Linear(low_rank, self.hidden_size, bias=attention_bias)
-        self.o_v_proj = nn.Linear(self.num_heads * self.head_dim, low_rank, bias=False)
+        self.q_u_proj = nn.Linear(q_rank, self.attention_hidden_size, bias=attention_bias)
+        self.q_v_proj = nn.Linear(self.hidden_size, q_rank, bias=False)
+        self.k_u_proj = nn.Linear(k_rank, self.key_value_hidden_size, bias=attention_bias)
+        self.k_v_proj = nn.Linear(self.hidden_size, k_rank, bias=False)
+        self.v_u_proj = nn.Linear(v_rank, self.key_value_hidden_size, bias=attention_bias)
+        self.v_v_proj = nn.Linear(self.hidden_size, v_rank, bias=False)
+        self.o_u_proj = nn.Linear(o_rank, self.hidden_size, bias=attention_bias)
+        self.o_v_proj = nn.Linear(self.attention_hidden_size, o_rank, bias=False)
 
         self.q_norm = MistralRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = MistralRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -146,9 +154,8 @@ class SVD_Qwen3Attention(nn.Module):
             past_key_values = past_key_value
 
         bsz, q_len, _ = hidden_states.size()
-        hidden_shape = (bsz, q_len, -1, self.head_dim)
 
-        query_states = self.q_u_proj(self.q_v_proj(hidden_states)).view(hidden_shape)
+        query_states = self.q_u_proj(self.q_v_proj(hidden_states)).view(bsz, q_len, self.num_heads, self.head_dim)
         key_states = self.k_u_proj(self.k_v_proj(hidden_states)).view(bsz, q_len, self.num_key_value_heads, self.head_dim)
         value_states = self.v_u_proj(self.v_v_proj(hidden_states)).view(bsz, q_len, self.num_key_value_heads, self.head_dim)
 
@@ -192,7 +199,7 @@ class SVD_Qwen3Attention(nn.Module):
             **kwargs,
         )
 
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.attention_hidden_size).contiguous()
         attn_output = self.o_u_proj(self.o_v_proj(attn_output))
 
         if not output_attentions:
