@@ -36,6 +36,51 @@ def log(message: str) -> None:
     print(f"[{timestamp}] {message}", flush=True)
 
 
+def parse_max_memory(spec: Optional[str]):
+    if spec is None or spec.strip() == "":
+        return None
+    stripped = spec.strip()
+    if stripped.startswith("{"):
+        parsed = json.loads(stripped)
+        return {int(key) if str(key).isdigit() else key: value for key, value in parsed.items()}
+    max_memory = {}
+    for item in stripped.split(","):
+        if not item.strip():
+            continue
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if key.isdigit():
+            key = int(key)
+        max_memory[key] = value.strip()
+    return max_memory
+
+
+def is_sharded_model(model) -> bool:
+    hf_device_map = getattr(model, "hf_device_map", None)
+    return isinstance(hf_device_map, dict) and len(set(hf_device_map.values())) > 1
+
+
+def summarize_device_map(model) -> str:
+    hf_device_map = getattr(model, "hf_device_map", None)
+    if not isinstance(hf_device_map, dict):
+        return "none"
+    counts = {}
+    for device in hf_device_map.values():
+        counts[str(device)] = counts.get(str(device), 0) + 1
+    return ", ".join(f"{device}:{count}" for device, count in sorted(counts.items()))
+
+
+def model_input_device(model, fallback: str = "cuda") -> torch.device:
+    try:
+        return model.get_input_embeddings().weight.device
+    except Exception:
+        return torch.device(fallback)
+
+
+def to_model_input(batch: torch.Tensor, model, fallback: str = "cuda") -> torch.Tensor:
+    return batch.to(model_input_device(model, fallback))
+
+
 def sample_top_p(logits, temperature=1.0, top_p=1.0):
     if temperature <= 0:
         raise ValueError("temperature must be positive")
@@ -55,8 +100,8 @@ def sample_top_p(logits, temperature=1.0, top_p=1.0):
     return torch.gather(sorted_indices, -1, sampled_sorted)
 
 
-def sample_on_policy_sequences_no_cache(model, prompts, rollout_len, temperature, top_p=1.0):
-    generated = prompts
+def sample_on_policy_sequences_no_cache(model, prompts, rollout_len, temperature, top_p=1.0, device="cuda"):
+    generated = to_model_input(prompts, model, device)
     for _ in range(rollout_len):
         logits = model(generated, use_cache=False).logits[:, -1, :].float()
         next_token = sample_top_p(logits, temperature=temperature, top_p=top_p)
@@ -64,12 +109,12 @@ def sample_on_policy_sequences_no_cache(model, prompts, rollout_len, temperature
     return generated
 
 
-def sample_on_policy_sequences(model, prompts, rollout_len, temperature, top_p=1.0, use_kv_cache=True):
+def sample_on_policy_sequences(model, prompts, rollout_len, temperature, top_p=1.0, use_kv_cache=True, device="cuda"):
     if not use_kv_cache:
-        return sample_on_policy_sequences_no_cache(model, prompts, rollout_len, temperature, top_p=top_p)
-    generated = prompts
+        return sample_on_policy_sequences_no_cache(model, prompts, rollout_len, temperature, top_p=top_p, device=device)
+    generated = to_model_input(prompts, model, device)
     try:
-        outputs = model(prompts, use_cache=True)
+        outputs = model(generated, use_cache=True)
         past_key_values = outputs.past_key_values
         logits = outputs.logits[:, -1, :].float()
         for step_idx in range(rollout_len):
@@ -83,7 +128,7 @@ def sample_on_policy_sequences(model, prompts, rollout_len, temperature, top_p=1
         return generated
     except Exception as err:
         log(f"KV-cache rollout failed ({type(err).__name__}: {err}); falling back to no-cache rollout")
-        return sample_on_policy_sequences_no_cache(model, prompts, rollout_len, temperature, top_p=top_p)
+        return sample_on_policy_sequences_no_cache(model, prompts, rollout_len, temperature, top_p=top_p, device=device)
 
 
 def forward_kd_logits(model, sequences, prompt_len, rollout_len, slice_lm_head=True):
@@ -832,16 +877,16 @@ def add_on_policy_gradient_parent_source(
     )
     try:
         for batch_idx, prompt_chunk in enumerate(tqdm(prompt_chunks, desc="collecting parent on-policy gradients")):
-            prompts_device = prompt_chunk.to(device)
             model.zero_grad(set_to_none=True)
             with torch.no_grad():
                 sequences = sample_on_policy_sequences(
                     model,
-                    prompts_device,
+                    prompt_chunk,
                     rollout_len=rollout_len,
                     temperature=temperature,
                     top_p=1.0,
                     use_kv_cache=use_kv_cache,
+                    device=device,
                 )
             collector.enabled = True
             student_logits = forward_kd_logits(
@@ -971,10 +1016,10 @@ def compute_nll(model, batches: Sequence[torch.Tensor], device: str, eval_batch_
     total_loss = 0.0
     total_tokens = 0
     for chunk in tqdm(_iter_minibatches(batches, eval_batch_size), desc="computing nll"):
-        chunk = chunk.to(device)                          # [bs, seqlen]
+        chunk = to_model_input(chunk, model, device)       # [bs, seqlen]
         logits = model(chunk, use_cache=False).logits.float()  # fp32 prevents log_softmax underflow
         shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = chunk[:, 1:].contiguous()
+        shift_labels = chunk[:, 1:].to(shift_logits.device).contiguous()
         n_tokens = shift_labels.numel()
         loss = torch.nn.functional.cross_entropy(
             shift_logits.view(-1, shift_logits.shape[-1]),
@@ -992,7 +1037,7 @@ def precompute_teacher_logits(model, batches: Sequence[torch.Tensor], device: st
     model.eval()
     log(f"Starting dense teacher-logit precomputation on {len(batches)} search batches")
     for batch_idx, batch in enumerate(tqdm(batches, desc="Computing dense teacher logits")):
-        logits = model(batch.to(device), use_cache=False).logits[:, :-1, :].float()
+        logits = model(to_model_input(batch, model, device), use_cache=False).logits[:, :-1, :].float()
         if not torch.isfinite(logits).all():
             raise RuntimeError(f"Non-finite dense teacher logits detected on batch {batch_idx}")
         logits = logits.cpu()
@@ -1005,22 +1050,34 @@ def precompute_teacher_logits(model, batches: Sequence[torch.Tensor], device: st
 def compute_kl(
     model,
     batches: Sequence[torch.Tensor],
-    teacher_logits: Sequence[torch.Tensor],
+    teacher_logits: Optional[Sequence[torch.Tensor]],
     device: str,
     eval_batch_size: int = 1,
+    spaces: Optional[Sequence[WeightSearchSpace]] = None,
+    dense_modules: Optional[Sequence[nn.Module]] = None,
 ) -> float:
     model.eval()
+    if teacher_logits is None and (spaces is None or dense_modules is None):
+        raise ValueError("Streaming KL requires spaces and dense_modules when teacher_logits is None")
     total_loss = 0.0
     total_seqs = 0
-    for chunk, teacher_chunk in tqdm(zip(
-        _iter_minibatches(batches, eval_batch_size),
-        _iter_minibatches(teacher_logits, eval_batch_size)), desc="computing kl"
-    ):
-        chunk = chunk.to(device)
+    batch_chunks = _iter_minibatches(batches, eval_batch_size)
+    teacher_chunks = _iter_minibatches(teacher_logits, eval_batch_size) if teacher_logits is not None else [None] * len(batch_chunks)
+    candidate_modules = capture_current_modules(model, spaces) if teacher_logits is None else None
+    for chunk, teacher_chunk in tqdm(zip(batch_chunks, teacher_chunks), desc="computing kl"):
+        chunk = to_model_input(chunk, model, device)
         student_logits = model(chunk, use_cache=False).logits[:, :-1, :].float()
         if not torch.isfinite(student_logits).all():
             raise RuntimeError("Non-finite student logits detected during KL computation")
-        teacher_log_prob = torch.log_softmax(teacher_chunk.to(device), dim=-1)
+        if teacher_chunk is None:
+            apply_dense_modules(model, spaces, dense_modules)
+            try:
+                teacher_chunk = model(chunk, use_cache=False).logits[:, :-1, :].float()
+            finally:
+                apply_dense_modules(model, spaces, candidate_modules)
+        else:
+            teacher_chunk = teacher_chunk.to(student_logits.device)
+        teacher_log_prob = torch.log_softmax(teacher_chunk.to(student_logits.device), dim=-1)
         student_log_prob = torch.log_softmax(student_logits, dim=-1)
         # batchmean divides by batch size; accumulate as sum then divide once at end
         loss = torch.nn.functional.kl_div(
@@ -1065,7 +1122,7 @@ def compute_on_policy_kl(
     candidate_modules = capture_current_modules(model, spaces)
 
     for prompt_chunk in tqdm(prompt_chunks, desc="computing on-policy kl"):
-        generated = prompt_chunk.to(device)
+        generated = to_model_input(prompt_chunk, model, device)
         rollout_contexts = []
         student_logits_per_step = []
 
@@ -1084,9 +1141,9 @@ def compute_on_policy_kl(
         apply_dense_modules(model, spaces, dense_modules)
         try:
             for context, student_logits in zip(rollout_contexts, student_logits_per_step):
-                teacher_logits = model(context.to(device), use_cache=False).logits[:, -1, :].float()
+                teacher_logits = model(to_model_input(context, model, device), use_cache=False).logits[:, -1, :].float()
                 teacher_log_prob = torch.log_softmax(teacher_logits, dim=-1)
-                student_log_prob = torch.log_softmax(student_logits.to(device), dim=-1)
+                student_log_prob = torch.log_softmax(student_logits.to(teacher_logits.device), dim=-1)
                 loss = torch.nn.functional.kl_div(
                     teacher_log_prob,
                     student_log_prob,
@@ -1123,7 +1180,15 @@ def compute_fitness(
     if fitness_fn == "ppl":
         return math.exp(compute_nll(model, batches, device, eval_batch_size))
     if fitness_fn == "kl":
-        return compute_kl(model, batches, teacher_logits, device, eval_batch_size)
+        return compute_kl(
+            model,
+            batches,
+            teacher_logits,
+            device,
+            eval_batch_size,
+            spaces=spaces,
+            dense_modules=dense_modules,
+        )
     if fitness_fn == "on_policy_kl":
         if spaces is None or genome is None or dense_modules is None:
             raise ValueError("on_policy_kl requires spaces, genome, and dense_modules")
@@ -1140,7 +1205,15 @@ def compute_fitness(
             eval_every=on_policy_eval_every,
         )
     nll = compute_nll(model, batches, device, eval_batch_size)
-    kl = compute_kl(model, batches, teacher_logits, device, eval_batch_size)
+    kl = compute_kl(
+        model,
+        batches,
+        teacher_logits,
+        device,
+        eval_batch_size,
+        spaces=spaces,
+        dense_modules=dense_modules,
+    )
     return alpha * kl + (1.0 - alpha) * nll
 
 
@@ -1449,6 +1522,38 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
     parser.add_argument("--DEV", type=str, default="cuda", help="Search device.")
+    parser.add_argument(
+        "--model_device_map",
+        type=str,
+        default="auto",
+        help=(
+            "Transformers device_map used for dense/search model loading. "
+            "Use 'auto' to shard large models across GPUs with accelerate, or 'none' for the old explicit model.to(--DEV) path."
+        ),
+    )
+    parser.add_argument(
+        "--model_max_memory",
+        type=str,
+        default=None,
+        help=(
+            "Optional max_memory for Transformers device_map, either JSON or comma form like "
+            "'0=78GiB,1=78GiB,cpu=200GiB'."
+        ),
+    )
+    parser.add_argument(
+        "--no_flash_attention_2",
+        action="store_true",
+        help="Disable flash_attention_2 when loading the model.",
+    )
+    parser.add_argument(
+        "--teacher_logits_mode",
+        choices=["cache", "stream"],
+        default="cache",
+        help=(
+            "For KL fitness, cache dense teacher logits once, or stream/recompute them per evaluation minibatch. "
+            "Use stream for large-vocab large-model runs to avoid huge CPU RAM use."
+        ),
+    )
     parser.add_argument("--eval_batch_size", type=int, default=4, help="Mini-batch size for fitness forward passes.")
     return parser.parse_args()
 
@@ -1475,6 +1580,9 @@ def main():
     source_profile_plan = build_source_profile_plan(source_datasets)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
+    model_device_map = None if args.model_device_map.lower() == "none" else args.model_device_map
+    model_max_memory = parse_max_memory(args.model_max_memory)
+    attn_implementation = None if args.no_flash_attention_2 else "flash_attention_2"
     run_start = time.time()
     rerank_enabled = args.rerank_topk_on_policy > 0
     bulk_fitness_fn = args.rerank_base_fitness if rerank_enabled else args.fitness_fn
@@ -1484,14 +1592,23 @@ def main():
         f"Launching evolutionary SVD search | model={args.model} | ratio={args.ratio} | "
         f"dataset={args.dataset} | fitness={args.fitness_fn} | generations={args.generations} | "
         f"offspring={args.offspring} | sources={source_datasets} | "
-        f"profile_plan={[name for name, _ in source_profile_plan]} | device={args.DEV}"
+        f"profile_plan={[name for name, _ in source_profile_plan]} | device={args.DEV} | "
+        f"model_device_map={model_device_map if model_device_map is not None else 'none'}"
     )
 
     log("Loading dense model and tokenizer")
-    model, tokenizer = get_model_from_huggingface(args.model)
+    model, tokenizer = get_model_from_huggingface(
+        args.model,
+        device_map=model_device_map,
+        max_memory=model_max_memory,
+        attn_implementation=attn_implementation,
+    )
     model.eval()
     model.seqlen = args.model_seq_len
-    model = model.to(args.DEV)
+    if model_device_map is None:
+        model = model.to(args.DEV)
+    elif is_sharded_model(model):
+        log(f"Loaded sharded model with device placement summary: {summarize_device_map(model)}")
     model.config.use_cache = False
     log(f"Loaded model; sequence length set to {args.model_seq_len}")
 
@@ -1523,12 +1640,26 @@ def main():
         profiling_mats = {source_profile_plan[0][0]: torch.load(args.profiling_mat_path, map_location="cpu")}
         log("Loaded profiling matrices from disk")
 
-    # The low-resource profiling path moves major submodules back to CPU.
-    # Move the full dense model to the target device again before search-time evaluation.
-    model = model.to(args.DEV)
+    # The low-resource profiling path moves major submodules back to CPU. For
+    # device_map loading, reload to restore the accelerate shard placement.
+    if model_device_map is None:
+        model = model.to(args.DEV)
+        log(f"Dense model moved back to {args.DEV} for search-time evaluation")
+    elif args.profiling_mat_path is None:
+        log("Reloading dense model with device_map for sharded search-time evaluation")
+        del model
+        torch.cuda.empty_cache()
+        model, _ = get_model_from_huggingface(
+            args.model,
+            device_map=model_device_map,
+            max_memory=model_max_memory,
+            attn_implementation=attn_implementation,
+        )
+        model.seqlen = args.model_seq_len
+        if is_sharded_model(model):
+            log(f"Reloaded sharded model with device placement summary: {summarize_device_map(model)}")
     model.eval()
     model.config.use_cache = False
-    log(f"Dense model moved back to {args.DEV} for search-time evaluation")
 
     spaces = build_search_spaces(
         args.model,
@@ -1633,7 +1764,10 @@ def main():
     if fitness_requires_teacher_logits(bulk_fitness_fn) or (
         rerank_enabled and args.rerank_selection_fitness == "on_policy_plus_kl"
     ):
-        teacher_logits = precompute_teacher_logits(model, search_batches, args.DEV)
+        if args.teacher_logits_mode == "cache":
+            teacher_logits = precompute_teacher_logits(model, search_batches, args.DEV)
+        else:
+            log("Dense teacher logits will be streamed per KL evaluation instead of cached")
     else:
         log("Teacher logits skipped because fitness does not require them")
 
@@ -1880,7 +2014,11 @@ def main():
 
         if args.save_model:
             model_path = os.path.join(args.save_path, f"{prefix}_evo_svd_{args.ratio}.pt")
-            torch.save({"model": model.cpu(), "tokenizer": tokenizer}, model_path)
+            if is_sharded_model(model):
+                log("Saving sharded compressed model without calling model.cpu()")
+                torch.save({"model": model, "tokenizer": tokenizer}, model_path)
+            else:
+                torch.save({"model": model.cpu(), "tokenizer": tokenizer}, model_path)
             log(f"Saved compressed model to {model_path}")
 
     log(f"Run finished successfully in {time.time() - run_start:.1f}s")

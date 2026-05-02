@@ -11,7 +11,13 @@ sys.path.append(current_path)
 # bandaid fix
 dev = torch.device("cuda")
 
-def get_model_from_huggingface(model_id):
+def get_model_from_huggingface(
+    model_id,
+    device_map="auto",
+    torch_dtype=torch.float16,
+    max_memory=None,
+    attn_implementation="flash_attention_2",
+):
     from transformers import AutoModelForCausalLM, LlamaTokenizer, AutoTokenizer, LlamaForCausalLM
     model_id_lower = model_id.lower()
     if "opt" in model_id_lower or "mistral" in model_id_lower or "qwen" in model_id_lower or "llama" in model_id_lower:
@@ -19,13 +25,16 @@ def get_model_from_huggingface(model_id):
     else:
         tokenizer = LlamaTokenizer.from_pretrained(model_id, device_map="cpu", trust_remote_code=True)
     load_kwargs = dict(
-        device_map="auto",
-        torch_dtype=torch.float16,
+        torch_dtype=torch_dtype,
         trust_remote_code=True,
         cache_dir=None,
     )
-    if "opt" not in model_id_lower:
-        load_kwargs["attn_implementation"] = "flash_attention_2"
+    if device_map is not None and str(device_map).lower() != "none":
+        load_kwargs["device_map"] = device_map
+    if max_memory is not None:
+        load_kwargs["max_memory"] = max_memory
+    if "opt" not in model_id_lower and attn_implementation:
+        load_kwargs["attn_implementation"] = attn_implementation
     try:
         model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
     except TypeError:
