@@ -970,19 +970,47 @@ def _append_gradient_source_to_spaces(
     if source_name in spaces[0].source_names:
         raise ValueError(f"Source {source_name} already exists in search spaces")
     log(f"Appending gradient-whitened source '{source_name}' to {len(spaces)} search spaces")
+    factor_storage_dtype = torch.bfloat16 if hasattr(torch, "bfloat16") else torch.float16
     for idx, (space, dense_module) in enumerate(tqdm(zip(spaces, dense_modules), total=len(spaces), desc="Adding gradient source")):
-        weight = dense_module.weight.detach().float().to(device)
+        weight_tensor = get_linear_like_weight(dense_module, expected_in_features=space.in_features)
+        if weight_tensor is None:
+            raise TypeError(f"Cannot find usable 2D weight for gradient source {space.name}")
+        work_device = space.device if space.device.type != "cpu" else torch.device(device)
+        log(
+            f"Adding gradient source {idx + 1}/{len(spaces)} | name={space.name} | "
+            f"shape=({space.out_features},{space.in_features}) | device={work_device}"
+        )
+        weight = weight_tensor.detach().float().to(work_device)
         factors = gradient_profile[idx][space.name]
-        input_factor = factors["x"].float().to(device)
-        grad_factor = factors["g"].float().to(device)
+        input_factor = factors["x"].float().to(work_device)
+        grad_factor = factors["g"].float().to(work_device)
         transformed = grad_factor.transpose(0, 1).matmul(weight).matmul(input_factor)
-        u, s, vt = torch.linalg.svd(transformed, full_matrices=False)
-        left = torch.linalg.solve(grad_factor.transpose(0, 1), u)
-        right = torch.linalg.solve(input_factor.transpose(0, 1), vt.transpose(0, 1)).transpose(0, 1)
+        try:
+            u, s, vt = torch.linalg.svd(transformed, full_matrices=False)
+            left = torch.linalg.solve(grad_factor.transpose(0, 1), u)
+            right = torch.linalg.solve(input_factor.transpose(0, 1), vt.transpose(0, 1)).transpose(0, 1)
+        except torch.OutOfMemoryError:
+            log(f"CUDA OOM while adding gradient source for {space.name}; retrying this SVD on CPU")
+            del weight, input_factor, grad_factor, transformed
+            torch.cuda.empty_cache()
+            work_device = torch.device("cpu")
+            weight = weight_tensor.detach().float().cpu()
+            input_factor = factors["x"].float().cpu()
+            grad_factor = factors["g"].float().cpu()
+            transformed = grad_factor.transpose(0, 1).matmul(weight).matmul(input_factor)
+            u, s, vt = torch.linalg.svd(transformed, full_matrices=False)
+            left = torch.linalg.solve(grad_factor.transpose(0, 1), u)
+            right = torch.linalg.solve(input_factor.transpose(0, 1), vt.transpose(0, 1)).transpose(0, 1)
         space.source_names.append(source_name)
         space.singular_values_sq_by_source.append((s.cpu() ** 2))
-        space.left_u_by_source.append(left.cpu())
-        space.right_v_by_source.append(right.cpu())
+        left_store = left.detach().to(device="cpu", dtype=factor_storage_dtype)
+        right_store = right.detach().to(device="cpu", dtype=factor_storage_dtype)
+        if not torch.isfinite(left_store).all() or not torch.isfinite(right_store).all():
+            log(f"Reduced-dtype gradient factors overflowed for {space.name}; storing this source in float32")
+            left_store = left.detach().cpu()
+            right_store = right.detach().cpu()
+        space.left_u_by_source.append(left_store)
+        space.right_v_by_source.append(right_store)
         del weight, input_factor, grad_factor, transformed, u, s, vt, left, right
         torch.cuda.empty_cache()
 
