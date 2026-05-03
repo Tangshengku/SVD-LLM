@@ -77,6 +77,142 @@ def log(message: str) -> None:
     print(message, flush=True)
 
 
+FLOAT8_DTYPES = tuple(
+    dtype
+    for dtype in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e5m2fnuz", None),
+    )
+    if dtype is not None
+)
+
+
+def _is_float8_dtype(dtype):
+    return dtype in FLOAT8_DTYPES
+
+
+def _runtime_svd_dtype(dtype):
+    return torch.float16 if _is_float8_dtype(dtype) else dtype
+
+
+def _parse_svd_output_dtype(name):
+    if name in (None, "original"):
+        return None
+    if name == "runtime":
+        return "runtime"
+    if name == "float16":
+        return torch.float16
+    if name == "bfloat16":
+        return torch.bfloat16
+    if name == "float32":
+        return torch.float32
+    if name == "float8_e4m3fn":
+        if not hasattr(torch, "float8_e4m3fn"):
+            raise ValueError("This PyTorch build does not expose torch.float8_e4m3fn")
+        return torch.float8_e4m3fn
+    if name == "float8_e5m2":
+        if not hasattr(torch, "float8_e5m2"):
+            raise ValueError("This PyTorch build does not expose torch.float8_e5m2")
+        return torch.float8_e5m2
+    raise ValueError(f"Unsupported --svd_output_dtype: {name}")
+
+
+def _resolve_output_dtype(source_dtype, output_dtype_policy):
+    if output_dtype_policy is None:
+        return source_dtype
+    if output_dtype_policy == "runtime":
+        return _runtime_svd_dtype(source_dtype)
+    return output_dtype_policy
+
+
+def _is_linear_like_module(module):
+    weight = getattr(module, "weight", None)
+    return isinstance(weight, torch.Tensor) and weight.ndim == 2
+
+
+def _get_own_linear_like_weight(module):
+    weight = getattr(module, "weight", None)
+    if isinstance(weight, torch.Tensor) and weight.ndim == 2 and weight.is_floating_point():
+        return weight
+    for _, tensor in module.named_parameters(recurse=False):
+        if isinstance(tensor, torch.Tensor) and tensor.ndim == 2 and tensor.is_floating_point():
+            return tensor
+    for _, tensor in module.named_buffers(recurse=False):
+        if isinstance(tensor, torch.Tensor) and tensor.ndim == 2 and tensor.is_floating_point():
+            return tensor
+    return None
+
+
+def _get_linear_like_weight(module, expected_in_features=None):
+    candidates = []
+    weight = getattr(module, "weight", None)
+    if isinstance(weight, torch.Tensor) and weight.ndim == 2 and weight.is_floating_point():
+        candidates.append(("weight", weight))
+    for name, tensor in module.named_parameters(recurse=True):
+        if isinstance(tensor, torch.Tensor) and tensor.ndim == 2 and tensor.is_floating_point():
+            candidates.append((name, tensor))
+    for name, tensor in module.named_buffers(recurse=True):
+        if isinstance(tensor, torch.Tensor) and tensor.ndim == 2 and tensor.is_floating_point():
+            candidates.append((name, tensor))
+    if not candidates:
+        return None
+    if expected_in_features is not None:
+        for _, tensor in candidates:
+            if tensor.shape[1] == expected_in_features:
+                return tensor
+    return candidates[0][1]
+
+
+def _find_linear_like_layers(module, name=""):
+    if _get_own_linear_like_weight(module) is not None:
+        return {name: module}
+    res = {}
+    for child_name, child in module.named_children():
+        child_path = name + "." + child_name if name else child_name
+        res.update(_find_linear_like_layers(child, child_path))
+    return res
+
+
+def _resolve_profiled_layers(layer, layer_profile=None):
+    if layer_profile is None:
+        return _find_linear_like_layers(layer)
+    subset = {}
+    for local_name, factor in layer_profile.items():
+        try:
+            module = layer.get_submodule(local_name)
+        except AttributeError:
+            continue
+        expected_in = factor.shape[0] if torch.is_tensor(factor) and factor.ndim >= 2 else None
+        if _get_linear_like_weight(module, expected_in_features=expected_in) is not None:
+            subset[local_name] = module
+    return subset
+
+
+def _clone_optional_bias(module, dtype=None):
+    bias = getattr(module, "bias", None)
+    if bias is None:
+        return None
+    if dtype is not None and not _is_float8_dtype(dtype):
+        return bias.detach().cpu().to(dtype)
+    return bias.detach().cpu()
+
+
+def _module_device(module, fallback="cpu"):
+    for tensor in module.parameters(recurse=True):
+        if tensor.device.type != "meta":
+            return tensor.device
+    for tensor in module.buffers(recurse=True):
+        if tensor.device.type != "meta":
+            return tensor.device
+    return torch.device(fallback)
+
+
+def _has_accelerate_device_map(model):
+    return hasattr(model, "hf_device_map") and getattr(model, "hf_device_map")
+
+
 def _sample_top_p(logits, temperature=1.0, top_p=1.0):
     if temperature <= 0:
         raise ValueError("temperature must be positive")
@@ -440,6 +576,7 @@ def on_policy_reverse_kd_guided_whitening(
     gradient_whitening_mode="both",
     use_on_policy_kv_cache=True,
     on_policy_layer_tail_ratio=1.0,
+    output_dtype_policy=None,
 ):
     if rounds <= 0:
         raise ValueError("rounds must be positive")
@@ -466,7 +603,19 @@ def on_policy_reverse_kd_guided_whitening(
         f"Applying initial offline whitening profile to build the first student | "
         f"warm_start_internal_ratio={warm_start_ratio:.4f} | final_internal_ratio={ratio:.4f}"
     )
-    whitening(model_name, model, offline_profile, warm_start_ratio, dev, init_scheme=init_scheme)
+    warm_start_output_dtype_policy = output_dtype_policy
+    if output_dtype_policy is None or output_dtype_policy != "runtime":
+        warm_start_output_dtype_policy = "runtime"
+        log("Using runtime dtype for warm-start student factors; final compression will use requested output dtype")
+    whitening(
+        model_name,
+        model,
+        offline_profile,
+        warm_start_ratio,
+        dev,
+        init_scheme=init_scheme,
+        output_dtype_policy=warm_start_output_dtype_policy,
+    )
     if "opt" in model_name:
         layer_count = len(model.model.decoder.layers)
     else:
@@ -591,6 +740,7 @@ def on_policy_reverse_kd_guided_whitening(
             init_scheme=init_scheme,
             offline_profile=offline_profile,
             gradient_layer_start=on_policy_layer_start,
+            output_dtype_policy=output_dtype_policy,
         )
         model.to(dev)
         log(f"Round {round_idx + 1}: recompression complete")
@@ -618,27 +768,28 @@ def profle_svdllm(name, model, calib_loader, dev):
         module.raw_scaling_diag_matrix += adds_sum
         del inp, adds, adds_sum
         torch.cuda.empty_cache()
+    handles = []
     for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
+        weight = _get_linear_like_weight(module)
+        if weight is not None:
             module.raw_scaling_diag_matrix = 0
-            module.register_forward_hook(hook)
+            handles.append(module.register_forward_hook(hook))
     for batch in tqdm(calib_loader):
         batch = {k: v.to(dev) for k, v in batch.items()}
         model(**batch)
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
-            module._forward_hooks.clear()
+    for handle in handles:
+        handle.remove()
     torch.cuda.empty_cache()
     model = model.cpu()
     for i in range(len(layers)):
-        subset = find_layers(layers[i])
+        subset = _find_linear_like_layers(layers[i])
         for name in subset:
             subset[name].raw_scaling_diag_matrix = subset[name].raw_scaling_diag_matrix.cpu()
     profiling_mat = {}
     print("Start Cholesky Decomposition...")
     for i in tqdm(range(len(layers))):
         layer_profile = {}
-        subset = find_layers(layers[i])
+        subset = _find_linear_like_layers(layers[i])
         for name in subset:
             raw_scaling_diag_matrix = subset[name].raw_scaling_diag_matrix.to(dev)
             scaling_diag_matrix = _cholesky_with_jitter(raw_scaling_diag_matrix, dev, dtype=torch.float64)
@@ -655,16 +806,21 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev, profile_bat
     model_name = model_name.lower()
     use_cache = model.config.use_cache
     model.config.use_cache = False
+    is_device_mapped = _has_accelerate_device_map(model)
+    input_dev = _module_device(model, dev) if is_device_mapped else torch.device(dev)
     if "opt" in model_name:
         layers = model.model.decoder.layers
-        model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev)
-        model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.to(dev)
-        model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(dev)
+        if not is_device_mapped:
+            model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev)
+            model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.to(dev)
+            model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(dev)
     else:
         layers = model.model.layers
-        model.model.embed_tokens = model.model.embed_tokens.to(dev)
-        model.model.norm = model.model.norm.to(dev)
-    layers[0] = layers[0].to(dev)
+        if not is_device_mapped:
+            model.model.embed_tokens = model.model.embed_tokens.to(dev)
+            model.model.norm = model.model.norm.to(dev)
+    if not is_device_mapped:
+        layers[0] = layers[0].to(dev)
 
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros(
@@ -690,7 +846,7 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev, profile_bat
     try:
         for batch in calib_loader:
             try:
-                batch = {k: v.to(dev) for k, v in batch.items()}
+                batch = {k: v.to(input_dev) for k, v in batch.items()}
                 model(**batch, use_cache=False)
             except ValueError:
                 pass
@@ -698,21 +854,27 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev, profile_bat
                 batch = None
                 torch.cuda.empty_cache()
         layers[0] = layers[0].module
-        layers[0] = layers[0].cpu()
+        if not is_device_mapped:
+            layers[0] = layers[0].cpu()
         if "opt" in model_name:
-            model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
-            model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.cpu()
-            model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
+            if not is_device_mapped:
+                model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
+                model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.cpu()
+                model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
         else:  
-            model.model.embed_tokens = model.model.embed_tokens.cpu()
-            model.model.norm = model.model.norm.cpu()
+            if not is_device_mapped:
+                model.model.embed_tokens = model.model.embed_tokens.cpu()
+                model.model.norm = model.model.norm.cpu()
         torch.cuda.empty_cache()
         outs = torch.zeros_like(inps)
         profiling_mat = {}
         for i in tqdm(range(len(layers))):
             layer_profile = {}
-            layer = layers[i].to(dev)
-            subset = find_layers(layer)        
+            layer = layers[i]
+            if not is_device_mapped:
+                layer = layer.to(dev)
+            layer_dev = _module_device(layer, dev)
+            subset = _find_linear_like_layers(layer)
             def hook(module, input, output):
                 inp = input[0].detach().float()
                 if inp.dim() == 2:  # for opt
@@ -724,34 +886,41 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev, profile_bat
                 torch.cuda.empty_cache()
             handles = []
             for name in subset:
+                weight = _get_linear_like_weight(subset[name])
+                if weight is None:
+                    continue
                 subset[name].scaling_diag_matrix = torch.zeros(
-                    (subset[name].weight.shape[1], subset[name].weight.shape[1]),
+                    (weight.shape[1], weight.shape[1]),
                     dtype=torch.float32,
                     device="cpu",
                 )
                 handles.append(subset[name].register_forward_hook(hook))
             for start in range(0, inps.shape[0], profile_batch_size):
                 end = min(start + profile_batch_size, inps.shape[0])
-                layer_kwargs = _move_nested_to_device(_stack_nested(cache['layer_kwargs'][start:end]), dev)
+                layer_kwargs = _move_nested_to_device(_stack_nested(cache['layer_kwargs'][start:end]), layer_dev)
                 layer_kwargs["use_cache"] = False
-                layer_output = layer(inps[start:end].to(dev), **layer_kwargs)
+                layer_output = layer(inps[start:end].to(layer_dev), **layer_kwargs)
                 outs[start:end] = layer_output[0].cpu()
                 layer_output = None
                 layer_kwargs = None
             for h in handles:
                 h.remove()
             handles = None
-            layer = layer.cpu()
+            if not is_device_mapped:
+                layer = layer.cpu()
             torch.cuda.empty_cache()
             for name in subset:
-                raw_scaling_diag_matrix = subset[name].scaling_diag_matrix.to(dev)
-                scaling_diag_matrix = _cholesky_with_jitter(raw_scaling_diag_matrix, dev, dtype=torch.float64)
+                if not hasattr(subset[name], "scaling_diag_matrix"):
+                    continue
+                raw_scaling_diag_matrix = subset[name].scaling_diag_matrix.to(layer_dev)
+                scaling_diag_matrix = _cholesky_with_jitter(raw_scaling_diag_matrix, layer_dev, dtype=torch.float64)
                 layer_profile[name] = scaling_diag_matrix.cpu()
                 subset[name].scaling_diag_matrix = None
                 scaling_diag_matrix = raw_scaling_diag_matrix = None
                 del scaling_diag_matrix, raw_scaling_diag_matrix
                 torch.cuda.empty_cache()
-            layers[i] = layer.cpu()
+            if not is_device_mapped:
+                layers[i] = layer.cpu()
             profiling_mat[i] = layer_profile
             inps = outs
             torch.cuda.empty_cache()
@@ -827,7 +996,7 @@ def _assign_low_rank_weights(model_name, layer, name, svd_u, svd_v, svd_attn=Non
 
 
 @torch.no_grad()
-def whitening(model_name, model, profiling_mat, ratio, dev, init_scheme="uniform"):
+def whitening(model_name, model, profiling_mat, ratio, dev, init_scheme="uniform", output_dtype_policy=None):
     model_name = model_name.lower()
     model.eval()
     if 'opt' in model_name:
@@ -837,10 +1006,15 @@ def whitening(model_name, model, profiling_mat, ratio, dev, init_scheme="uniform
     print("Start SVD decomposition after whitening...")
     for i in tqdm(range(len(layers))):
         layer = layers[i]
-        subset = find_layers(layer)
+        subset = _resolve_profiled_layers(layer, profiling_mat[i])
         #### Replace Attn, MLP ####
         if "llama" in model_name or "vicuna" in model_name:
-            svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio, init_scheme=init_scheme)
+            svd_attn = SVD_LlamaAttention(
+                config=model.config,
+                ratio=ratio,
+                init_scheme=init_scheme,
+                layer_idx=getattr(layer.self_attn, "layer_idx", None),
+            )
             svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio, init_scheme=init_scheme)
         elif "mistral" in model_name:
             svd_attn = SVD_MistralAttention(
@@ -862,9 +1036,13 @@ def whitening(model_name, model, profiling_mat, ratio, dev, init_scheme="uniform
             svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio, init_scheme=init_scheme)
         #### Replace Attn, MLP ####
         for name in subset:
-            dtype = subset[name].weight.data.dtype
-            W = subset[name].weight.data.float().to(dev)
             scaling_diag_matrix = profiling_mat[i][name].to(dev)
+            weight_tensor = _get_linear_like_weight(subset[name], expected_in_features=scaling_diag_matrix.shape[0])
+            if weight_tensor is None:
+                continue
+            source_dtype = weight_tensor.dtype
+            output_dtype = _resolve_output_dtype(source_dtype, output_dtype_policy)
+            W = weight_tensor.detach().float().to(dev)
             try:
                 scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix)
             except Exception as e:
@@ -882,8 +1060,8 @@ def whitening(model_name, model, profiling_mat, ratio, dev, init_scheme="uniform
             truc_sigma = torch.diag(truc_s)
             #### Replace Attn, MLP ####
             sqrtSigma = torch.sqrt(truc_sigma)
-            svd_u = torch.matmul(truc_u, sqrtSigma).cpu().to(dtype)
-            svd_v = torch.matmul(sqrtSigma, truc_v).cpu().to(dtype)
+            svd_u = torch.matmul(truc_u, sqrtSigma).cpu().to(output_dtype)
+            svd_v = torch.matmul(sqrtSigma, truc_v).cpu().to(output_dtype)
             if 'opt' in model_name:
                 if "q_proj" in name:
                     svd_decoder.self_attn.q_u_proj.weight.data = svd_u
@@ -949,6 +1127,8 @@ def whitening(model_name, model, profiling_mat, ratio, dev, init_scheme="uniform
                     layer.mlp = svd_mlp
             W = W_scale = scaling_matrix_inv = scaling_diag_matrix = U = S = VT  = truc_s = truc_u = truc_v = sqrtSigma = None
             del  W, W_scale, scaling_matrix_inv, scaling_diag_matrix, U, S, VT, truc_s, truc_u, truc_v, sqrtSigma
+        if 'opt' in model_name:
+            layers[i] = svd_decoder
         del layer
         torch.cuda.empty_cache()
 
@@ -963,6 +1143,7 @@ def gradient_whitening(
     init_scheme="uniform",
     offline_profile=None,
     gradient_layer_start=0,
+    output_dtype_policy=None,
 ):
     model_name = model_name.lower()
     model.eval()
@@ -973,9 +1154,18 @@ def gradient_whitening(
     print("Start hybrid gradient/offline-whitened SVD decomposition...")
     for i in tqdm(range(len(layers))):
         layer = layers[i]
-        subset = find_layers(layer)
+        if i >= gradient_layer_start:
+            layer_profile_keys = gradient_profile.get(i, {})
+        else:
+            layer_profile_keys = offline_profile[i] if offline_profile is not None else {}
+        subset = _resolve_profiled_layers(layer, layer_profile_keys)
         if "llama" in model_name or "vicuna" in model_name:
-            svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio, init_scheme=init_scheme)
+            svd_attn = SVD_LlamaAttention(
+                config=model.config,
+                ratio=ratio,
+                init_scheme=init_scheme,
+                layer_idx=getattr(layer.self_attn, "layer_idx", None),
+            )
             svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio, init_scheme=init_scheme)
         elif "mistral" in model_name:
             svd_attn = SVD_MistralAttention(
@@ -997,8 +1187,17 @@ def gradient_whitening(
             svd_decoder = SVDOPTDecoderLayer(model.config, ratio=ratio, init_scheme=init_scheme)
 
         for name in subset:
-            dtype = subset[name].weight.data.dtype
-            W = subset[name].weight.data.float().to(dev)
+            expected_in = None
+            if i >= gradient_layer_start:
+                expected_in = gradient_profile[i][name]["x"].shape[0]
+            elif offline_profile is not None:
+                expected_in = offline_profile[i][name].shape[0]
+            weight_tensor = _get_linear_like_weight(subset[name], expected_in_features=expected_in)
+            if weight_tensor is None:
+                continue
+            source_dtype = weight_tensor.dtype
+            output_dtype = _resolve_output_dtype(source_dtype, output_dtype_policy)
+            W = weight_tensor.detach().float().to(dev)
             num_s_after_trunc = int(W.shape[0] * W.shape[1] * ratio / (W.shape[0] + W.shape[1]))
             if i >= gradient_layer_start:
                 factors = gradient_profile[i][name]
@@ -1013,11 +1212,11 @@ def gradient_whitening(
                 svd_u = torch.linalg.solve(
                     grad_factor.transpose(0, 1),
                     left,
-                ).cpu().to(dtype)
+                ).cpu().to(output_dtype)
                 svd_v = torch.linalg.solve(
                     input_factor.transpose(0, 1),
                     right.transpose(0, 1),
-                ).transpose(0, 1).cpu().to(dtype)
+                ).transpose(0, 1).cpu().to(output_dtype)
                 del input_factor, grad_factor, left, right
             else:
                 if offline_profile is None:
@@ -1034,10 +1233,10 @@ def gradient_whitening(
                 U, S, VT = torch.linalg.svd(W_scale, full_matrices=False)
                 truc_s = S[:num_s_after_trunc]
                 sqrt_s = torch.sqrt(truc_s)
-                svd_u = (U[:, :num_s_after_trunc] * sqrt_s.unsqueeze(0)).cpu().to(dtype)
+                svd_u = (U[:, :num_s_after_trunc] * sqrt_s.unsqueeze(0)).cpu().to(output_dtype)
                 svd_v = (
                     sqrt_s.unsqueeze(1) * torch.matmul(VT[:num_s_after_trunc, :], scaling_matrix_inv)
-                ).cpu().to(dtype)
+                ).cpu().to(output_dtype)
                 del scaling_diag_matrix, scaling_matrix_inv
             _assign_low_rank_weights(
                 model_name,
@@ -1111,7 +1310,12 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
         subset = find_layers(layer)
         gpts = {}
         if "llama" in model_name or "vicuna" in model_name:
-            svd_attn = SVD_LlamaAttention(config=model.config, ratio=ratio, init_scheme=init_scheme)
+            svd_attn = SVD_LlamaAttention(
+                config=model.config,
+                ratio=ratio,
+                init_scheme=init_scheme,
+                layer_idx=getattr(layer.self_attn, "layer_idx", None),
+            )
             svd_mlp = SVD_LlamaMLP(hidden_size=layer.hidden_size, intermediate_size=model.config.intermediate_size, hidden_act=model.config.hidden_act, ratio=ratio, init_scheme=init_scheme)
         elif "mistral" in model_name:
             svd_attn = SVD_MistralAttention(
@@ -1362,6 +1566,16 @@ if __name__ == '__main__':
         choices=['uniform', 'xavier_uniform', 'kaiming_uniform', 'default'],
         help='Initialization scheme for freshly created SVD low-rank modules before decomposition weights are loaded.',
     )
+    parser.add_argument(
+        '--svd_output_dtype',
+        type=str,
+        default='original',
+        choices=['original', 'runtime', 'float8_e4m3fn', 'float8_e5m2', 'float16', 'bfloat16', 'float32'],
+        help=(
+            'Dtype for saved SVD factor weights. original preserves source dtype, including FP8; '
+            'runtime converts FP8 source weights to fp16 for executable low-rank modules.'
+        ),
+    )
     
     args = parser.parse_args()
     user_ratio = args.ratio
@@ -1371,6 +1585,7 @@ if __name__ == '__main__':
         args.warm_start_ratio = 1 - args.warm_start_ratio
     if not (0.0 <= args.on_policy_layer_tail_ratio <= 1.0):
         raise ValueError("--on_policy_layer_tail_ratio must be in [0, 1]")
+    svd_output_dtype_policy = _parse_svd_output_dtype(args.svd_output_dtype)
     if args.step == 1:
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
         model = model.eval()
@@ -1383,7 +1598,15 @@ if __name__ == '__main__':
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
-        whitening(args.model, model, profiling_mat, args.ratio, args.DEV, init_scheme=args.init_scheme)
+        whitening(
+            args.model,
+            model,
+            profiling_mat,
+            args.ratio,
+            args.DEV,
+            init_scheme=args.init_scheme,
+            output_dtype_policy=svd_output_dtype_policy,
+        )
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_code_math_wiki_nolast' + str(args.ratio) + '.pt')   # fp32
     elif args.step == 2:
@@ -1479,6 +1702,7 @@ if __name__ == '__main__':
             gradient_whitening_mode=args.gradient_whitening_mode,
             use_on_policy_kv_cache=not args.disable_on_policy_kv_cache,
             on_policy_layer_tail_ratio=args.on_policy_layer_tail_ratio,
+            output_dtype_policy=svd_output_dtype_policy,
         )
         if args.save_path is not None:
             output_path = (
