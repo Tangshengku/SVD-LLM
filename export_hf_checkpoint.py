@@ -126,6 +126,13 @@ def convert_factorized_pair(
     output_dtype: torch.dtype,
 ) -> nn.Linear:
     weight = factorized_linear_to_dense(u_proj, v_proj, compute_device, compute_dtype, output_dtype)
+    expected_shape = (out_features, in_features)
+    if tuple(weight.shape) != expected_shape:
+        raise ValueError(
+            f"Factorized pair reconstructed shape {tuple(weight.shape)} does not match "
+            f"requested dense shape {expected_shape}. "
+            f"u_proj.weight={tuple(u_proj.weight.shape)}, v_proj.weight={tuple(v_proj.weight.shape)}"
+        )
     bias = u_proj.bias is not None
     dense = make_linear(in_features, out_features, bias, torch.device("cpu"), output_dtype)
     dense.weight.data.copy_(weight)
@@ -136,10 +143,16 @@ def convert_factorized_pair(
 
 def convert_svd_llama_attention(module: SVD_LlamaAttention, compute_device: torch.device, compute_dtype: torch.dtype, output_dtype: torch.dtype) -> nn.Module:
     dense = ModuleScaffold()
-    dense.q_proj = convert_factorized_pair(module.q_u_proj, module.q_v_proj, module.num_heads * module.head_dim, module.hidden_size, compute_device, compute_dtype, output_dtype)
-    dense.k_proj = convert_factorized_pair(module.k_u_proj, module.k_v_proj, module.num_heads * module.head_dim, module.hidden_size, compute_device, compute_dtype, output_dtype)
-    dense.v_proj = convert_factorized_pair(module.v_u_proj, module.v_v_proj, module.num_heads * module.head_dim, module.hidden_size, compute_device, compute_dtype, output_dtype)
-    dense.o_proj = convert_factorized_pair(module.o_u_proj, module.o_v_proj, module.hidden_size, module.num_heads * module.head_dim, compute_device, compute_dtype, output_dtype)
+    attention_hidden_size = getattr(module, "attention_hidden_size", module.num_heads * module.head_dim)
+    key_value_hidden_size = getattr(
+        module,
+        "key_value_hidden_size",
+        getattr(module, "num_key_value_heads", module.num_heads) * module.head_dim,
+    )
+    dense.q_proj = convert_factorized_pair(module.q_u_proj, module.q_v_proj, attention_hidden_size, module.hidden_size, compute_device, compute_dtype, output_dtype)
+    dense.k_proj = convert_factorized_pair(module.k_u_proj, module.k_v_proj, key_value_hidden_size, module.hidden_size, compute_device, compute_dtype, output_dtype)
+    dense.v_proj = convert_factorized_pair(module.v_u_proj, module.v_v_proj, key_value_hidden_size, module.hidden_size, compute_device, compute_dtype, output_dtype)
+    dense.o_proj = convert_factorized_pair(module.o_u_proj, module.o_v_proj, module.hidden_size, attention_hidden_size, compute_device, compute_dtype, output_dtype)
     return dense
 
 
@@ -171,6 +184,16 @@ def convert_svd_mlp(module: nn.Module, hidden_size: int, intermediate_size: int,
     dense.up_proj = convert_factorized_pair(module.up_u_proj, module.up_v_proj, intermediate_size, hidden_size, compute_device, compute_dtype, output_dtype)
     dense.down_proj = convert_factorized_pair(module.down_u_proj, module.down_v_proj, hidden_size, intermediate_size, compute_device, compute_dtype, output_dtype)
     return dense
+
+
+def infer_svd_mlp_dims(module: nn.Module) -> Tuple[int, int]:
+    hidden_size = getattr(module, "hidden_size", None)
+    intermediate_size = getattr(module, "intermediate_size", None)
+    if hidden_size is None:
+        hidden_size = module.gate_v_proj.in_features
+    if intermediate_size is None:
+        intermediate_size = module.gate_u_proj.out_features
+    return hidden_size, intermediate_size
 
 
 def convert_svd_opt_attention(module: SVDOPTAttention, compute_device: torch.device, compute_dtype: torch.dtype, output_dtype: torch.dtype) -> nn.Module:
@@ -240,11 +263,14 @@ def convert_single_module(
     if isinstance(module, SVD_Qwen3Attention):
         return convert_svd_qwen3_attention(module, compute_device, compute_dtype, output_dtype), "svdllm"
     if isinstance(module, SVD_LlamaMLP):
-        return convert_svd_mlp(module, module.hidden_size, module.intermediate_size, compute_device, compute_dtype, output_dtype), "svdllm"
+        hidden_size, intermediate_size = infer_svd_mlp_dims(module)
+        return convert_svd_mlp(module, hidden_size, intermediate_size, compute_device, compute_dtype, output_dtype), "svdllm"
     if isinstance(module, SVD_MistralMLP):
-        return convert_svd_mlp(module, module.hidden_size, module.intermediate_size, compute_device, compute_dtype, output_dtype), "svdllm"
+        hidden_size, intermediate_size = infer_svd_mlp_dims(module)
+        return convert_svd_mlp(module, hidden_size, intermediate_size, compute_device, compute_dtype, output_dtype), "svdllm"
     if isinstance(module, SVD_Qwen3MLP):
-        return convert_svd_mlp(module, module.hidden_size, module.intermediate_size, compute_device, compute_dtype, output_dtype), "svdllm"
+        hidden_size, intermediate_size = infer_svd_mlp_dims(module)
+        return convert_svd_mlp(module, hidden_size, intermediate_size, compute_device, compute_dtype, output_dtype), "svdllm"
     if isinstance(module, SVDOPTDecoderLayer):
         return convert_svd_opt_decoder_layer(module, compute_device, compute_dtype, output_dtype), "svdllm"
     if isinstance(module, SVDOPTAttention):

@@ -131,6 +131,8 @@ class SVD_LlamaMLP(nn.Module):
         init_scheme: str = "uniform",
     ):
         super().__init__()
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
         self.ratio = ratio
         self.init_scheme = init_scheme
         low_rank = int(intermediate_size * hidden_size * self.ratio / (intermediate_size + hidden_size))
