@@ -77,6 +77,24 @@ def log(message: str) -> None:
     print(message, flush=True)
 
 
+def _prepare_model_for_pickle(model):
+    if not isinstance(model, nn.Module):
+        return model
+    if not any(hasattr(module, "_hf_hook") for module in model.modules()):
+        return model
+    try:
+        from accelerate.hooks import remove_hook_from_submodules
+    except ImportError:
+        return model
+    remove_hook_from_submodules(model)
+    return model
+
+
+def save_model_checkpoint(model, tokenizer, path):
+    model = _prepare_model_for_pickle(model)
+    torch.save({'model': model, 'tokenizer': tokenizer}, path)
+
+
 FLOAT8_DTYPES = tuple(
     dtype
     for dtype in (
@@ -1608,7 +1626,7 @@ if __name__ == '__main__':
             output_dtype_policy=svd_output_dtype_policy,
         )
         if args.save_path is not None:
-            torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_code_math_wiki_nolast' + str(args.ratio) + '.pt')   # fp32
+            save_model_checkpoint(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_code_math_wiki_nolast' + str(args.ratio) + '.pt')   # fp32
     elif args.step == 2:
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
         dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
@@ -1625,7 +1643,7 @@ if __name__ == '__main__':
             profiling_mat = torch.load(args.profiling_mat_path)
         whitening_local_update(args.model, model, dataloader, profiling_mat, args.ratio, args.DEV, init_scheme=args.init_scheme)
         if args.save_path is not None:
-            torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_then_update_' + str(args.ratio) + '.pt')  # fp32
+            save_model_checkpoint(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_then_update_' + str(args.ratio) + '.pt')  # fp32
     elif args.step == 3:
         model, tokenizer = get_model_from_huggingface(args.model)
         model = model.eval()
@@ -1633,7 +1651,7 @@ if __name__ == '__main__':
         dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
         whitening_local_update(model_name=args.model, model=model, dataloader=dataloader, profiling_mat=None, ratio=args.ratio, dev=args.DEV, direct_update=True, init_scheme=args.init_scheme)
         if args.save_path is not None:
-            torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_update_only_' + str(args.ratio) + '.pt')   # fp32
+            save_model_checkpoint(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_update_only_' + str(args.ratio) + '.pt')   # fp32
     elif args.step == 6:
         warm_start_log = (
             f"{user_warm_start_ratio:.4f}"
@@ -1709,10 +1727,7 @@ if __name__ == '__main__':
                 args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_on_policy_reverse_kd' + 'comp_ratio' + str(args.ratio) + f'wp_ratio_{args.warm_start_ratio}' + f'lt_ratio_{args.on_policy_layer_tail_ratio}' +  args.offline_dataset + '_' + str(args.whitening_nsamples) + str(args.on_policy_prompt_nsamples) + str(args.gradient_whitening_mode) + '.pt'
             )
             log(f"Saving step 6 checkpoint to {output_path}")
-            torch.save(
-                {'model': model, 'tokenizer': tokenizer},
-                output_path
-            )
+            save_model_checkpoint(model, tokenizer, output_path)
     elif args.step >= 4:
         print(f"evaluating {args.model_path}...")
         if args.model_path == "original":
@@ -1727,7 +1742,7 @@ if __name__ == '__main__':
                     torch_dtype=torch.float16,
                 )
                 model = model.merge_and_unload()
-                torch.save({'model': model, 'tokenizer': tokenizer}, args.lora + '/merge.pt')
+                save_model_checkpoint(model, tokenizer, args.lora + '/merge.pt')
         model.eval()
         model = model.half()
         model = model.to(args.DEV)

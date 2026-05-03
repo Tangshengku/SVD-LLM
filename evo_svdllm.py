@@ -17,6 +17,7 @@ from SVDLLM import (
     _OnPolicyCovCollector,
     _build_gradient_whitening_profile,
     profle_svdllm_low_resource,
+    save_model_checkpoint,
 )
 from component.low_rank_linear import LowRankLinear, ZeroLinear
 from utils.data_utils import (
@@ -2307,9 +2308,9 @@ def main():
             model_path = os.path.join(args.save_path, f"{prefix}_evo_svd_{args.ratio}.pt")
             if is_sharded_model(model):
                 log("Saving sharded compressed model without calling model.cpu()")
-                torch.save({"model": model, "tokenizer": tokenizer}, model_path)
+                save_model_checkpoint(model, tokenizer, model_path)
             else:
-                torch.save({"model": model.cpu(), "tokenizer": tokenizer}, model_path)
+                save_model_checkpoint(model.cpu(), tokenizer, model_path)
             log(f"Saved compressed model to {model_path}")
 
     log(f"Run finished successfully in {time.time() - run_start:.1f}s")
