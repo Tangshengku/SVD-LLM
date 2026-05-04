@@ -80,13 +80,26 @@ def log(message: str) -> None:
 def _prepare_model_for_pickle(model):
     if not isinstance(model, nn.Module):
         return model
-    if not any(hasattr(module, "_hf_hook") for module in model.modules()):
-        return model
     try:
         from accelerate.hooks import remove_hook_from_submodules
     except ImportError:
-        return model
-    remove_hook_from_submodules(model)
+        remove_hook_from_submodules = None
+    if remove_hook_from_submodules is not None:
+        remove_hook_from_submodules(model)
+    for module in model.modules():
+        old_forward = getattr(module, "_old_forward", None)
+        if old_forward is not None:
+            module.forward = old_forward
+            try:
+                delattr(module, "_old_forward")
+            except AttributeError:
+                pass
+        for attr_name in ("_hf_hook", "_hf_hooks"):
+            if hasattr(module, attr_name):
+                try:
+                    delattr(module, attr_name)
+                except AttributeError:
+                    pass
     return model
 
 

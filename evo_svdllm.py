@@ -1602,6 +1602,34 @@ def genome_to_serializable(spaces: Sequence[WeightSearchSpace], genome: Dict[str
     }
 
 
+def load_genome_config(path: str, spaces: Sequence[WeightSearchSpace]) -> Dict[str, List[List[int]]]:
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    weight_entries = payload.get("weights")
+    if not isinstance(weight_entries, list):
+        raise ValueError(f"Config {path} does not contain a 'weights' list")
+    by_name = {entry["name"]: entry for entry in weight_entries}
+    missing = [space.name for space in spaces if space.name not in by_name]
+    if missing:
+        raise ValueError(f"Config {path} is missing {len(missing)} search weights; first missing={missing[0]}")
+    genome = {"ranks": [], "selected": [], "sources": []}
+    for space in spaces:
+        entry = by_name[space.name]
+        source_name = entry.get("source", space.source_names[0])
+        if source_name not in space.source_names:
+            raise ValueError(
+                f"Config source '{source_name}' for {space.name} is not available in rebuilt search spaces. "
+                "If this source is on_policy_grad, load the saved evolutionary cache with --evo_profiling_mat_path."
+            )
+        rank = int(entry["rank"])
+        selected = [int(item) for item in entry.get("selected", list(range(rank)))]
+        source_idx = space.source_names.index(source_name)
+        genome["ranks"].append(rank)
+        genome["selected"].append(normalize_selection(space, source_idx, rank, selected))
+        genome["sources"].append(source_idx)
+    return genome
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, required=True, help="Dense Hugging Face model name or local path.")
@@ -1668,6 +1696,12 @@ def parse_args():
     )
     parser.add_argument("--save_path", type=str, default=None, help="Directory for configs or model checkpoints.")
     parser.add_argument("--save_model", action="store_true", help="Save the final compressed model checkpoint.")
+    parser.add_argument(
+        "--resume_config_path",
+        type=str,
+        default=None,
+        help="Load a saved *_evo_svd_config.json, apply it to rebuilt/cached search spaces, save the model, and exit.",
+    )
     parser.add_argument(
         "--fitness_fn",
         choices=["ppl", "kl", "hyb", "on_policy_kl"],
@@ -2013,6 +2047,28 @@ def main():
             f"active_weights={sum(rank > 0 for rank in parent['ranks'])} | "
             f"default_source={spaces[0].source_names[parent['sources'][0]] if spaces else 'n/a'}"
         )
+
+    if args.resume_config_path is not None:
+        log(f"Loading saved evolutionary config from {args.resume_config_path}")
+        resumed_genome = load_genome_config(args.resume_config_path, spaces)
+        log(
+            f"Applying resumed genome | kept_params={total_cost(spaces, resumed_genome['ranks'])}/{budget} | "
+            f"active_weights={sum(rank > 0 for rank in resumed_genome['ranks'])}"
+        )
+        apply_genome(model, spaces, resumed_genome)
+        if args.save_path is None:
+            args.save_path = os.path.dirname(args.resume_config_path)
+        os.makedirs(args.save_path, exist_ok=True)
+        prefix = args.model.replace("/", "_").replace("-", "_")
+        model_path = os.path.join(args.save_path, f"{prefix}_evo_svd_{args.ratio}.pt")
+        if is_sharded_model(model):
+            log("Saving resumed sharded compressed model without calling model.cpu()")
+            save_model_checkpoint(model, tokenizer, model_path)
+        else:
+            save_model_checkpoint(model.cpu(), tokenizer, model_path)
+        log(f"Saved resumed compressed model to {model_path}")
+        log(f"Run finished successfully in {time.time() - run_start:.1f}s")
+        return
 
     log(f"Preparing {args.search_nsamples} search batches from {args.dataset}")
     search_batches = get_search_batches(args.dataset, tokenizer, args.search_nsamples, args.model_seq_len, args.seed)
