@@ -102,6 +102,16 @@ def search_runtime_dtype(dtype: torch.dtype) -> torch.dtype:
     return torch.float16 if is_float8_dtype(dtype) else dtype
 
 
+def parse_storage_dtype(name: str) -> torch.dtype:
+    if name == "float32":
+        return torch.float32
+    if name == "float16":
+        return torch.float16
+    if name == "bfloat16":
+        return torch.bfloat16
+    raise ValueError(f"Unsupported storage dtype: {name}")
+
+
 def is_linear_like_module(module: nn.Module) -> bool:
     weight = getattr(module, "weight", None)
     return isinstance(weight, torch.Tensor) and weight.ndim == 2
@@ -259,6 +269,14 @@ class WeightSearchSpace:
 
     def right_v(self, source_idx: int) -> torch.Tensor:
         return self.right_v_by_source[source_idx]
+
+
+def store_factor_tensor(tensor: torch.Tensor, dtype: torch.dtype, name: str) -> torch.Tensor:
+    stored = tensor.detach().to(device="cpu", dtype=dtype)
+    if dtype != torch.float32 and not torch.isfinite(stored).all():
+        log(f"Reduced-dtype SVD factors overflowed for {name}; storing this factor in float32")
+        stored = tensor.detach().cpu()
+    return stored
 
 
 def get_transformer_layers(model_name: str, model) -> Tuple[str, Sequence[nn.Module]]:
@@ -437,6 +455,8 @@ def build_search_spaces(
     boundary_window: int,
     tail_count: int,
     device: str,
+    factor_storage_dtype: torch.dtype,
+    discard_profile_layers: bool,
 ) -> List[WeightSearchSpace]:
     layer_root, layers = get_transformer_layers(model_name, model)
     spaces: List[WeightSearchSpace] = []
@@ -444,7 +464,8 @@ def build_search_spaces(
     log(
         f"Building search spaces from {len(layers)} transformer layers "
         f"(rank_step={rank_step}, boundary_window={boundary_window}, tail_count={tail_count}, "
-        f"sources={source_names})"
+        f"sources={source_names}, factor_storage_dtype={factor_storage_dtype}, "
+        f"discard_profile_layers={discard_profile_layers})"
     )
 
     discovered_linear_like = 0
@@ -485,6 +506,7 @@ def build_search_spaces(
             if max_rank <= 0:
                 continue
 
+            stored_rank_count = min(full_rank, max_rank + boundary_window)
             singular_values_sq_by_source = []
             left_u_by_source = []
             right_v_by_source = []
@@ -500,17 +522,20 @@ def build_search_spaces(
 
                 whitened_weight = torch.matmul(weight, scaling_diag_matrix)
                 u, s, vt = torch.linalg.svd(whitened_weight, full_matrices=False)
-                right_v = torch.matmul(vt, scaling_matrix_inv).cpu()
-                singular_values_sq_by_source.append(s.cpu() ** 2)
-                left_u_by_source.append(u.cpu())
-                right_v_by_source.append(right_v)
+                right_v = torch.matmul(vt[:stored_rank_count, :], scaling_matrix_inv)
+                singular_values_sq_by_source.append(s[:stored_rank_count].cpu() ** 2)
+                left_u_by_source.append(store_factor_tensor(u[:, :stored_rank_count], factor_storage_dtype, f"{layer_idx}.{local_name}.U"))
+                right_v_by_source.append(store_factor_tensor(right_v, factor_storage_dtype, f"{layer_idx}.{local_name}.V"))
                 del scaling_diag_matrix, scaling_matrix_inv, whitened_weight, u, s, vt, right_v
 
             rank_levels = sorted(set([0] + list(range(rank_step, max_rank + 1, rank_step)) + [max_rank]))
 
-            boundary_cap = min(full_rank, max_rank + boundary_window + 1)
-            tail_start = max(boundary_cap, full_rank - tail_count)
-            tail_pool = list(range(tail_start, full_rank))
+            if stored_rank_count == full_rank:
+                boundary_cap = min(full_rank, max_rank + boundary_window + 1)
+                tail_start = max(boundary_cap, full_rank - tail_count)
+                tail_pool = list(range(tail_start, full_rank))
+            else:
+                tail_pool = []
 
             spaces.append(
                 WeightSearchSpace(
@@ -535,6 +560,9 @@ def build_search_spaces(
 
             del weight
             torch.cuda.empty_cache()
+        if discard_profile_layers:
+            for source_name in source_names:
+                profiling_mats[source_name].pop(layer_idx, None)
     if not spaces:
         log(
             f"No searchable weights built | discovered_linear_like={discovered_linear_like} | "
@@ -965,13 +993,13 @@ def _append_gradient_source_to_spaces(
     gradient_profile: Dict[int, Dict[str, Dict[str, torch.Tensor]]],
     source_name: str,
     device: str,
+    factor_storage_dtype: torch.dtype,
 ) -> None:
     if not spaces:
         return
     if source_name in spaces[0].source_names:
         raise ValueError(f"Source {source_name} already exists in search spaces")
     log(f"Appending gradient-whitened source '{source_name}' to {len(spaces)} search spaces")
-    factor_storage_dtype = torch.bfloat16 if hasattr(torch, "bfloat16") else torch.float16
     for idx, (space, dense_module) in enumerate(tqdm(zip(spaces, dense_modules), total=len(spaces), desc="Adding gradient source")):
         weight_tensor = get_linear_like_weight(dense_module, expected_in_features=space.in_features)
         if weight_tensor is None:
@@ -985,11 +1013,12 @@ def _append_gradient_source_to_spaces(
         factors = gradient_profile[idx][space.name]
         input_factor = factors["x"].float().to(work_device)
         grad_factor = factors["g"].float().to(work_device)
+        stored_rank_count = len(space.singular_values_sq(0))
         transformed = grad_factor.transpose(0, 1).matmul(weight).matmul(input_factor)
         try:
             u, s, vt = torch.linalg.svd(transformed, full_matrices=False)
-            left = torch.linalg.solve(grad_factor.transpose(0, 1), u)
-            right = torch.linalg.solve(input_factor.transpose(0, 1), vt.transpose(0, 1)).transpose(0, 1)
+            left = torch.linalg.solve(grad_factor.transpose(0, 1), u[:, :stored_rank_count])
+            right = torch.linalg.solve(input_factor.transpose(0, 1), vt[:stored_rank_count, :].transpose(0, 1)).transpose(0, 1)
         except torch.OutOfMemoryError:
             log(f"CUDA OOM while adding gradient source for {space.name}; retrying this SVD on CPU")
             del weight, input_factor, grad_factor, transformed
@@ -1000,16 +1029,12 @@ def _append_gradient_source_to_spaces(
             grad_factor = factors["g"].float().cpu()
             transformed = grad_factor.transpose(0, 1).matmul(weight).matmul(input_factor)
             u, s, vt = torch.linalg.svd(transformed, full_matrices=False)
-            left = torch.linalg.solve(grad_factor.transpose(0, 1), u)
-            right = torch.linalg.solve(input_factor.transpose(0, 1), vt.transpose(0, 1)).transpose(0, 1)
+            left = torch.linalg.solve(grad_factor.transpose(0, 1), u[:, :stored_rank_count])
+            right = torch.linalg.solve(input_factor.transpose(0, 1), vt[:stored_rank_count, :].transpose(0, 1)).transpose(0, 1)
         space.source_names.append(source_name)
-        space.singular_values_sq_by_source.append((s.cpu() ** 2))
-        left_store = left.detach().to(device="cpu", dtype=factor_storage_dtype)
-        right_store = right.detach().to(device="cpu", dtype=factor_storage_dtype)
-        if not torch.isfinite(left_store).all() or not torch.isfinite(right_store).all():
-            log(f"Reduced-dtype gradient factors overflowed for {space.name}; storing this source in float32")
-            left_store = left.detach().cpu()
-            right_store = right.detach().cpu()
+        space.singular_values_sq_by_source.append((s[:stored_rank_count].cpu() ** 2))
+        left_store = store_factor_tensor(left, factor_storage_dtype, f"{space.name}.on_policy.U")
+        right_store = store_factor_tensor(right, factor_storage_dtype, f"{space.name}.on_policy.V")
         space.left_u_by_source.append(left_store)
         space.right_v_by_source.append(right_store)
         del weight, input_factor, grad_factor, transformed, u, s, vt, left, right
@@ -1049,6 +1074,7 @@ def add_on_policy_gradient_parent_source(
     slice_kd_lm_head: bool,
     layer_tail_ratio: float,
     input_covariance_source: str,
+    factor_storage_dtype: torch.dtype,
     source_name: str = "on_policy_grad",
 ) -> str:
     if input_covariance_source not in {"on_policy", "offline"}:
@@ -1144,7 +1170,7 @@ def add_on_policy_gradient_parent_source(
         whitening_mode=whitening_mode,
         offline_profile=offline_profile,
     )
-    _append_gradient_source_to_spaces(tail_spaces, tail_dense_modules, gradient_profile, source_name, device)
+    _append_gradient_source_to_spaces(tail_spaces, tail_dense_modules, gradient_profile, source_name, device, factor_storage_dtype)
     for idx in tail_indices:
         space = spaces[idx]
         source_idx = space.source_names.index(source_name)
@@ -1703,6 +1729,12 @@ def parse_args():
     parser.add_argument("--rank_step", type=int, default=8, help="Rank step for admissible levels.")
     parser.add_argument("--boundary_window", type=int, default=8, help="Boundary search window size.")
     parser.add_argument("--tail_count", type=int, default=8, help="Tail-pool size per weight.")
+    parser.add_argument(
+        "--svd_factor_storage_dtype",
+        choices=["bfloat16", "float16", "float32"],
+        default="bfloat16",
+        help="CPU dtype used to store precomputed SVD factors. bfloat16 greatly reduces RAM for 70B search.",
+    )
     parser.add_argument("--mutation_granularity", choices=["group", "weight"], default="group")
     parser.add_argument(
         "--init_strategy",
@@ -1796,7 +1828,7 @@ def parse_args():
     parser.add_argument(
         "--teacher_logits_mode",
         choices=["cache", "stream"],
-        default="cache",
+        default="stream",
         help=(
             "For KL fitness, cache dense teacher logits once, or stream/recompute them per evaluation minibatch. "
             "Use stream for large-vocab large-model runs to avoid huge CPU RAM use."
@@ -1808,6 +1840,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    factor_storage_dtype = parse_storage_dtype(args.svd_factor_storage_dtype)
     if args.rerank_topk_on_policy < 0:
         raise ValueError("--rerank_topk_on_policy must be non-negative")
     if args.rerank_on_policy_weight < 0:
@@ -1940,6 +1973,11 @@ def main():
         model.eval()
         model.config.use_cache = False
 
+        keep_offline_profile_for_gradient = (
+            args.init_parent_method == "on_policy_gradient"
+            and args.init_parent_gradient_mode == "both"
+            and args.init_parent_input_covariance_source == "offline"
+        )
         spaces = build_search_spaces(
             args.model,
             model,
@@ -1948,7 +1986,11 @@ def main():
             boundary_window=args.boundary_window,
             tail_count=args.tail_count,
             device=args.DEV,
+            factor_storage_dtype=factor_storage_dtype,
+            discard_profile_layers=not keep_offline_profile_for_gradient,
         )
+        if not keep_offline_profile_for_gradient:
+            profiling_mats.clear()
         if not spaces:
             raise RuntimeError("No admissible linear weights found for evolutionary SVD search.")
         dense_modules = capture_dense_modules(model, spaces)
@@ -2031,6 +2073,7 @@ def main():
             slice_kd_lm_head=not args.disable_init_parent_lm_head_slicing,
             layer_tail_ratio=args.init_parent_on_policy_layer_tail_ratio,
             input_covariance_source=args.init_parent_input_covariance_source,
+            factor_storage_dtype=factor_storage_dtype,
             source_name="on_policy_grad",
         )
         log(
