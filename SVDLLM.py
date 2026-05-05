@@ -158,6 +158,113 @@ def _resolve_output_dtype(source_dtype, output_dtype_policy):
     return output_dtype_policy
 
 
+def _low_rank_from_ratio(rows, cols, ratio):
+    full_rank = min(rows, cols)
+    rank = int(rows * cols * ratio / (rows + cols))
+    return max(1, min(full_rank, rank))
+
+
+def _factor_group_name(name):
+    leaf = name.rsplit(".", 1)[-1]
+    for suffix in ("q_proj", "k_proj", "v_proj", "o_proj", "out_proj", "gate_proj", "down_proj", "up_proj", "fc1", "fc2"):
+        if suffix in leaf or suffix in name:
+            return suffix
+    return leaf
+
+
+def _ensure_factor_pair(owner, u_attr, v_attr, svd_u, svd_v):
+    u_proj = getattr(owner, u_attr)
+    v_proj = getattr(owner, v_attr)
+    out_features, rank = svd_u.shape
+    v_rank, in_features = svd_v.shape
+    if rank != v_rank:
+        raise ValueError(f"Mismatched factor ranks for {u_attr}/{v_attr}: {rank} vs {v_rank}")
+    if (
+        u_proj.weight.shape == svd_u.shape
+        and v_proj.weight.shape == svd_v.shape
+    ):
+        return
+    u_bias = u_proj.bias is not None
+    v_bias = v_proj.bias is not None
+    new_u = nn.Linear(rank, out_features, bias=u_bias)
+    new_v = nn.Linear(in_features, rank, bias=v_bias)
+    setattr(owner, u_attr, new_u)
+    setattr(owner, v_attr, new_v)
+
+
+def _dynamic_rank_allocation(model_name, model, profiling_mat, ratio, dev):
+    model_name = model_name.lower()
+    if 'opt' in model_name:
+        layers = model.model.decoder.layers
+    else:
+        layers = model.model.layers
+
+    entries = []
+    print("Computing SVD-LLM V2 layer sensitivity for dynamic rank allocation...")
+    for i in tqdm(range(len(layers))):
+        layer = layers[i]
+        subset = _resolve_profiled_layers(layer, profiling_mat[i])
+        for name in subset:
+            scaling_diag_matrix = profiling_mat[i][name].to(dev)
+            weight_tensor = _get_linear_like_weight(subset[name], expected_in_features=scaling_diag_matrix.shape[0])
+            if weight_tensor is None:
+                continue
+            W = weight_tensor.detach().float().to(dev)
+            rows, cols = W.shape
+            try:
+                W_scale = torch.matmul(W, scaling_diag_matrix.float())
+                _, S, _ = torch.linalg.svd(W_scale, full_matrices=False)
+            except torch.OutOfMemoryError:
+                del W, scaling_diag_matrix
+                torch.cuda.empty_cache()
+                raise
+            base_rank = _low_rank_from_ratio(rows, cols, ratio)
+            tail = S[base_rank:]
+            loss = torch.linalg.vector_norm(tail).item() if tail.numel() else 0.0
+            entries.append(
+                {
+                    "key": (i, name),
+                    "group": _factor_group_name(name),
+                    "rows": rows,
+                    "cols": cols,
+                    "loss": max(loss, 0.0),
+                }
+            )
+            del W, W_scale, S, scaling_diag_matrix, tail
+            torch.cuda.empty_cache()
+
+    target_compression = max(0.0, min(1.0, 1.0 - ratio))
+    by_group = {}
+    for entry in entries:
+        by_group.setdefault(entry["group"], []).append(entry)
+
+    rank_map = {}
+    ratio_map = {}
+    for group_entries in by_group.values():
+        scores = []
+        for entry in group_entries:
+            # Paper uses inverse log-normalized truncation loss. log1p keeps the
+            # score finite and positive for small unnormalized losses.
+            score = 1.0 / max(math.log1p(entry["loss"]), 1e-12)
+            scores.append(score)
+        score_sum = sum(scores)
+        for entry, score in zip(group_entries, scores):
+            allocated_compression = len(group_entries) * target_compression * score / score_sum if score_sum > 0 else target_compression
+            allocated_compression = max(0.0, min(0.99, allocated_compression))
+            allocated_ratio = 1.0 - allocated_compression
+            rank = _low_rank_from_ratio(entry["rows"], entry["cols"], allocated_ratio)
+            rank_map[entry["key"]] = rank
+            ratio_map[entry["key"]] = allocated_ratio
+
+    if rank_map:
+        avg_ratio = sum(ratio_map.values()) / len(ratio_map)
+        print(
+            f"Dynamic rank allocation ready for {len(rank_map)} weights "
+            f"(target_keep_ratio={ratio:.4f}, avg_allocated_keep_ratio={avg_ratio:.4f})"
+        )
+    return rank_map, ratio_map
+
+
 def _is_linear_like_module(module):
     weight = getattr(module, "weight", None)
     return isinstance(weight, torch.Tensor) and weight.ndim == 2
@@ -963,26 +1070,32 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev, profile_bat
 def _assign_low_rank_weights(model_name, layer, name, svd_u, svd_v, svd_attn=None, svd_mlp=None, svd_decoder=None):
     if 'opt' in model_name:
         if "q_proj" in name:
+            _ensure_factor_pair(svd_decoder.self_attn, "q_u_proj", "q_v_proj", svd_u, svd_v)
             svd_decoder.self_attn.q_u_proj.weight.data = svd_u
             svd_decoder.self_attn.q_v_proj.weight.data = svd_v
             svd_decoder.self_attn.q_u_proj.bias.data = layer.self_attn.q_proj.bias.data
         elif "k_proj" in name:
+            _ensure_factor_pair(svd_decoder.self_attn, "k_u_proj", "k_v_proj", svd_u, svd_v)
             svd_decoder.self_attn.k_u_proj.weight.data = svd_u
             svd_decoder.self_attn.k_v_proj.weight.data = svd_v
             svd_decoder.self_attn.k_u_proj.bias.data = layer.self_attn.k_proj.bias.data
         elif "v_proj" in name:
+            _ensure_factor_pair(svd_decoder.self_attn, "v_u_proj", "v_v_proj", svd_u, svd_v)
             svd_decoder.self_attn.v_u_proj.weight.data = svd_u
             svd_decoder.self_attn.v_v_proj.weight.data = svd_v
             svd_decoder.self_attn.v_u_proj.bias.data = layer.self_attn.v_proj.bias.data
         elif "out_proj" in name:
+            _ensure_factor_pair(svd_decoder.self_attn, "out_u_proj", "out_v_proj", svd_u, svd_v)
             svd_decoder.self_attn.out_u_proj.weight.data = svd_u
             svd_decoder.self_attn.out_v_proj.weight.data = svd_v
             svd_decoder.self_attn.out_u_proj.bias.data = layer.self_attn.out_proj.bias.data
         elif "fc1" in name:
+            _ensure_factor_pair(svd_decoder, "fc1_u_proj", "fc1_v_proj", svd_u, svd_v)
             svd_decoder.fc1_u_proj.weight.data = svd_u
             svd_decoder.fc1_v_proj.weight.data = svd_v
             svd_decoder.fc1_u_proj.bias.data = layer.fc1.bias.data
         elif "fc2" in name:
+            _ensure_factor_pair(svd_decoder, "fc2_u_proj", "fc2_v_proj", svd_u, svd_v)
             svd_decoder.fc2_u_proj.weight.data = svd_u
             svd_decoder.fc2_v_proj.weight.data = svd_v
             svd_decoder.fc2_u_proj.bias.data = layer.fc2.bias.data
@@ -991,21 +1104,25 @@ def _assign_low_rank_weights(model_name, layer, name, svd_u, svd_v, svd_attn=Non
         return
 
     if "q_proj" in name:
+        _ensure_factor_pair(svd_attn, "q_u_proj", "q_v_proj", svd_u, svd_v)
         svd_attn.q_u_proj.weight.data = svd_u
         svd_attn.q_v_proj.weight.data = svd_v
         if "qwen" in model_name and layer.self_attn.q_proj.bias is not None:
             svd_attn.q_u_proj.bias.data.copy_(layer.self_attn.q_proj.bias.data)
     elif "k_proj" in name:
+        _ensure_factor_pair(svd_attn, "k_u_proj", "k_v_proj", svd_u, svd_v)
         svd_attn.k_u_proj.weight.data = svd_u
         svd_attn.k_v_proj.weight.data = svd_v
         if "qwen" in model_name and layer.self_attn.k_proj.bias is not None:
             svd_attn.k_u_proj.bias.data.copy_(layer.self_attn.k_proj.bias.data)
     elif "v_proj" in name:
+        _ensure_factor_pair(svd_attn, "v_u_proj", "v_v_proj", svd_u, svd_v)
         svd_attn.v_u_proj.weight.data = svd_u
         svd_attn.v_v_proj.weight.data = svd_v
         if "qwen" in model_name and layer.self_attn.v_proj.bias is not None:
             svd_attn.v_u_proj.bias.data.copy_(layer.self_attn.v_proj.bias.data)
     elif "o_proj" in name:
+        _ensure_factor_pair(svd_attn, "o_u_proj", "o_v_proj", svd_u, svd_v)
         svd_attn.o_u_proj.weight.data = svd_u
         svd_attn.o_v_proj.weight.data = svd_v
         if "qwen" in model_name and layer.self_attn.o_proj.bias is not None:
@@ -1015,25 +1132,40 @@ def _assign_low_rank_weights(model_name, layer, name, svd_u, svd_v, svd_attn=Non
             svd_attn.k_norm.weight.data.copy_(layer.self_attn.k_norm.weight.data)
         layer.self_attn = svd_attn
     elif "gate_proj" in name:
+        _ensure_factor_pair(svd_mlp, "gate_u_proj", "gate_v_proj", svd_u, svd_v)
         svd_mlp.gate_u_proj.weight.data = svd_u
         svd_mlp.gate_v_proj.weight.data = svd_v
     elif "down_proj" in name:
+        _ensure_factor_pair(svd_mlp, "down_u_proj", "down_v_proj", svd_u, svd_v)
         svd_mlp.down_u_proj.weight.data = svd_u
         svd_mlp.down_v_proj.weight.data = svd_v
     elif "up_proj" in name:
+        _ensure_factor_pair(svd_mlp, "up_u_proj", "up_v_proj", svd_u, svd_v)
         svd_mlp.up_u_proj.weight.data = svd_u
         svd_mlp.up_v_proj.weight.data = svd_v
         layer.mlp = svd_mlp
 
 
 @torch.no_grad()
-def whitening(model_name, model, profiling_mat, ratio, dev, init_scheme="uniform", output_dtype_policy=None):
+def whitening(
+    model_name,
+    model,
+    profiling_mat,
+    ratio,
+    dev,
+    init_scheme="uniform",
+    output_dtype_policy=None,
+    dynamic_rank_allocation=False,
+):
     model_name = model_name.lower()
     model.eval()
     if 'opt' in model_name:
         layers = model.model.decoder.layers
     else:
         layers = model.model.layers
+    dynamic_rank_map = {}
+    if dynamic_rank_allocation:
+        dynamic_rank_map, _ = _dynamic_rank_allocation(model_name, model, profiling_mat, ratio, dev)
     print("Start SVD decomposition after whitening...")
     for i in tqdm(range(len(layers))):
         layer = layers[i]
@@ -1084,7 +1216,7 @@ def whitening(model_name, model, profiling_mat, ratio, dev, init_scheme="uniform
             scaling_matrix_inv = scaling_matrix_inv.float()
             W_scale = torch.matmul(W, scaling_diag_matrix)
             U, S, VT = torch.linalg.svd(W_scale, full_matrices=False)
-            num_s_after_trunc = int(W.shape[0] * W.shape[1] * ratio / (W.shape[0] + W.shape[1]))
+            num_s_after_trunc = dynamic_rank_map.get((i, name), _low_rank_from_ratio(W.shape[0], W.shape[1], ratio))
             truc_s = S[:num_s_after_trunc]
             truc_u = U[:, :num_s_after_trunc]
             truc_v = torch.matmul(VT[:num_s_after_trunc, :], scaling_matrix_inv)
@@ -1093,71 +1225,10 @@ def whitening(model_name, model, profiling_mat, ratio, dev, init_scheme="uniform
             sqrtSigma = torch.sqrt(truc_sigma)
             svd_u = torch.matmul(truc_u, sqrtSigma).cpu().to(output_dtype)
             svd_v = torch.matmul(sqrtSigma, truc_v).cpu().to(output_dtype)
-            if 'opt' in model_name:
-                if "q_proj" in name:
-                    svd_decoder.self_attn.q_u_proj.weight.data = svd_u
-                    svd_decoder.self_attn.q_v_proj.weight.data = svd_v
-                    svd_decoder.self_attn.q_u_proj.bias.data = layer.self_attn.q_proj.bias.data  # the linear layer in OPT has bias, which is different from LLaMA and Mistral
-                elif "k_proj" in name:
-                    svd_decoder.self_attn.k_u_proj.weight.data = svd_u
-                    svd_decoder.self_attn.k_v_proj.weight.data = svd_v
-                    svd_decoder.self_attn.k_u_proj.bias.data = layer.self_attn.k_proj.bias.data
-                elif "v_proj" in name:
-                    svd_decoder.self_attn.v_u_proj.weight.data = svd_u
-                    svd_decoder.self_attn.v_v_proj.weight.data = svd_v
-                    svd_decoder.self_attn.v_u_proj.bias.data = layer.self_attn.v_proj.bias.data
-                elif "out_proj" in name:
-                    svd_decoder.self_attn.out_u_proj.weight.data = svd_u
-                    svd_decoder.self_attn.out_v_proj.weight.data = svd_v
-                    svd_decoder.self_attn.out_u_proj.bias.data = layer.self_attn.out_proj.bias.data
-                elif "fc1" in name:
-                    svd_decoder.fc1_u_proj.weight.data = svd_u
-                    svd_decoder.fc1_v_proj.weight.data = svd_v
-                    svd_decoder.fc1_u_proj.bias.data = layer.fc1.bias.data
-                elif "fc2" in name:
-                    svd_decoder.fc2_u_proj.weight.data = svd_u
-                    svd_decoder.fc2_v_proj.weight.data = svd_v
-                    svd_decoder.fc2_u_proj.bias.data = layer.fc2.bias.data
-                    svd_decoder.self_attn_layer_norm = layer.self_attn_layer_norm
-                    svd_decoder.final_layer_norm = layer.final_layer_norm
-                    layers[i] = svd_decoder
-            else:
-                if "q_proj" in name:
-                    svd_attn.q_u_proj.weight.data = svd_u
-                    svd_attn.q_v_proj.weight.data = svd_v
-                    if "qwen" in model_name and layer.self_attn.q_proj.bias is not None:
-                        svd_attn.q_u_proj.bias.data.copy_(layer.self_attn.q_proj.bias.data)
-                elif "k_proj" in name:
-                    svd_attn.k_u_proj.weight.data = svd_u
-                    svd_attn.k_v_proj.weight.data = svd_v
-                    if "qwen" in model_name and layer.self_attn.k_proj.bias is not None:
-                        svd_attn.k_u_proj.bias.data.copy_(layer.self_attn.k_proj.bias.data)
-                elif "v_proj" in name:
-                    svd_attn.v_u_proj.weight.data = svd_u
-                    svd_attn.v_v_proj.weight.data = svd_v
-                    if "qwen" in model_name and layer.self_attn.v_proj.bias is not None:
-                        svd_attn.v_u_proj.bias.data.copy_(layer.self_attn.v_proj.bias.data)
-                elif "o_proj" in name:
-                    svd_attn.o_u_proj.weight.data = svd_u
-                    svd_attn.o_v_proj.weight.data = svd_v
-                    if "qwen" in model_name and layer.self_attn.o_proj.bias is not None:
-                        svd_attn.o_u_proj.bias.data.copy_(layer.self_attn.o_proj.bias.data)
-                    if "qwen" in model_name:
-                        svd_attn.q_norm.weight.data.copy_(layer.self_attn.q_norm.weight.data)
-                        svd_attn.k_norm.weight.data.copy_(layer.self_attn.k_norm.weight.data)
-                    layer.self_attn =  svd_attn
-                elif "gate_proj" in name:
-                    svd_mlp.gate_u_proj.weight.data = svd_u
-                    svd_mlp.gate_v_proj.weight.data = svd_v
-                elif "down_proj" in name:
-                    svd_mlp.down_u_proj.weight.data = svd_u
-                    svd_mlp.down_v_proj.weight.data = svd_v
-                elif "up_proj" in name:
-                    svd_mlp.up_u_proj.weight.data = svd_u
-                    svd_mlp.up_v_proj.weight.data = svd_v
-                    layer.mlp = svd_mlp
-            W = W_scale = scaling_matrix_inv = scaling_diag_matrix = U = S = VT  = truc_s = truc_u = truc_v = sqrtSigma = None
-            del  W, W_scale, scaling_matrix_inv, scaling_diag_matrix, U, S, VT, truc_s, truc_u, truc_v, sqrtSigma
+            _assign_low_rank_weights(model_name, layer, name, svd_u, svd_v, svd_attn=svd_attn if 'opt' not in model_name else None, svd_mlp=svd_mlp if 'opt' not in model_name else None, svd_decoder=svd_decoder if 'opt' in model_name else None)
+            W = W_scale = scaling_matrix_inv = scaling_diag_matrix = U = S = VT = truc_s = truc_u = truc_v = truc_sigma = sqrtSigma = svd_u = svd_v = None
+            del W, W_scale, scaling_matrix_inv, scaling_diag_matrix, U, S, VT, truc_s, truc_u, truc_v, truc_sigma, sqrtSigma, svd_u, svd_v
+            torch.cuda.empty_cache()
         if 'opt' in model_name:
             layers[i] = svd_decoder
         del layer
@@ -1288,7 +1359,17 @@ def gradient_whitening(
 
 
 @torch.no_grad()
-def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, dev, direct_update=False, init_scheme="uniform"):
+def whitening_local_update(
+    model_name,
+    model,
+    dataloader,
+    profiling_mat,
+    ratio,
+    dev,
+    direct_update=False,
+    init_scheme="uniform",
+    dynamic_rank_allocation=False,
+):
     model_name = model_name.lower()
     print("Start SVD decomposition then update...")
     use_cache = model.config.use_cache
@@ -1336,6 +1417,9 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
     model.model.norm = model.model.norm.cpu()
     torch.cuda.empty_cache()
     outs = torch.zeros_like(inps)
+    dynamic_rank_map = {}
+    if dynamic_rank_allocation and profiling_mat is not None and not direct_update:
+        dynamic_rank_map, _ = _dynamic_rank_allocation(model_name, model, profiling_mat, ratio, dev)
     for i in tqdm(range(len(layers))):
         layer = layers[i].to(dev)
         subset = find_layers(layer)
@@ -1371,7 +1455,14 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
                 scaling_diag_matrix = profiling_mat[i][name].to(dev)
             else: 
                 scaling_diag_matrix = None
-            gpts[name] = local_update(subset[name], scaling_diag_matrix = scaling_diag_matrix, ratio=ratio, name=name, direct_update=direct_update)
+            gpts[name] = local_update(
+                subset[name],
+                scaling_diag_matrix=scaling_diag_matrix,
+                ratio=ratio,
+                name=name,
+                direct_update=direct_update,
+                rank=dynamic_rank_map.get((i, name)),
+            )
         
         def add_batch(name):
             def tmp(_, inp, out):
@@ -1387,69 +1478,7 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
         for name in gpts:
             svd_u, svd_v = gpts[name].fasterprune()
             svd_u, svd_v = svd_u.to(dtype), svd_v.to(dtype)
-            if 'opt' in model_name:
-                if "q_proj" in name:
-                    svd_decoder.self_attn.q_u_proj.weight.data = svd_u
-                    svd_decoder.self_attn.q_v_proj.weight.data = svd_v
-                    svd_decoder.self_attn.q_u_proj.bias.data = layer.self_attn.q_proj.bias.data  # the linear layer in OPT has bias, which is different from LLaMA and Mistral
-                elif "k_proj" in name:
-                    svd_decoder.self_attn.k_u_proj.weight.data = svd_u
-                    svd_decoder.self_attn.k_v_proj.weight.data = svd_v
-                    svd_decoder.self_attn.k_u_proj.bias.data = layer.self_attn.k_proj.bias.data
-                elif "v_proj" in name:
-                    svd_decoder.self_attn.v_u_proj.weight.data = svd_u
-                    svd_decoder.self_attn.v_v_proj.weight.data = svd_v
-                    svd_decoder.self_attn.v_u_proj.bias.data = layer.self_attn.v_proj.bias.data
-                elif "out_proj" in name:
-                    svd_decoder.self_attn.out_u_proj.weight.data = svd_u
-                    svd_decoder.self_attn.out_v_proj.weight.data = svd_v
-                    svd_decoder.self_attn.out_u_proj.bias.data = layer.self_attn.out_proj.bias.data
-                elif "fc1" in name:
-                    svd_decoder.fc1_u_proj.weight.data = svd_u
-                    svd_decoder.fc1_v_proj.weight.data = svd_v
-                    svd_decoder.fc1_u_proj.bias.data = layer.fc1.bias.data
-                elif "fc2" in name:
-                    svd_decoder.fc2_u_proj.weight.data = svd_u
-                    svd_decoder.fc2_v_proj.weight.data = svd_v
-                    svd_decoder.fc2_u_proj.bias.data = layer.fc2.bias.data
-                    svd_decoder.self_attn_layer_norm = layer.self_attn_layer_norm
-                    svd_decoder.final_layer_norm = layer.final_layer_norm
-                    layers[i] = svd_decoder
-            else:
-                if "q_proj" in name:
-                    svd_attn.q_u_proj.weight.data = svd_u
-                    svd_attn.q_v_proj.weight.data = svd_v
-                    if "qwen" in model_name and layer.self_attn.q_proj.bias is not None:
-                        svd_attn.q_u_proj.bias.data.copy_(layer.self_attn.q_proj.bias.data)
-                elif "k_proj" in name:
-                    svd_attn.k_u_proj.weight.data = svd_u
-                    svd_attn.k_v_proj.weight.data = svd_v
-                    if "qwen" in model_name and layer.self_attn.k_proj.bias is not None:
-                        svd_attn.k_u_proj.bias.data.copy_(layer.self_attn.k_proj.bias.data)
-                elif "v_proj" in name:
-                    svd_attn.v_u_proj.weight.data = svd_u
-                    svd_attn.v_v_proj.weight.data = svd_v
-                    if "qwen" in model_name and layer.self_attn.v_proj.bias is not None:
-                        svd_attn.v_u_proj.bias.data.copy_(layer.self_attn.v_proj.bias.data)
-                elif "o_proj" in name:
-                    svd_attn.o_u_proj.weight.data = svd_u
-                    svd_attn.o_v_proj.weight.data = svd_v
-                    if "qwen" in model_name and layer.self_attn.o_proj.bias is not None:
-                        svd_attn.o_u_proj.bias.data.copy_(layer.self_attn.o_proj.bias.data)
-                    if "qwen" in model_name:
-                        svd_attn.q_norm.weight.data.copy_(layer.self_attn.q_norm.weight.data)
-                        svd_attn.k_norm.weight.data.copy_(layer.self_attn.k_norm.weight.data)
-                    layer.self_attn =  svd_attn
-                elif "gate_proj" in name:
-                    svd_mlp.gate_u_proj.weight.data = svd_u
-                    svd_mlp.gate_v_proj.weight.data = svd_v
-                elif "down_proj" in name:
-                    svd_mlp.down_u_proj.weight.data = svd_u
-                    svd_mlp.down_v_proj.weight.data = svd_v
-                elif "up_proj" in name:
-                    svd_mlp.up_u_proj.weight.data = svd_u
-                    svd_mlp.up_v_proj.weight.data = svd_v
-                    layer.mlp = svd_mlp
+            _assign_low_rank_weights(model_name, layer, name, svd_u, svd_v, svd_attn=svd_attn if 'opt' not in model_name else None, svd_mlp=svd_mlp if 'opt' not in model_name else None, svd_decoder=svd_decoder if 'opt' in model_name else None)
         layer = layer.to(dev)
         for j in range(inps.shape[0]):
             outs[j] = layer(inps[j].unsqueeze(0), **cache['layer_kwargs'][j])[0]
@@ -1463,7 +1492,7 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
 
 
 class local_update:
-    def __init__(self, layer, scaling_diag_matrix, ratio, name, direct_update=False):
+    def __init__(self, layer, scaling_diag_matrix, ratio, name, direct_update=False, rank=None):
         self.layer = layer
         self.name = name
         self.dev = self.layer.weight.device
@@ -1485,7 +1514,7 @@ class local_update:
             W_scale = torch.matmul(W, scaling_diag_matrix)
             self.U, self.S, self.VT = torch.linalg.svd(W_scale, full_matrices=False)  
         # trucation SVD
-        num_s_after_trunc = int(W.shape[0] * W.shape[1] * ratio / (W.shape[0] + W.shape[1]))
+        num_s_after_trunc = rank if rank is not None else _low_rank_from_ratio(W.shape[0], W.shape[1], ratio)
         self.truc_s = self.S[:num_s_after_trunc].cuda()
         self.truc_u = self.U[:, :num_s_after_trunc].cuda()
         if direct_update:
@@ -1607,6 +1636,11 @@ if __name__ == '__main__':
             'runtime converts FP8 source weights to fp16 for executable low-rank modules.'
         ),
     )
+    parser.add_argument(
+        '--dynamic_rank_allocation',
+        action='store_true',
+        help='Apply SVD-LLM V2 layer-sensitivity based dynamic rank allocation during whitening.',
+    )
     
     args = parser.parse_args()
     user_ratio = args.ratio
@@ -1637,6 +1671,7 @@ if __name__ == '__main__':
             args.DEV,
             init_scheme=args.init_scheme,
             output_dtype_policy=svd_output_dtype_policy,
+            dynamic_rank_allocation=args.dynamic_rank_allocation,
         )
         if args.save_path is not None:
             save_model_checkpoint(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_code_math_wiki_nolast' + str(args.ratio) + '.pt')   # fp32
@@ -1654,7 +1689,16 @@ if __name__ == '__main__':
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
-        whitening_local_update(args.model, model, dataloader, profiling_mat, args.ratio, args.DEV, init_scheme=args.init_scheme)
+        whitening_local_update(
+            args.model,
+            model,
+            dataloader,
+            profiling_mat,
+            args.ratio,
+            args.DEV,
+            init_scheme=args.init_scheme,
+            dynamic_rank_allocation=args.dynamic_rank_allocation,
+        )
         if args.save_path is not None:
             save_model_checkpoint(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_then_update_' + str(args.ratio) + '.pt')  # fp32
     elif args.step == 3:
