@@ -227,6 +227,8 @@ def _dynamic_rank_allocation(model_name, model, profiling_mat, ratio, dev):
                     "group": _factor_group_name(name),
                     "rows": rows,
                     "cols": cols,
+                    "base_rank": base_rank,
+                    "full_rank": min(rows, cols),
                     "loss": max(loss, 0.0),
                 }
             )
@@ -241,26 +243,81 @@ def _dynamic_rank_allocation(model_name, model, profiling_mat, ratio, dev):
     rank_map = {}
     ratio_map = {}
     for group_entries in by_group.values():
+        target_rank_cost = sum(
+            entry["base_rank"] * (entry["rows"] + entry["cols"])
+            for entry in group_entries
+        )
+        losses = [entry["loss"] for entry in group_entries]
+        loss_mean = sum(losses) / max(len(losses), 1)
+        loss_mean = max(loss_mean, 1e-12)
         scores = []
         for entry in group_entries:
-            # Paper uses inverse log-normalized truncation loss. log1p keeps the
-            # score finite and positive for small unnormalized losses.
-            score = 1.0 / max(math.log1p(entry["loss"]), 1e-12)
+            # SVD-LLM V2 applies inverse-log normalization to theoretical
+            # truncation loss. Normalize by the group mean first so tiny raw
+            # losses do not dominate and collapse ranks to one.
+            normalized_loss = entry["loss"] / loss_mean
+            score = 1.0 / max(math.log(math.e + normalized_loss), 1e-12)
             scores.append(score)
         score_sum = sum(scores)
         for entry, score in zip(group_entries, scores):
             allocated_compression = len(group_entries) * target_compression * score / score_sum if score_sum > 0 else target_compression
-            allocated_compression = max(0.0, min(0.99, allocated_compression))
+            allocated_compression = max(0.0, min(0.95, allocated_compression))
             allocated_ratio = 1.0 - allocated_compression
             rank = _low_rank_from_ratio(entry["rows"], entry["cols"], allocated_ratio)
             rank_map[entry["key"]] = rank
             ratio_map[entry["key"]] = allocated_ratio
 
+        def current_rank_cost():
+            return sum(
+                rank_map[entry["key"]] * (entry["rows"] + entry["cols"])
+                for entry in group_entries
+            )
+
+        # Integer ranks and clipping can drift away from the requested budget.
+        # Repair the group to the same low-rank parameter budget as fixed-ratio
+        # SVD-LLM, removing rank from low-sensitivity weights first and adding it
+        # back to high-sensitivity weights first.
+        while current_rank_cost() > target_rank_cost:
+            candidates = [
+                (entry["loss"], entry)
+                for entry in group_entries
+                if rank_map[entry["key"]] > 1
+            ]
+            if not candidates:
+                break
+            _, entry = min(candidates, key=lambda item: item[0])
+            rank_map[entry["key"]] -= 1
+        while current_rank_cost() < target_rank_cost:
+            candidates = [
+                (entry["loss"], entry)
+                for entry in group_entries
+                if rank_map[entry["key"]] < entry["full_rank"]
+            ]
+            if not candidates:
+                break
+            _, entry = max(candidates, key=lambda item: item[0])
+            rank_map[entry["key"]] += 1
+        for entry in group_entries:
+            rank = rank_map[entry["key"]]
+            ratio_map[entry["key"]] = rank * (entry["rows"] + entry["cols"]) / max(entry["rows"] * entry["cols"], 1)
+        group_name = group_entries[0]["group"]
+        group_ranks = [rank_map[entry["key"]] for entry in group_entries]
+        group_cost = current_rank_cost()
+        print(
+            f"Dynamic allocation group={group_name}: "
+            f"weights={len(group_entries)}, rank_range=[{min(group_ranks)}, {max(group_ranks)}], "
+            f"avg_rank={sum(group_ranks) / len(group_ranks):.1f}, "
+            f"rank_cost={group_cost}/{target_rank_cost}"
+        )
+
     if rank_map:
         avg_ratio = sum(ratio_map.values()) / len(ratio_map)
+        min_rank = min(rank_map.values())
+        max_rank = max(rank_map.values())
         print(
             f"Dynamic rank allocation ready for {len(rank_map)} weights "
-            f"(target_keep_ratio={ratio:.4f}, avg_allocated_keep_ratio={avg_ratio:.4f})"
+            f"(target_keep_ratio={ratio:.4f}, avg_allocated_keep_ratio={avg_ratio:.4f}, "
+            f"rank_range=[{min_rank}, {max_rank}])"
         )
     return rank_map, ratio_map
 
