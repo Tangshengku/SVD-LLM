@@ -671,6 +671,63 @@ def _compute_reverse_kd_loss(student_logits, teacher_logits, prompt_len, kd_temp
     )
 
 
+def _compute_forward_kd_loss(student_logits, teacher_logits, start, end, kd_temperature):
+    if end <= start:
+        raise ValueError("KD loss slice must be non-empty")
+    student_slice = student_logits[:, start:end, :].float()
+    teacher_slice = teacher_logits[:, start:end, :].float()
+    student_log_prob = torch.log_softmax(student_slice / kd_temperature, dim=-1)
+    teacher_log_prob = torch.log_softmax(teacher_slice / kd_temperature, dim=-1)
+    return (kd_temperature ** 2) * torch.nn.functional.kl_div(
+        student_log_prob,
+        teacher_log_prob,
+        reduction="batchmean",
+        log_target=True,
+    )
+
+
+def _compute_on_policy_objective(
+    loss_type,
+    sequences,
+    student_logits,
+    teacher_logits,
+    prompt_len,
+    rollout_len,
+    kd_temperature,
+):
+    if loss_type == "reverse_kd":
+        if teacher_logits is None:
+            raise ValueError("reverse_kd requires teacher logits")
+        return (
+            _compute_reverse_kd_loss(student_logits, teacher_logits, prompt_len, kd_temperature),
+            (prompt_len - 1, prompt_len - 1 + rollout_len),
+            "reverse_kd_loss",
+        )
+    if loss_type == "lm":
+        student_slice = student_logits[:, prompt_len - 1 : -1, :].float()
+        labels = sequences[:, prompt_len:].contiguous()
+        loss = torch.nn.functional.cross_entropy(
+            student_slice.reshape(-1, student_slice.shape[-1]),
+            labels.reshape(-1),
+        )
+        return loss, (prompt_len - 1, prompt_len - 1 + rollout_len), "lm_loss"
+    if loss_type == "prefix_kd":
+        if teacher_logits is None:
+            raise ValueError("prefix_kd requires teacher logits")
+        return (
+            _compute_forward_kd_loss(
+                student_logits,
+                teacher_logits,
+                start=0,
+                end=prompt_len - 1,
+                kd_temperature=kd_temperature,
+            ),
+            (0, prompt_len - 1),
+            "prefix_kd_loss",
+        )
+    raise ValueError(f"Unsupported on-policy loss: {loss_type}")
+
+
 def _build_gradient_whitening_profile(on_stats, lambda0, dev, whitening_mode="both", offline_profile=None):
     if whitening_mode not in {"both", "grad_only"}:
         raise ValueError("whitening_mode must be one of: both, grad_only")
@@ -772,6 +829,7 @@ def on_policy_reverse_kd_guided_whitening(
     use_on_policy_kv_cache=True,
     on_policy_layer_tail_ratio=1.0,
     output_dtype_policy=None,
+    on_policy_loss="reverse_kd",
 ):
     if rounds <= 0:
         raise ValueError("rounds must be positive")
@@ -779,6 +837,8 @@ def on_policy_reverse_kd_guided_whitening(
         raise ValueError("rollout_len must be positive")
     if not (0.0 <= on_policy_layer_tail_ratio <= 1.0):
         raise ValueError("on_policy_layer_tail_ratio must be in [0, 1]")
+    if on_policy_loss not in {"reverse_kd", "lm", "prefix_kd"}:
+        raise ValueError("on_policy_loss must be one of: reverse_kd, lm, prefix_kd")
 
     model_name = model_name.lower()
     model.eval()
@@ -787,7 +847,8 @@ def on_policy_reverse_kd_guided_whitening(
         f"Starting on-policy reverse-KD guided whitening | offline_profile_layers={len(offline_profile)} | "
         f"prompt_dataset={prompt_dataset} | prompt_nsamples={prompt_nsamples} | prompt_len={prompt_len} | "
         f"rollout_len={rollout_len} | rounds={rounds} | kd_temperature={kd_temperature} | "
-        f"generation_temperature={generation_temperature} | generation_top_p={generation_top_p}"
+        f"generation_temperature={generation_temperature} | generation_top_p={generation_top_p} | "
+        f"on_policy_loss={on_policy_loss}"
     )
     dense_paths = _build_replaced_module_paths(model_name, model)
     dense_snapshot = _capture_module_snapshot(model, dense_paths)
@@ -857,7 +918,8 @@ def on_policy_reverse_kd_guided_whitening(
 
         try:
             running_loss = 0.0
-            for batch_idx, prompts in enumerate(tqdm(prompt_batches, desc="collecting on-policy reverse-kd covariances")):
+            loss_label = f"{on_policy_loss}_loss"
+            for batch_idx, prompts in enumerate(tqdm(prompt_batches, desc=f"collecting on-policy {on_policy_loss} covariances")):
                 prompts = prompts.to(dev)
                 model.zero_grad(set_to_none=True)
                 if batch_idx == 0:
@@ -882,25 +944,31 @@ def on_policy_reverse_kd_guided_whitening(
                     )
                 collector.enabled = True
                 student_logits = model(sequences, use_cache=False).logits
-                _apply_module_snapshot(model, dense_snapshot, device=dev, offload_replaced_to_cpu=False)
-                with torch.no_grad():
-                    teacher_logits = model(sequences, use_cache=False).logits
-                _apply_module_snapshot(model, student_snapshot, device=dev, offload_replaced_to_cpu=False)
-                loss = _compute_reverse_kd_loss(
+                teacher_logits = None
+                if on_policy_loss in {"reverse_kd", "prefix_kd"}:
+                    _apply_module_snapshot(model, dense_snapshot, device=dev, offload_replaced_to_cpu=False)
+                    with torch.no_grad():
+                        teacher_logits = model(sequences, use_cache=False).logits
+                    _apply_module_snapshot(model, student_snapshot, device=dev, offload_replaced_to_cpu=False)
+                loss, gradient_slice, loss_label = _compute_on_policy_objective(
+                    on_policy_loss,
+                    sequences,
                     student_logits,
                     teacher_logits,
-                    prompt_len=prompt_len,
+                    prompt_len,
+                    rollout_len,
                     kd_temperature=kd_temperature,
                 )
                 running_loss += loss.item()
                 loss.backward()
-                collector.consume_batch((prompt_len - 1, prompt_len - 1 + rollout_len))
+                collector.consume_batch(gradient_slice)
                 collector.enabled = False
                 model.zero_grad(set_to_none=True)
                 if batch_idx == 0 or batch_idx == len(prompt_batches) - 1:
                     log(
                         f"Round {round_idx + 1}: processed prompt batch {batch_idx + 1}/{len(prompt_batches)} | "
-                        f"reverse_kd_loss={loss.item():.6f} | sequence_len={sequences.shape[1]}"
+                        f"{loss_label}={loss.item():.6f} | sequence_len={sequences.shape[1]} | "
+                        f"gradient_slice={gradient_slice}"
                     )
         finally:
             collector.enabled = False
@@ -912,7 +980,7 @@ def on_policy_reverse_kd_guided_whitening(
         mean_loss = running_loss / max(len(prompt_batches), 1)
         log(
             f"Round {round_idx + 1}: collected on-policy stats | active_projections={active_stats}/{len(collector.stats)} | "
-            f"total_tokens={total_tokens} | mean_reverse_kd_loss={mean_loss:.6f}"
+            f"total_tokens={total_tokens} | mean_{loss_label}={mean_loss:.6f}"
         )
         gradient_profile = _build_gradient_whitening_profile(
             collector.stats,
@@ -1651,6 +1719,13 @@ if __name__ == '__main__':
     parser.add_argument('--on_policy_prompt_nsamples', type=int, default=16, help='Number of prompt samples used for on-policy reverse KD in step 6.')
     parser.add_argument('--on_policy_rounds', type=int, default=1, help='Number of reverse-KD-guided whitening rounds in step 6.')
     parser.add_argument('--kd_temperature', type=float, default=2.0, help='Distillation temperature tau for reverse KD in step 6.')
+    parser.add_argument(
+        '--on_policy_loss',
+        type=str,
+        default='reverse_kd',
+        choices=['reverse_kd', 'lm', 'prefix_kd'],
+        help='Step 6 gradient objective: reverse_kd on generated tokens, lm cross-entropy on generated tokens, or prefix_kd on prompt-prefix logits.',
+    )
     parser.add_argument('--generation_temperature', type=float, default=0.7, help='Sampling temperature for student rollouts in step 6.')
     parser.add_argument('--generation_top_p', type=float, default=0.9, help='Top-p sampling threshold for student rollouts in step 6.')
     parser.add_argument(
@@ -1784,6 +1859,7 @@ if __name__ == '__main__':
             f"On-policy KD prompts: dataset={args.on_policy_dataset} | prompt_nsamples={args.on_policy_prompt_nsamples} | "
             f"prompt_len={args.on_policy_prompt_len} | rollout_len={args.on_policy_rollout_len} | "
             f"gradient_whitening_mode={args.gradient_whitening_mode} | "
+            f"loss={args.on_policy_loss} | "
             f"kv_cache={not args.disable_on_policy_kv_cache} | "
             f"tail_layer_ratio={args.on_policy_layer_tail_ratio}"
         )
@@ -1835,10 +1911,11 @@ if __name__ == '__main__':
             use_on_policy_kv_cache=not args.disable_on_policy_kv_cache,
             on_policy_layer_tail_ratio=args.on_policy_layer_tail_ratio,
             output_dtype_policy=svd_output_dtype_policy,
+            on_policy_loss=args.on_policy_loss,
         )
         if args.save_path is not None:
             output_path = (
-                args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_on_policy_reverse_kd' + 'comp_ratio' + str(args.ratio) + f'wp_ratio_{args.warm_start_ratio}' + f'lt_ratio_{args.on_policy_layer_tail_ratio}' +  args.offline_dataset + '_' + str(args.whitening_nsamples) + str(args.on_policy_prompt_nsamples) + str(args.gradient_whitening_mode) + '.pt'
+                args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + f'_on_policy_{args.on_policy_loss}' + 'comp_ratio' + str(args.ratio) + f'wp_ratio_{args.warm_start_ratio}' + f'lt_ratio_{args.on_policy_layer_tail_ratio}' +  args.offline_dataset + '_' + str(args.whitening_nsamples) + str(args.on_policy_prompt_nsamples) + str(args.gradient_whitening_mode) + '.pt'
             )
             log(f"Saving step 6 checkpoint to {output_path}")
             save_model_checkpoint(model, tokenizer, output_path)
