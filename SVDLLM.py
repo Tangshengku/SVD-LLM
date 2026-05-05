@@ -704,13 +704,13 @@ def _compute_on_policy_objective(
             "reverse_kd_loss",
         )
     if loss_type == "lm":
-        student_slice = student_logits[:, prompt_len - 1 : -1, :].float()
-        labels = sequences[:, prompt_len:].contiguous()
+        student_slice = student_logits[:, : prompt_len - 1, :].float()
+        labels = sequences[:, 1:prompt_len].contiguous()
         loss = torch.nn.functional.cross_entropy(
             student_slice.reshape(-1, student_slice.shape[-1]),
             labels.reshape(-1),
         )
-        return loss, (prompt_len - 1, prompt_len - 1 + rollout_len), "lm_loss"
+        return loss, (0, prompt_len - 1), "prefix_lm_loss"
     if loss_type == "prefix_kd":
         if teacher_logits is None:
             raise ValueError("prefix_kd requires teacher logits")
@@ -844,7 +844,7 @@ def on_policy_reverse_kd_guided_whitening(
     model.eval()
     model.config.use_cache = False
     log(
-        f"Starting on-policy reverse-KD guided whitening | offline_profile_layers={len(offline_profile)} | "
+        f"Starting guided gradient whitening | offline_profile_layers={len(offline_profile)} | "
         f"prompt_dataset={prompt_dataset} | prompt_nsamples={prompt_nsamples} | prompt_len={prompt_len} | "
         f"rollout_len={rollout_len} | rounds={rounds} | kd_temperature={kd_temperature} | "
         f"generation_temperature={generation_temperature} | generation_top_p={generation_top_p} | "
@@ -892,7 +892,8 @@ def on_policy_reverse_kd_guided_whitening(
     model.to(dev)
 
     for round_idx in range(rounds):
-        log(f"Start on-policy reverse-KD guided whitening round {round_idx + 1}/{rounds}")
+        objective_is_on_policy = on_policy_loss == "reverse_kd"
+        log(f"Start guided whitening round {round_idx + 1}/{rounds} | objective={on_policy_loss}")
         student_snapshot = _capture_module_snapshot(model, dense_paths)
         collector = _OnPolicyCovCollector(
             model,
@@ -919,27 +920,36 @@ def on_policy_reverse_kd_guided_whitening(
         try:
             running_loss = 0.0
             loss_label = f"{on_policy_loss}_loss"
-            for batch_idx, prompts in enumerate(tqdm(prompt_batches, desc=f"collecting on-policy {on_policy_loss} covariances")):
+            for batch_idx, prompts in enumerate(tqdm(prompt_batches, desc=f"collecting {on_policy_loss} covariances")):
                 prompts = prompts.to(dev)
                 model.zero_grad(set_to_none=True)
                 if batch_idx == 0:
-                    log(
-                        f"Round {round_idx + 1}: sampling on-policy rollouts on {dev} | "
-                        f"batch_size={prompts.shape[0]} | prompt_len={prompts.shape[1]} | "
-                        f"rollout_len={rollout_len} | kv_cache={use_on_policy_kv_cache}"
-                    )
-                with torch.no_grad():
-                    sequences = _sample_on_policy_sequences(
-                        model,
-                        prompts,
-                        rollout_len=rollout_len,
-                        generation_temperature=generation_temperature,
-                        generation_top_p=generation_top_p,
-                        use_kv_cache=use_on_policy_kv_cache,
-                    )
+                    if objective_is_on_policy:
+                        log(
+                            f"Round {round_idx + 1}: sampling on-policy rollouts on {dev} | "
+                            f"batch_size={prompts.shape[0]} | prompt_len={prompts.shape[1]} | "
+                            f"rollout_len={rollout_len} | kv_cache={use_on_policy_kv_cache}"
+                        )
+                    else:
+                        log(
+                            f"Round {round_idx + 1}: using off-policy prompt-prefix objective on {dev} | "
+                            f"batch_size={prompts.shape[0]} | prompt_len={prompts.shape[1]}"
+                        )
+                if objective_is_on_policy:
+                    with torch.no_grad():
+                        sequences = _sample_on_policy_sequences(
+                            model,
+                            prompts,
+                            rollout_len=rollout_len,
+                            generation_temperature=generation_temperature,
+                            generation_top_p=generation_top_p,
+                            use_kv_cache=use_on_policy_kv_cache,
+                        )
+                else:
+                    sequences = prompts
                 if batch_idx == 0:
                     log(
-                        f"Round {round_idx + 1}: first rollout batch ready | "
+                        f"Round {round_idx + 1}: first objective batch ready | "
                         f"sequence_len={sequences.shape[1]}"
                     )
                 collector.enabled = True
@@ -1724,7 +1734,7 @@ if __name__ == '__main__':
         type=str,
         default='reverse_kd',
         choices=['reverse_kd', 'lm', 'prefix_kd'],
-        help='Step 6 gradient objective: reverse_kd on generated tokens, lm cross-entropy on generated tokens, or prefix_kd on prompt-prefix logits.',
+        help='Step 6 gradient objective: reverse_kd on generated rollout tokens, lm cross-entropy on prompt-prefix tokens, or prefix_kd on prompt-prefix logits.',
     )
     parser.add_argument('--generation_temperature', type=float, default=0.7, help='Sampling temperature for student rollouts in step 6.')
     parser.add_argument('--generation_top_p', type=float, default=0.9, help='Top-p sampling threshold for student rollouts in step 6.')
@@ -1860,7 +1870,7 @@ if __name__ == '__main__':
             f"prompt_len={args.on_policy_prompt_len} | rollout_len={args.on_policy_rollout_len} | "
             f"gradient_whitening_mode={args.gradient_whitening_mode} | "
             f"loss={args.on_policy_loss} | "
-            f"kv_cache={not args.disable_on_policy_kv_cache} | "
+            f"kv_cache={not args.disable_on_policy_kv_cache if args.on_policy_loss == 'reverse_kd' else 'unused'} | "
             f"tail_layer_ratio={args.on_policy_layer_tail_ratio}"
         )
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
