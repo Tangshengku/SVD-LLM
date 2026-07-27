@@ -1,14 +1,16 @@
 #!/bin/bash
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0
 export TRANSFORMERS_CACHE=/nfs/scistore19/alistgrp/huggingface/hub
 
 # example of compressing LLaMA-7B with SVDLLMq
 FINE_TUNE_PATH="."
 # run data whitening with 20% compression ratio
-# python SVDLLM.py --dataset mix:wikitext2,evol-codealpaca,tulu-math --model RedHatAI/Llama-3.3-70B-Instruct-FP8-dynamic --step 1 --ratio 0.2 --whitening_nsamples 1024 --seed 3 --model_seq_len 2048 --save_path . 
+# python SVDLLM.py --dataset mix:wikitext2,evol-codealpaca,tulu-math --model mistralai/Mistral-7B-v0.1 --step 1 --ratio 0.2 --whitening_nsamples 1024 --seed 3 --model_seq_len 2048 --save_path .  --on_policy_rollouts_per_prompt 4
 ## you can also run the following command for low-resource gpu (ex. llama 7b will only need 15G gpu memory to compress) or to compress large-scale llm (ex. llama 65b)
 # python SVDLLM.py --model jeffwan/llama-7b-hf --step 1 --ratio 0.2 --whitening_nsamples 256 --dataset wikitext2 --model_seq_len 2048 --save_path ./ --run_low_resource
-python SVDLLM.py --step 4 --model_path original --model Qwen/Qwen3-32B
+# python SVDLLM.py --step 5 --eval_batch_size 8196 --gen_seq_len 32   --model /nfs/scistore19/alistgrp/stang/svd_baselines/Dobi-SVD/results/compressed_model/Mistral-7B-v0.1/DobiSVD_Dense-Mistral-7B-v0.1-0.65 --model_path original
+python SVDLLM.py --step 4    --model_path ./mistralai_Mistral_7B_v0.1_on_policy_reverse_kdcomp_ratio0.8wp_ratio_0.8lt_ratio_1.0mix:wikitext2,evol-codealpaca,tulu-math_256256both.pt
+
 # python SVDLLM.py \
 #     --model mistralai/Mistral-7B-v0.1\
 #     --step 6 \
@@ -16,8 +18,11 @@ python SVDLLM.py --step 4 --model_path original --model Qwen/Qwen3-32B
 #     --ratio 0.2 \
 #     --offline_dataset mix:wikitext2,evol-codealpaca,tulu-math \
 #     --on_policy_dataset mix:evol-codealpaca,tulu-math \
+#     --on_policy_loss reverse_kd \
 #     --whitening_nsamples 256 \
+#     --on_policy_layer_tail_ratio 1.0 \
 #     --on_policy_prompt_nsamples 256 \
+#     --on_policy_rollouts_per_prompt 4 \
 #     --on_policy_prompt_len 128 \
 #     --on_policy_rollout_len 512 \
 #     --gradient_whitening_mode both \
@@ -26,9 +31,9 @@ python SVDLLM.py --step 4 --model_path original --model Qwen/Qwen3-32B
 #     --generation_temperature 0.7 \
 #     --generation_top_p 0.9 \
 #     --cov_rho 0.3 \
-#     --profiling_mat_path /nfs/scistore19/alistgrp/stang/SVD-LLM/mistralai_Mistral_7B_v0.1_profiling_mix:wikitext2,evol-codealpaca,tulu-math_256_3.pt \
+#     --profiling_mat_path /nfs/scistore19/alistgrp/stang/SVD-LLM/mistralai_Mistral_7B_v0.1_profiling_mix:wikitext2,evol-codealpaca,tulu-math_1024_3.pt \
 #     --DEV cuda \
-#     --save_path ./
+#     --save_path ./ 
     # --on_policy_layer_tail_ratio 0.25 \
 # --profiling_mat_path /nfs/scistore19/alistgrp/stang/SVD-LLM/mistralai_Mistral_7B_v0.1_profiling_mix:wikitext2,evol-codealpaca,tulu-math_256_3.pt \
 

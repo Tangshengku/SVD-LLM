@@ -145,8 +145,8 @@ def parse_args():
     parser.add_argument("--dataset", type=str, default="wikitext2", choices=["wikitext2", "ptb", "c4"])
     parser.add_argument("--model_seq_len", type=int, default=2048)
     parser.add_argument("--eval_batch_size", type=int, default=1)
-    parser.add_argument("--compare_batches", type=int, default=2, help="Number of eval batches used for logit comparison.")
-    parser.add_argument("--max_eval_batches", type=int, default=8, help="Number of eval batches used for PPL comparison.")
+    parser.add_argument("--compare_batches", type=int, default=256, help="Number of eval batches used for logit comparison.")
+    parser.add_argument("--max_eval_batches", type=int, default=256, help="Number of eval batches used for PPL comparison.")
     parser.add_argument("--DEV", type=str, default="cuda")
     parser.add_argument(
         "--factor_device",

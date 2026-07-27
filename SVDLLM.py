@@ -1723,7 +1723,7 @@ if __name__ == '__main__':
         default=8,
         help='Mini-batch size used inside low-resource whitening profiling. Larger is faster but uses more GPU memory.',
     )
-    parser.add_argument('--eval_batch_size', type=int, default=4, help='inference bactch size')
+    parser.add_argument('--eval_batch_size', type=int, default=1, help='inference bactch size')
     parser.add_argument('--gen_seq_len', type=int, default=1024, help='generated sequence len for efficiency evaluation')
     parser.add_argument('--step', type=int, default=4, help='the step to run the compression')
     parser.add_argument('--lora', type=str, default=None, help='the lora updated weight path to run the accuracy evaluation')
@@ -1828,7 +1828,7 @@ if __name__ == '__main__':
             dynamic_rank_allocation=args.dynamic_rank_allocation,
         )
         if args.save_path is not None:
-            save_model_checkpoint(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_code_math_wiki_nolast' + str(args.ratio) + '.pt')   # fp32
+            save_model_checkpoint(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_code_math_wiki_dyna_rank' + str(args.ratio) + '.pt')   # fp32
     elif args.step == 2:
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
         dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)

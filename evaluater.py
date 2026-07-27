@@ -13,7 +13,7 @@ sys.path.append(current_path)
 
 @torch.no_grad()
 def ppl_eval(model, tokenizer, datasets=['wikitext2', 'ptb', 'c4'], model_seq_len=2048, batch_size=32, device="cuda"):
-    model.to(device)
+    # model.to(device)
     model.eval()
     ppls = {}
     for dataset in datasets:

@@ -13,3 +13,5 @@ evo_output*
 svdllm_0.6_hf/
 outputs/
 evalplus_results/
+Qwen*
+meta*
